@@ -22,6 +22,9 @@ printf '%s\n' "$4" >> "$HS_VM_TEST_LOG"
 if [ "$4" = "${HS_VM_FAIL_PHASE:-}" ]; then
   exit 19
 fi
+case "$*" in
+  *'cat '*) echo 0 ;;
+esac
 EOF
 chmod +x "$test_dir/npx"
 touch "$test_dir/source.tar.gz"
@@ -45,8 +48,8 @@ check_case() {
   fi
 }
 
-check_case none 0 'create scp exec delete '
+check_case none 0 'create fs fs exec exec exec delete '
 check_case create 19 'create '
-check_case scp 19 'create scp delete '
-check_case exec 19 'create scp exec delete '
+check_case fs 19 'create fs delete '
+check_case exec 19 'create fs fs exec delete '
 echo "Linux VM lifecycle tests passed."
