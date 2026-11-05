@@ -182,7 +182,7 @@ Run these commands from the repository root.
 | `cargo test --locked --manifest-path desktop/Cargo.toml` | The bridge, menu, and navigation tests pass. The UI asset contract tests pass. |
 | `node --test desktop/tests/fetch_shim.test.mjs` | The fetch shim tests pass. Node is needed for this test only. |
 | `node --test desktop/tests/ui_model.test.mjs` | The pure page state tests pass. Node is needed for this test only. |
-| `cargo test --locked --manifest-path desktop/Cargo.toml --features webview-smoke --test webview_smoke` | Opens one hidden webview, checks the page, the demo API, the native menu handler, both themes, three window sizes, pairing, start, stop, and forget, then prints `WEBVIEW SMOKE PASS`. Needs a graphical session and a system webview. |
+| `cargo test --locked --manifest-path desktop/Cargo.toml --features webview-smoke --test webview_smoke` | Opens one visible webview, checks the page, the demo API, the native menu handler, both themes, three window sizes, pairing, start, stop, and forget, then prints `WEBVIEW SMOKE PASS`. Needs a graphical session and a system webview. |
 | `cargo build --locked --manifest-path desktop/Cargo.toml` | Builds `desktop/target/debug/hotspotshade-desktop`. |
 | `cargo run --locked --manifest-path desktop/Cargo.toml` | Opens the demo window. |
 | `cargo build --release --locked --manifest-path desktop/Cargo.toml` | Builds `desktop/target/release/hotspotshade-desktop`. |

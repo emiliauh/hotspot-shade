@@ -1,4 +1,4 @@
-// Test-only script for the hidden webview smoke test.
+// Test-only script for the visible webview smoke test.
 //
 // The script runs inside the real Tauri webview after the production fetch
 // shim and the production page. It checks the demo labels, navigation, native

@@ -120,7 +120,7 @@ jobs:
         run: node --test gui_assets/app.test.mjs
       - name: Build desktop demo
         run: cargo build --locked --manifest-path desktop/Cargo.toml
-      - name: Webview smoke test (hidden window, embedded assets)
+      - name: Webview smoke test (visible window, embedded assets)
         run: cargo test --locked --manifest-path desktop/Cargo.toml --features webview-smoke --test webview_smoke
       - name: Lint desktop code
         run: cargo clippy --locked --manifest-path desktop/Cargo.toml --features webview-smoke --all-targets -- -D warnings

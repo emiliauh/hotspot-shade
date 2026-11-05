@@ -1,6 +1,6 @@
 //! Bounded hermetic smoke test for the desktop webview.
 //!
-//! This test creates one hidden Tauri window. The window loads the embedded
+//! This test creates one visible Tauri window. The window loads the embedded
 //! `index.html` through the production window builder, installs the production
 //! fetch shim, and registers the production `demo_api` command. A test-only
 //! script waits for the page to render the demo label, checks the asset origin,
@@ -16,10 +16,9 @@
 //! either one, the test fails with a timeout or a start error. It never reports
 //! a pass without a report from the webview.
 //!
-//! A pass proves that one hidden window loaded the embedded page, the shim sent
-//! an `/api/status` call to `demo_api`, and the page showed the demo label. It
-//! does not prove the visible layout, the theme, a real service, a tunnel, or
-//! live platform support.
+//! A pass verifies the measured window layouts and theme change as well as the
+//! embedded page, shim, and demo status. It does not prove a real service, a
+//! tunnel, or live platform support.
 
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
@@ -86,7 +85,7 @@ fn main() {
     }
 
     eprintln!(
-        "WEBVIEW SMOKE: opening a hidden webview. The test has a {} s limit.",
+        "WEBVIEW SMOKE: opening a visible webview. The test has a {} s limit.",
         TIMEOUT.as_secs()
     );
 
@@ -131,16 +130,16 @@ fn main() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             // Build the production menu once. This catches a runtime menu
-            // error on the host. The hidden window does not open it.
+            // error on the host. The test does not open it.
             app.set_menu(menu::build(app)?)?;
 
-            // The same builder as the desktop binary. The window stays hidden
-            // and the test-only script runs after the production fetch shim.
+            // Show the window to exercise the production rendering path.
+            // Some hidden macOS webviews update custom properties but keep
+            // stale rendered styles; the assertions still check both.
             window::builder(app)
-                .visible(false)
-                // The hidden window must keep its timers. The test uses a
-                // bounded action sequence. The production window is visible
-                // and keeps the default policy.
+                .visible(true)
+                // Keep the bounded test sequence responsive if the window is
+                // temporarily obscured on a shared graphical session.
                 .background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled)
                 .initialization_script(SMOKE_SCRIPT)
                 .build()?;
