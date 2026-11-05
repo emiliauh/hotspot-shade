@@ -149,6 +149,14 @@
 
   function measureAt(checks, failures, label, width, height, expectedSidebar) {
     return resizeTo(width, height).then(function () {
+      // The media query can apply a little after the resize on a slow runner.
+      return waitFor(function () {
+        return Math.abs(document.querySelector('.sidebar').getBoundingClientRect().width -
+          expectedSidebar) <= 4;
+      }, 3000, 'the sidebar width').catch(function () {
+        return false;
+      });
+    }).then(function () {
       var sidebar = document.querySelector('.sidebar').getBoundingClientRect();
       var view = element('view-dashboard').getBoundingClientRect();
       note(checks, failures, label + '_window_size',
@@ -462,18 +470,28 @@
       var backgroundBefore = getComputedStyle(document.body).backgroundColor;
       window.__hotspotshadeMenu('theme');
       var themeAfter = document.documentElement.getAttribute('data-theme');
-      var backgroundAfter = getComputedStyle(document.body).backgroundColor;
-      note(checks, failures, 'theme_toggle', themeBefore !== themeAfter && backgroundBefore !== backgroundAfter,
-        themeBefore + ' -> ' + themeAfter);
-      window.__hotspotshadeMenu('theme');
-      try {
-        if (storedThemeBefore === null) localStorage.removeItem('hs-theme');
-        else localStorage.setItem('hs-theme', storedThemeBefore);
-      } catch (error) {
-        /* The test must not change the stored preference. */
-      }
+      // A slow runner can repaint after the toggle. Wait for the new color.
+      var themePromise = waitFor(function () {
+        return getComputedStyle(document.body).backgroundColor !== backgroundBefore;
+      }, 3000, 'the theme color').then(function () {
+        return true;
+      }, function () {
+        return false;
+      }).then(function (changed) {
+        note(checks, failures, 'theme_toggle', themeBefore !== themeAfter && changed,
+          themeBefore + ' -> ' + themeAfter);
+        window.__hotspotshadeMenu('theme');
+        try {
+          if (storedThemeBefore === null) localStorage.removeItem('hs-theme');
+          else localStorage.setItem('hs-theme', storedThemeBefore);
+        } catch (error) {
+          /* The test must not change the stored preference. */
+        }
+      });
 
-      menuChecks(checks, failures).then(function () {
+      themePromise.then(function () {
+        return menuChecks(checks, failures);
+      }).then(function () {
         return layoutSizes(checks, failures);
       }).then(function () {
         return actionChecks(checks, failures);
