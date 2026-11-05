@@ -1,0 +1,30 @@
+{
+  "name": "hotspotshade-linux",
+  "productName": "HotspotShade",
+  "version": "0.1.0",
+  "private": true,
+  "description": "HotspotShade target app for Linux. Demo backend by default, local engine service when configured.",
+  "license": "UNLICENSED",
+  "main": "src/main/main.js",
+  "scripts": {
+    "start": "electron .",
+    "start:demo": "electron . --demo",
+    "start:engine": "electron .",
+    "test": "node --test test/*.test.mjs",
+    "test:a11y": "electron test/a11y-main.js",
+    "test:smoke": "electron test/smoke-main.js",
+    "test:settings-window": "electron test/settings-window-main.js",
+    "test:engine-smoke": "electron test/engine-smoke-main.js",
+    "test:main-engine": "electron test/main-engine-launch.js",
+    "measure:memory": "electron test/memory-main.js",
+    "measure:responsiveness": "electron test/responsiveness-main.js",
+    "package:deb": "sh scripts/package-deb.sh"
+  },
+  "devDependencies": {
+    "@electron/packager": "20.3.0",
+    "electron": "45.2.3"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -1,0 +1,91 @@
+<Application
+    x:Class="HotspotShade.WinUI2.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="using:Microsoft.UI.Xaml.Controls"
+    xmlns:converters="using:HotspotShade.WinUI2.Converters">
+
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <controls:XamlControlsResources />
+            </ResourceDictionary.MergedDictionaries>
+
+            <ResourceDictionary.ThemeDictionaries>
+                <ResourceDictionary x:Key="Default">
+                    <SolidColorBrush x:Key="AppBackgroundBrush" Color="#101012" />
+                    <SolidColorBrush x:Key="CardBackgroundBrush" Color="#1A1A1E" />
+                    <SolidColorBrush x:Key="CardStrokeBrush" Color="#303036" />
+                    <SolidColorBrush x:Key="SecondaryTextBrush" Color="#A0A0A8" />
+                    <SolidColorBrush x:Key="StatusOffBrush" Color="#8A8A93" />
+                    <SolidColorBrush x:Key="StatusOnBrush" Color="#4CC38A" />
+                    <SolidColorBrush x:Key="StatusAttentionBrush" Color="#E0A030" />
+                    <SolidColorBrush x:Key="StatusPairingBrush" Color="#6CA0FF" />
+                    <SolidColorBrush x:Key="CodeBackgroundBrush" Color="#202026" />
+                    <SolidColorBrush x:Key="DangerTextBrush" Color="#FF8A80" />
+                </ResourceDictionary>
+
+                <ResourceDictionary x:Key="Light">
+                    <SolidColorBrush x:Key="AppBackgroundBrush" Color="#FAFAFA" />
+                    <SolidColorBrush x:Key="CardBackgroundBrush" Color="#FFFFFF" />
+                    <SolidColorBrush x:Key="CardStrokeBrush" Color="#E2E2E6" />
+                    <SolidColorBrush x:Key="SecondaryTextBrush" Color="#5F5F66" />
+                    <SolidColorBrush x:Key="StatusOffBrush" Color="#767680" />
+                    <SolidColorBrush x:Key="StatusOnBrush" Color="#1E8E5A" />
+                    <SolidColorBrush x:Key="StatusAttentionBrush" Color="#A65F00" />
+                    <SolidColorBrush x:Key="StatusPairingBrush" Color="#2563EB" />
+                    <SolidColorBrush x:Key="CodeBackgroundBrush" Color="#F2F2F5" />
+                    <SolidColorBrush x:Key="DangerTextBrush" Color="#B3261E" />
+                </ResourceDictionary>
+
+                <ResourceDictionary x:Key="HighContrast">
+                    <SolidColorBrush x:Key="AppBackgroundBrush" Color="{ThemeResource SystemColorWindowColor}" />
+                    <SolidColorBrush x:Key="CardBackgroundBrush" Color="{ThemeResource SystemColorWindowColor}" />
+                    <SolidColorBrush x:Key="CardStrokeBrush" Color="{ThemeResource SystemColorWindowTextColor}" />
+                    <SolidColorBrush x:Key="SecondaryTextBrush" Color="{ThemeResource SystemColorWindowTextColor}" />
+                    <SolidColorBrush x:Key="StatusOffBrush" Color="{ThemeResource SystemColorWindowTextColor}" />
+                    <SolidColorBrush x:Key="StatusOnBrush" Color="{ThemeResource SystemColorHighlightColor}" />
+                    <SolidColorBrush x:Key="StatusAttentionBrush" Color="{ThemeResource SystemColorWindowTextColor}" />
+                    <SolidColorBrush x:Key="StatusPairingBrush" Color="{ThemeResource SystemColorHighlightColor}" />
+                    <SolidColorBrush x:Key="CodeBackgroundBrush" Color="{ThemeResource SystemColorWindowColor}" />
+                    <SolidColorBrush x:Key="DangerTextBrush" Color="{ThemeResource SystemColorWindowTextColor}" />
+                </ResourceDictionary>
+            </ResourceDictionary.ThemeDictionaries>
+
+            <converters:BoolToVisibilityConverter x:Key="BoolToVisibility" />
+            <converters:EnumNameToVisibilityConverter x:Key="EnumNameToVisibility" />
+            <converters:StringToVisibilityConverter x:Key="StringToVisibility" />
+
+            <Style x:Key="CardStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource CardBackgroundBrush}" />
+                <Setter Property="BorderBrush" Value="{ThemeResource CardStrokeBrush}" />
+                <Setter Property="BorderThickness" Value="1" />
+                <Setter Property="CornerRadius" Value="8" />
+                <Setter Property="Padding" Value="16" />
+            </Style>
+
+            <Style x:Key="SecondaryTextBlockStyle" TargetType="TextBlock" BasedOn="{StaticResource BodyTextBlockStyle}">
+                <Setter Property="Foreground" Value="{ThemeResource SecondaryTextBrush}" />
+            </Style>
+
+            <Style x:Key="CaptionSecondaryTextBlockStyle" TargetType="TextBlock" BasedOn="{StaticResource CaptionTextBlockStyle}">
+                <Setter Property="Foreground" Value="{ThemeResource SecondaryTextBrush}" />
+            </Style>
+
+            <Style x:Key="CardTitleTextBlockStyle" TargetType="TextBlock" BasedOn="{StaticResource BodyTextBlockStyle}">
+                <Setter Property="FontWeight" Value="SemiBold" />
+            </Style>
+
+            <Style x:Key="PageTitleTextBlockStyle" TargetType="TextBlock" BasedOn="{StaticResource TitleTextBlockStyle}">
+                <Setter Property="TextWrapping" Value="Wrap" />
+            </Style>
+
+            <Style x:Key="StatusDotStyle" TargetType="Ellipse">
+                <Setter Property="Width" Value="10" />
+                <Setter Property="Height" Value="10" />
+                <Setter Property="HorizontalAlignment" Value="Center" />
+                <Setter Property="VerticalAlignment" Value="Center" />
+            </Style>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

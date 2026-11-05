@@ -1,0 +1,43 @@
+# Test image for the HotspotShade Linux demo shell.
+#
+# Build from the linux/ directory:
+#   docker build -f scripts/Dockerfile.test -t hotspotshade-linux-test:45.2.3 .
+#
+# The source is mounted at run time. This image holds only the OS libraries,
+# Node.js, Electron, and a setuid chrome-sandbox for a non-root test user.
+
+FROM node:24-bookworm
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates \
+        fonts-dejavu-core \
+        libasound2 \
+        libatk-bridge2.0-0 \
+        libcairo2 \
+        libcups2 \
+        libdrm2 \
+        libgbm1 \
+        libgl1 \
+        libgtk-3-0 \
+        libnss3 \
+        libpango-1.0-0 \
+        libx11-xcb1 \
+        libxkbcommon0 \
+        libxshmfence1 \
+        libxss1 \
+        xauth \
+        xvfb \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --shell /bin/bash appuser
+
+WORKDIR /opt/hs-deps
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund \
+    && node -e "console.log(require('electron'))" \
+    && chown root:root node_modules/electron/dist/chrome-sandbox \
+    && chmod 4755 node_modules/electron/dist/chrome-sandbox
+
+USER appuser
+WORKDIR /work

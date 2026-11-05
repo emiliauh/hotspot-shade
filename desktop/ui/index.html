@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="HotspotShade desktop demo. All data is simulated.">
+  <title>HotspotShade Desktop (Demo) · Dashboard</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <script src="/boot.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#mainContent">Skip to content</a>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Sidebar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+            <path d="M4.5 15.5a7.5 7.5 0 0 1 15 0"/>
+            <path d="M8.5 15.5a3.5 3.5 0 0 1 7 0"/>
+            <circle cx="12" cy="15.5" r="1" fill="currentColor" stroke="none"/>
+            <path d="M4.5 19.5h15" opacity=".55"/>
+          </svg>
+        </span>
+        <span class="brand-copy">
+          <span class="brand-name">HotspotShade</span>
+          <span class="brand-demo">
+            <span class="demo-pill" id="demoPill" title="Simulated data. No sockets open. No traffic leaves this machine.">Demo</span>
+          </span>
+        </span>
+      </div>
+
+      <nav class="nav" id="primaryNav" aria-label="Primary">
+        <button type="button" class="nav-item" data-view="dashboard" title="Dashboard">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M4 13a8 8 0 0 1 16 0"/>
+            <path d="m12 13 3.5-3.5"/>
+            <circle cx="12" cy="13" r="1.4" fill="currentColor" stroke="none"/>
+            <path d="M4 18h16"/>
+          </svg>
+          <span class="nav-label">Dashboard</span>
+          <span class="nav-status-dot" id="navStatusDot" aria-hidden="true"></span>
+        </button>
+        <button type="button" class="nav-item" data-view="activity" aria-label="Activity" title="Activity">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="8.5"/>
+            <path d="M12 7.5V12l3 2"/>
+          </svg>
+          <span class="nav-label">Activity</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="sidebar-meta" id="versionLabel">v0.1.0 · demo only</div>
+        <button type="button" class="nav-item nav-settings" id="settingsNav" data-view="settings" aria-label="Settings" title="Settings">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M12 3.5v2M12 18.5v2M3.5 12h2M18.5 12h2M6 6l1.4 1.4M16.6 16.6 18 18M6 18l1.4-1.4M16.6 7.4 18 6"/>
+          </svg>
+          <span class="nav-label">Settings</span>
+        </button>
+      </div>
+    </aside>
+
+    <div class="detail">
+      <div class="demo-banner" id="demoBanner" role="note">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 4.5 3.8 18.4A1 1 0 0 0 4.7 20h14.6a1 1 0 0 0 .9-1.6L12 4.5Z"/>
+          <path d="M12 9.5v4M12 17h.01"/>
+        </svg>
+        <p><strong>Demo mode.</strong> All data is simulated. No tunnel, routes, or network traffic.</p>
+        <button type="button" class="link-button" id="demoDetails">Details</button>
+      </div>
+
+      <header class="toolbar">
+        <div class="toolbar-context" aria-hidden="true">HotspotShade Desktop</div>
+        <div class="toolbar-actions">
+          <span class="pill platform-pill" id="platformBadge" title="Platform">
+            <span class="pill-dot" aria-hidden="true"></span>
+            <span id="platformText">Local host</span>
+          </span>
+          <button type="button" class="icon-button" id="themeToggle" aria-label="Switch to dark appearance" title="Switch appearance">
+            <svg class="icon icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="4"/>
+              <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>
+            </svg>
+            <svg class="icon icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5a8.5 8.5 0 1 0 10.7 10.7Z"/>
+            </svg>
+          </button>
+          <button type="button" class="icon-button" id="refreshButton" aria-label="Refresh status" title="Refresh status">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M19.5 8.5A8 8 0 1 0 20 14"/>
+              <path d="M20 4.5v4h-4"/>
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <main class="content" id="mainContent" tabindex="-1">
+        <!-- ============================= DASHBOARD ============================= -->
+        <section class="view" id="view-dashboard" aria-label="Dashboard">
+          <div id="dashboardContent">
+            <article class="card hero">
+              <div class="hero-status">
+                <span class="status-dot" id="statusDot" aria-hidden="true"></span>
+                <h1 class="hero-title" id="dashboardTitle">Starting HotspotShade</h1>
+              </div>
+              <p class="hero-subtitle" id="dashboardSubtitle">The app is reading the demo status.</p>
+              <p class="meta-line" id="dashboardChecked" hidden></p>
+              <div class="hero-actions">
+                <button type="button" class="button button-primary button-large" id="primaryAction" hidden>Pair with source device</button>
+                <button type="button" class="button button-secondary button-large" id="secondaryAction" hidden>Forget this source device</button>
+              </div>
+              <p class="inline-error" id="dashboardError" role="alert" hidden></p>
+            </article>
+
+            <div class="card-grid">
+              <article class="card" aria-labelledby="sourceCardTitle">
+                <h2 class="card-title" id="sourceCardTitle">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M5 9.5a10 10 0 0 1 14 0"/>
+                    <path d="M8 12.5a6 6 0 0 1 8 0"/>
+                    <path d="M11 15.5a2 2 0 0 1 2 0"/>
+                    <circle cx="12" cy="18" r="1" fill="currentColor" stroke="none"/>
+                  </svg>
+                  Source device
+                </h2>
+                <p class="card-value" id="sourceValue">Loading</p>
+                <ul class="detail-list" id="sourceDetails"></ul>
+              </article>
+
+              <article class="card" aria-labelledby="connectionCardTitle">
+                <h2 class="card-title" id="connectionCardTitle">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="4" y="4" width="16" height="16" rx="3"/>
+                    <path d="M8 9h8M8 13h5M8 17h3"/>
+                  </svg>
+                  Connection
+                </h2>
+                <p class="card-value" id="connectionValue">Loading</p>
+                <ul class="detail-list" id="connectionDetails"></ul>
+              </article>
+            </div>
+
+            <article class="card attention-card" id="attentionCard" hidden aria-labelledby="attentionTitle">
+              <h2 class="card-title" id="attentionTitle">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 4.5 3.8 18.4A1 1 0 0 0 4.7 20h14.6a1 1 0 0 0 .9-1.6L12 4.5Z"/>
+                  <path d="M12 9.5v4M12 17h.01"/>
+                </svg>
+                Needs attention
+              </h2>
+              <ul class="attention-list" id="attentionList"></ul>
+            </article>
+          </div>
+
+          <div class="card pairing-card" id="pairingPanel" hidden aria-labelledby="pairingTitle">
+            <div class="pairing-head">
+              <h1 class="hero-title" id="pairingTitle">Pair your source device</h1>
+              <span class="spinner" id="pairingSpinner" hidden aria-hidden="true"></span>
+            </div>
+            <p class="hero-subtitle" id="pairingMessage" role="status" aria-live="polite">Connecting to your source device.</p>
+            <div class="pair-code" id="pairCodeBlock" hidden>
+              <span class="field-label">Pairing code</span>
+              <p class="pair-code-value" id="pairCode"></p>
+              <button type="button" class="button button-secondary" id="copyCode">Copy code</button>
+            </div>
+            <ol class="pairing-steps">
+              <li>Open HotspotShade on your source device.</li>
+              <li>Check that both screens show the same code.</li>
+              <li>Tap Allow on the source device.</li>
+            </ol>
+            <div class="pairing-actions">
+              <button type="button" class="button button-secondary" id="cancelPairing">Cancel</button>
+            </div>
+            <p class="note">This pairing is simulated. No connection is made.</p>
+          </div>
+        </section>
+
+        <!-- ============================= ACTIVITY ============================= -->
+        <section class="view" id="view-activity" aria-labelledby="activityTitle" hidden>
+          <div class="page-head">
+            <div>
+              <h1 class="page-title" id="activityTitle">Activity</h1>
+              <p class="page-subtitle">Events from the in-memory demo backend. The record stays on this target device.</p>
+            </div>
+            <div class="page-actions">
+              <button type="button" class="button button-secondary" id="activityDetailsToggle" aria-pressed="false">Details</button>
+              <button type="button" class="button button-secondary" id="activityRefresh">Refresh</button>
+            </div>
+          </div>
+
+          <div class="card activity-card">
+            <div class="activity-empty" id="activityEmpty">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="8.5"/>
+                <path d="M12 7.5V12l3 2"/>
+              </svg>
+              <p id="activityEmptyTitle">Loading activity</p>
+              <span id="activityEmptyText">Waiting for the demo backend.</span>
+            </div>
+            <ol class="activity-list" id="activityList" aria-live="off"></ol>
+          </div>
+          <p class="note" id="activityNote">The activity record is simulated. It is never written to disk.</p>
+        </section>
+
+        <!-- ============================= SETTINGS ============================= -->
+        <section class="view" id="view-settings" aria-labelledby="settingsTitle" hidden>
+          <div class="page-head">
+            <div>
+              <h1 class="page-title" id="settingsTitle">Settings</h1>
+              <p class="page-subtitle">The demo keeps settings on this target device only.</p>
+            </div>
+          </div>
+
+          <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+            <button type="button" class="settings-tab" id="settingsTabGeneral" role="tab" data-settings-tab="general" aria-controls="settingsGeneralPanel" aria-selected="true" tabindex="0">General</button>
+            <button type="button" class="settings-tab" id="settingsTabPairing" role="tab" data-settings-tab="pairing" aria-controls="settingsPairingPanel" aria-selected="false" tabindex="-1">Pairing</button>
+            <button type="button" class="settings-tab" id="settingsTabAdvanced" role="tab" data-settings-tab="advanced" aria-controls="settingsAdvancedPanel" aria-selected="false" tabindex="-1">Advanced</button>
+          </div>
+
+          <div class="settings-panel" id="settingsGeneralPanel" role="tabpanel" aria-labelledby="settingsTabGeneral">
+            <article class="card">
+              <h2 class="section-title">Connection</h2>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <label class="setting-label" for="pingToggle">Let ping work</label>
+                  <p class="setting-help">Uses the simulated echo relay on the source device. Applies the next time you turn the tunnel on.</p>
+                </div>
+                <input class="checkbox" id="pingToggle" type="checkbox" checked>
+              </div>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <span class="setting-label" id="appearanceLabel">Appearance</span>
+                  <p class="setting-help">System follows the operating system.</p>
+                </div>
+                <div class="segmented" role="group" aria-labelledby="appearanceLabel">
+                  <button type="button" class="segment" data-theme-pref="system" aria-pressed="true">System</button>
+                  <button type="button" class="segment" data-theme-pref="light" aria-pressed="false">Light</button>
+                  <button type="button" class="segment" data-theme-pref="dark" aria-pressed="false">Dark</button>
+                </div>
+              </div>
+            </article>
+
+            <article class="card">
+              <h2 class="section-title">Demo mode</h2>
+              <p class="body-copy">This app is a user interface demo. It uses the in-memory <code>DemoBackend</code> and the narrow <code>demo_api</code> bridge. It has no tunnel, no route change, no network listener, and no real service.</p>
+              <p class="body-copy">Counters, logs, pairing steps, failures, and start and stop results are simulated. Windows and Linux tunnel support is not implemented.</p>
+            </article>
+          </div>
+
+          <div class="settings-panel" id="settingsPairingPanel" role="tabpanel" aria-labelledby="settingsTabPairing" hidden>
+            <article class="card">
+              <h2 class="section-title">Source device pairing</h2>
+              <p class="card-value" id="settingsPairingState" role="status" aria-live="polite">Not paired</p>
+              <p class="body-copy" id="settingsPairingMessage">Pair with your source device to use it.</p>
+              <div class="button-row">
+                <button type="button" class="button button-primary" id="settingsPair">Pair with source device</button>
+                <button type="button" class="button button-secondary" id="settingsCancel" hidden>Cancel</button>
+                <button type="button" class="button button-secondary" id="settingsForget" hidden>Forget this source device</button>
+                <button type="button" class="button button-danger" id="settingsTurnOffForget" hidden>Turn off and forget</button>
+              </div>
+              <p class="note">Forget removes this pairing from this target device. Stop the tunnel first.</p>
+              <p class="body-copy" id="settingsForgetMessage" role="status" aria-live="polite"></p>
+            </article>
+          </div>
+
+          <div class="settings-panel" id="settingsAdvancedPanel" role="tabpanel" aria-labelledby="settingsTabAdvanced" hidden>
+            <article class="card">
+              <div class="section-head">
+                <div>
+                  <h2 class="section-title">Recent failures</h2>
+                  <p class="section-subtitle">Failed connection setups on this target device. The demo record stays in memory.</p>
+                </div>
+                <div class="button-row">
+                  <button type="button" class="button button-secondary" id="failuresRefresh">Refresh</button>
+                  <button type="button" class="button button-secondary" id="copyFailures" disabled>Copy report</button>
+                </div>
+              </div>
+              <p class="body-copy" id="failuresSummary" role="status" aria-live="polite">Loading recent failures.</p>
+              <table class="failures-table" id="failuresTable" hidden>
+                <thead>
+                  <tr><th scope="col">Count</th><th scope="col">Kind</th><th scope="col">Target</th><th scope="col">Stage</th><th scope="col">Reason</th></tr>
+                </thead>
+                <tbody id="failuresBody"></tbody>
+              </table>
+              <p class="empty-state" id="failuresEmpty" hidden>No failed connections yet.</p>
+            </article>
+
+            <article class="card">
+              <h2 class="section-title">Diagnostics</h2>
+              <p class="section-subtitle">A plain-text report with the simulated relay counters and timing.</p>
+              <div class="button-row">
+                <button type="button" class="button button-secondary" id="copyDiagnostics">Copy diagnostics</button>
+                <span class="copy-state" id="copyState" role="status" aria-live="polite"></span>
+              </div>
+            </article>
+
+            <article class="card">
+              <h2 class="section-title">App details</h2>
+              <dl class="detail-table">
+                <div><dt>App version</dt><dd id="appVersion">0.1.0</dd></div>
+                <div><dt>Platform</dt><dd id="appPlatform">Detecting</dd></div>
+                <div><dt>Default interface</dt><dd id="appIface">Unknown</dd></div>
+                <div><dt>Mode</dt><dd id="appMode">Demo. Data is simulated.</dd></div>
+                <div><dt>Status</dt><dd id="appStatus">Starting</dd></div>
+                <div><dt>Demo data</dt><dd id="appDemo">Simulated by DemoBackend</dd></div>
+              </dl>
+            </article>
+
+            <article class="card" id="demoLimits">
+              <h2 class="section-title">Demo limitations</h2>
+              <ul class="limitation-list">
+                <li>No tunnel and no route change.</li>
+                <li>No network listener and no external request.</li>
+                <li>No real service, credential, or source device.</li>
+                <li>No Windows or Linux tunnel support.</li>
+                <li>No claim that a tunnel is on when the demo bridge is unavailable.</li>
+              </ul>
+              <p class="note">The demo bridge redacts credential-like fields. It cannot start the real engine.</p>
+            </article>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="false"></div>
+  <script src="/model.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

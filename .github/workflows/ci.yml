@@ -1,0 +1,266 @@
+name: CI
+
+# Hermetic checks only. No job changes routes, creates a tunnel device, or
+# needs a phone. Tests use loopback servers, mock tunnel devices, and fakes.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+
+jobs:
+  rust-macos:
+    name: Rust (macOS) type check, test, build
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Type check (all targets)
+        working-directory: rust
+        run: cargo check --all-targets --locked
+      - name: Test
+        working-directory: rust
+        run: cargo test --locked
+      - name: Build release binary
+        working-directory: rust
+        run: cargo build --release --locked
+      - name: GUI smoke test (demo backend)
+        run: scripts/gui_smoke.sh rust/target/release/hotspotshade
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hotspotshade-macos-arm64
+          path: rust/target/release/hotspotshade
+          retention-days: 14
+
+  # The tunnel is not implemented on Windows. Keep the portable code tested.
+  rust-windows:
+    name: Rust (Windows) type check and test
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Type check (all targets)
+        shell: bash
+        working-directory: rust
+        run: cargo check --all-targets --locked
+      - name: Test
+        shell: bash
+        working-directory: rust
+        run: cargo test --locked
+      - name: Clippy (Windows code)
+        shell: bash
+        working-directory: rust
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  rust-linux:
+    name: Rust (Linux) foundation checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Type check (all targets)
+        working-directory: rust
+        run: cargo check --all-targets --locked
+      - name: Test
+        working-directory: rust
+        run: cargo test --locked
+      - name: Clippy (Linux code)
+        working-directory: rust
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test disposable VM cleanup
+        run: bash scripts/tests/linux_vm_test_test.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test Linux Electron demo model and security
+        working-directory: linux
+        run: npm test
+      - name: Test Linux Electron demo in a sandboxed webview
+        run: bash linux/scripts/test-container.sh smoke
+
+  desktop-demo:
+    name: Shared desktop demo checks
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+      - name: Test Rust bridge and assets
+        run: cargo test --locked --manifest-path desktop/Cargo.toml
+      - name: Test fetch shim and page model
+        run: node --test desktop/tests/fetch_shim.test.mjs desktop/tests/ui_model.test.mjs
+      - name: Test browser failure report formatting
+        run: node --test gui_assets/app.test.mjs
+      - name: Build desktop demo
+        run: cargo build --locked --manifest-path desktop/Cargo.toml
+      - name: Webview smoke test (hidden window, embedded assets)
+        run: cargo test --locked --manifest-path desktop/Cargo.toml --features webview-smoke --test webview_smoke
+      - name: Lint desktop code
+        run: cargo clippy --locked --manifest-path desktop/Cargo.toml --features webview-smoke --all-targets -- -D warnings
+      - name: Check desktop formatting
+        run: cargo fmt --manifest-path desktop/Cargo.toml -- --check
+
+  desktop-windows:
+    name: Shared desktop demo checks (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+      - name: Test desktop demo
+        run: cargo test --locked --manifest-path desktop/Cargo.toml
+
+  winui-demo:
+    name: WinUI demo model and build checks
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Test WinUI demo state and source contracts
+        run: dotnet run --project windows/tests/HotspotShade.WinUI2.Core.Tests/HotspotShade.WinUI2.Core.Tests.csproj --configuration Release
+      - uses: microsoft/setup-msbuild@v2
+      - name: Build WinUI demo (unsigned, no deployment)
+        run: >-
+          msbuild windows/HotspotShade.WinUI2.sln /restore
+          /p:Configuration=Debug /p:Platform=x64
+          /p:HotspotShadeSdkVersion=10.0.26100.0
+          /p:GenerateAppxPackageOnBuild=false /p:AppxBundle=Never
+          /p:AppxPackageSigningEnabled=false /m
+
+  lint:
+    name: Lint
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Clippy
+        working-directory: rust
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Format check
+        working-directory: rust
+        run: cargo fmt --check
+
+  android-demo:
+    name: Android demo tests and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK platform and build tools
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+      - name: Test, lint, and build the Android demo
+        working-directory: android
+        run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
+
+  ios:
+    name: iOS tests, simulator build, unsigned IPA
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Logic tests (fake links and clocks, no sockets)
+        run: scripts/swift_tests.sh
+      - name: Simulator build
+        run: >
+          xcodebuild -project ios/HotspotProxy.xcodeproj -scheme HotspotProxy
+          -configuration Debug -sdk iphonesimulator
+          -destination 'generic/platform=iOS Simulator'
+          CODE_SIGNING_ALLOWED=NO build
+      - name: Build unsigned IPA
+        run: scripts/build_ipa.sh build/HotspotShade-iOS-unsigned.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HotspotShade-iOS-unsigned-ipa
+          path: build/HotspotShade-iOS-unsigned.ipa
+          retention-days: 14
+
+  macos-app:
+    name: macOS app tests and unsigned app
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Build demo engine
+        run: cargo build --release --locked --manifest-path rust/Cargo.toml
+      - name: Swift package tests
+        run: HS_TEST_DEMO_BINARY="$PWD/rust/target/release/hotspotshade" swift test --package-path macos/HotspotShadeKit
+      - name: Build unsigned app
+        run: scripts/build_mac_app.sh build/HotspotShade-unsigned.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HotspotShade-macos-unsigned
+          path: build/HotspotShade-unsigned.zip
+          retention-days: 14
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [rust-macos, rust-windows, rust-linux, desktop-demo, desktop-windows, winui-demo, android-demo, ios, macos-app, lint]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: |
+            The iOS app is called HotspotShade. The IPA is unsigned. Sign it with your own certificate before you install it. See ios/README.md.
+
+            The binary for the target device has no executable bit after download. Run chmod +x on the file.
+
+            The HotspotShade app for macOS is ad-hoc signed and runs on arm64 only.
+        run: |
+          mv dist/hotspotshade-macos-arm64/hotspotshade dist/hotspotshade-macos-arm64.bin
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "$NOTES" \
+            dist/HotspotShade-iOS-unsigned-ipa/HotspotShade-iOS-unsigned.ipa \
+            dist/hotspotshade-macos-arm64.bin \
+            dist/HotspotShade-macos-unsigned/HotspotShade-unsigned.zip

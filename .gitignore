@@ -1,0 +1,37 @@
+# Build output
+/build/
+rust/target/
+rust/target-linux-check/
+**/DerivedData/
+# Xcode user state
+**/xcuserdata/
+*.xcuserstate
+# Large benchmark payload (50 MB of generated data)
+# Never commit these
+wintun.dll
+*.pem
+*.key
+*.mobileprovision
+# OS and editor files
+.DS_Store
+__pycache__/
+*.pyc
+
+# Swift package build output
+**/.build/
+**/.swiftpm/
+
+# Build output and caches
+**/target/
+**/node_modules/
+linux/build/
+linux/.shots/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.apk
+*.deb
+*.ipa
+*.log
+probes/

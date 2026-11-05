@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!--
+      The instrumented interop test runs in the target app process. Android
+      grants the INTERNET permission from the target app, not from the test
+      APK. This debug overlay keeps the main manifest without permission.
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
+</manifest>

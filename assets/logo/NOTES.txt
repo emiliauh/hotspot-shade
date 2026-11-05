@@ -1,0 +1,126 @@
+HotspotShade logo
+
+CONCEPT
+Night Signal, concept B, is the production icon.
+A deep navy tile holds a bright signal mark. The tile is the shade and the mark is the signal.
+The tile is a superellipse with exponent 5. It is 824 by 824 on a 1024 canvas. The transparent padding is 100 px.
+The mark is a dot and two arcs. The axis points up and to the right at 20 degrees from vertical.
+A light rim follows the tile edge. It improves the boundary on a dark page at 29 px and above.
+The iOS icon is full bleed. The system mask gives the corner shape. The iOS icon has no rim.
+The web sidebar uses a simplified signal glyph. The favicon uses Night Signal.
+
+PALETTE
+Tile start: #2B3568. Top left.
+Tile middle: #151D42.
+Tile end: #070B18. Bottom right.
+Rim: #B7C8FF at 45 percent. Then #8FA6F0 at 16 percent. Then #8FA6F0 at 7 percent.
+Mark: #F3F8FF.
+Template mark: #000000.
+Shadow: #000000 at 38 percent.
+
+CLEAR SPACE
+Keep 100 px clear around the tile at 1024 px. This is 10 percent of the width.
+The rim adds 6 px outside the tile edge on the transparent logos.
+Keep at least 130 px between the mark and the tile edge. The mark is 558 px wide on the 824 px tile.
+
+MINIMUM SIZE
+App icon: 16 px.
+Standalone mark: 16 px.
+Favicon: 16 px.
+At 40 px and 29 px the two arcs are separate. The dot, the two arcs and the diagonal direction stay clear.
+At 16 px the arc caps can touch. The dot and the diagonal direction remain. The outer arc detail is gone.
+The rim is less than one pixel wide at 16 px. The boundary is weak on a dark page.
+
+FILES
+logo.svg
+  Source of truth for the squircle brand mark. Dark tile, light rim, transparent corners.
+logo-1024.png
+  1024 px squircle for a README or a dark page. No shadow.
+logo-512.png
+  512 px version of logo-1024.png.
+logo-square.svg
+  Full-bleed source for the iOS app icon. No rim.
+logo-ios-1024.png
+  iOS AppIcon, 1024 px universal. Opaque, no alpha, sRGB, full-bleed square.
+  iOS applies the squircle mask. Do not round this file.
+logo-mac.svg
+  Source for the macOS icon. Squircle, rim and soft shadow.
+logo-mac-1024.png
+  macOS icon, 1024 px. Squircle, soft shadow, transparent corners. Good for the README.
+logo-mac-512.png
+  512 px version of logo-mac-1024.png.
+mac-icon-16.png to mac-icon-1024.png
+  The macOS AppIcon set. Each size is rendered from logo-mac-1024.png.
+mark.svg
+  Symbol only, 256 viewBox, flat #F3F8FF. Use on dark surfaces.
+mark-template.svg
+  Symbol only, 256 viewBox, black. Use for a template image or a menu bar glyph.
+favicon.svg
+  32 by 32 viewBox. Squircle tile, rim and mark. Inline safe. No external assets.
+concept-a.svg, concept-b.svg, concept-c.svg
+  The three design directions.
+concept-a.png, concept-b.png, concept-c.png
+  1024 px renders of the concepts.
+concepts.png
+  Comparison sheet. 340, 120, 40, 29 and 16 px.
+icon-backgrounds.png
+  Production check sheet. Light and dark backgrounds at 340, 120, 40, 29 and 16 px.
+  It also shows the 16 px icon at 8x with nearest sampling.
+render.sh
+  Regenerates the PNGs, checks the catalogs and updates both app icon catalogs.
+  No network. No Python.
+render_helper.swift
+  Helpers for the opaque iOS PNG, the concept sheet and the background check sheet.
+
+WHERE EACH FILE GOES
+iOS AppIcon: logo-ios-1024.png in the 1024 universal slot.
+macOS AppIcon: mac-icon-16.png through mac-icon-1024.png.
+README: logo-mac-1024.png at 160 px for the shadow, or logo-1024.png for a flat mark.
+Web favicon: favicon.svg.
+Dark surfaces: mark.svg.
+Template image or menu bar: mark-template.svg.
+In-app brand mark: logo-1024.png or logo.svg.
+
+README SNIPPET
+Add this line to the README when you want the shadowed squircle:
+
+  <img src="assets/logo/logo-mac-1024.png" width="160" alt="HotspotShade">
+
+Use logo-1024.png instead of logo-mac-1024.png for the flat version.
+The web server embeds favicon.svg directly from this directory.
+
+RENDERER
+sips renders the SVG. It supports linear gradients, use, stroke gradients, opacity, alpha and Gaussian blur.
+sips does not keep the round cap at the start of a stroked path when a mask is applied. The final SVGs use no masks or clip paths.
+qlmanage adds a white matte, so it cannot make the transparent PNGs. sips keeps alpha, so the script uses sips.
+The macOS icon shadow uses feGaussianBlur. It renders correctly.
+
+COMMANDS
+  cd assets/logo
+  ./render.sh
+  sips -g hasAlpha -g profile -g pixelWidth logo-ios-1024.png
+  sips -g hasAlpha -g profile -g pixelWidth logo-mac-1024.png
+  sips -z 29 29 logo-ios-1024.png --out /tmp/hs_logo/final-ios-29.png
+  sips -z 16 16 logo-ios-1024.png --out /tmp/hs_logo/final-ios-16.png
+  sips -z 160 160 logo-mac-1024.png --out /tmp/hs_logo/final-readme-160.png
+  sips -s format png favicon.svg --out /tmp/hs_logo/final-favicon-32.png
+  sips -z 16 16 /tmp/hs_logo/final-favicon-32.png --out /tmp/hs_logo/final-favicon-16.png
+  sips -s format png mark.svg --out /tmp/hs_logo/mark.png
+  sips -s format png mark-template.svg --out /tmp/hs_logo/mark-template.png
+  sh -n render.sh
+
+The script uses these commands for the production PNGs:
+  sips -s format png <source>.svg --out <target>.png
+  sips -z <size> <size> logo-mac-1024.png --out mac-icon-<size>.png
+  sips -m "/System/Library/ColorSync/Profiles/sRGB Profile.icc" <file>.png --out <file>.png
+  swift render_helper.swift opaque <input>.png logo-ios-1024.png
+  swift render_helper.swift backgrounds icon-backgrounds.png logo-mac-1024.png
+  swift render_helper.swift sheet concepts.png concept-a.png concept-b.png concept-c.png
+
+CHECKS
+logo-ios-1024.png is 1024 by 1024, has no alpha channel and uses sRGB.
+logo-mac-1024.png is 1024 by 1024, has alpha and uses sRGB.
+The mac icon set keeps alpha and sRGB.
+The script checks that every file in both AppIcon catalogs exists, has the size of its slot and keeps the alpha channel that the slot needs.
+The concepts sheet uses a light background so the dark variants and the shadows are visible.
+The background check sheet uses #F5F7FA and #090D17. Use it to check the tile boundary at 16, 29 and 40 px.

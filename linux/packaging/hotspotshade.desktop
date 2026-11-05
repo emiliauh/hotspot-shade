@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=HotspotShade
+GenericName=Hotspot normalizer
+Comment=Use the source device hotspot on this target device.
+Exec=/opt/hotspotshade/HotspotShade %U
+Icon=hotspotshade
+Terminal=false
+Categories=Network;System;
+StartupNotify=true
+StartupWMClass=HotspotShade

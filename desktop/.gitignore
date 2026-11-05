@@ -1,0 +1,4 @@
+# Tauri build schemas.
+/gen/
+# Rust build output.
+/target/

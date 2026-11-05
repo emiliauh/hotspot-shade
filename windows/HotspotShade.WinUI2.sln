@@ -1,0 +1,37 @@
+
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{A5A43C5B-DE2A-4C0C-9213-0A381AF9435A}") = "HotspotShade.WinUI2", "src\HotspotShade.WinUI2\HotspotShade.WinUI2.csproj", "{7A8F3D2C-4B1E-4C7A-9E2D-1F3B5C7D9A01}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "HotspotShade.WinUI2.Core", "src\HotspotShade.WinUI2.Core\HotspotShade.WinUI2.Core.csproj", "{2C4E6A8B-1D3F-4A5C-8B7E-9D0F1A2B3C4D}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "HotspotShade.WinUI2.Core.Tests", "tests\HotspotShade.WinUI2.Core.Tests\HotspotShade.WinUI2.Core.Tests.csproj", "{5E7A9C1D-3F2B-4D6E-8A0C-2B4D6F8A0C1E}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{7A8F3D2C-4B1E-4C7A-9E2D-1F3B5C7D9A01}.Debug|x64.ActiveCfg = Debug|x64
+		{7A8F3D2C-4B1E-4C7A-9E2D-1F3B5C7D9A01}.Debug|x64.Build.0 = Debug|x64
+		{7A8F3D2C-4B1E-4C7A-9E2D-1F3B5C7D9A01}.Release|x64.ActiveCfg = Release|x64
+		{7A8F3D2C-4B1E-4C7A-9E2D-1F3B5C7D9A01}.Release|x64.Build.0 = Release|x64
+		{2C4E6A8B-1D3F-4A5C-8B7E-9D0F1A2B3C4D}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{2C4E6A8B-1D3F-4A5C-8B7E-9D0F1A2B3C4D}.Debug|x64.Build.0 = Debug|Any CPU
+		{2C4E6A8B-1D3F-4A5C-8B7E-9D0F1A2B3C4D}.Release|x64.ActiveCfg = Release|Any CPU
+		{2C4E6A8B-1D3F-4A5C-8B7E-9D0F1A2B3C4D}.Release|x64.Build.0 = Release|Any CPU
+		{5E7A9C1D-3F2B-4D6E-8A0C-2B4D6F8A0C1E}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{5E7A9C1D-3F2B-4D6E-8A0C-2B4D6F8A0C1E}.Debug|x64.Build.0 = Debug|Any CPU
+		{5E7A9C1D-3F2B-4D6E-8A0C-2B4D6F8A0C1E}.Release|x64.ActiveCfg = Release|Any CPU
+		{5E7A9C1D-3F2B-4D6E-8A0C-2B4D6F8A0C1E}.Release|x64.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {9B1D3F5A-7C2E-4A8B-9D0F-3E5A7C9B1D2F}
+	EndGlobalSection
+EndGlobal

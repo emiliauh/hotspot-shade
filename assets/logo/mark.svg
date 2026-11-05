@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="HotspotShade mark">
+  <title>HotspotShade mark</title>
+  <g transform="translate(128 128) scale(0.34) translate(-511.7 -512)">
+    <g fill="none" stroke="#F3F8FF" stroke-linecap="round">
+      <path stroke-width="74" d="M339.23 495.32 A204 204 0 0 1 585.67 585.00"/>
+      <path stroke-width="84" d="M274.93 318.64 A392 392 0 0 1 748.48 491.00"/>
+    </g>
+    <circle cx="409" cy="687" r="84" fill="#F3F8FF"/>
+  </g>
+</svg>

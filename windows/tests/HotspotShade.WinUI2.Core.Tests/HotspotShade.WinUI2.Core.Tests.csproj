@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>HotspotShade.WinUI2.Core.Tests</RootNamespace>
+    <AssemblyName>HotspotShade.WinUI2.Core.Tests</AssemblyName>
+    <LangVersion>7.3</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\HotspotShade.WinUI2.Core\HotspotShade.WinUI2.Core.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+    xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+    xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+    xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
+    IgnorableNamespaces="uap mp">
+
+  <Identity
+      Name="HotspotShade.WinUI2.Prototype"
+      Publisher="CN=HotspotShade Prototype"
+      Version="0.1.0.0" />
+
+  <mp:PhoneIdentity
+      PhoneProductId="2752C9DB-E97F-44F8-8572-B2E061F1B928"
+      PhonePublisherId="00000000-0000-0000-0000-000000000000" />
+
+  <Properties>
+    <DisplayName>HotspotShade (simulated)</DisplayName>
+    <PublisherDisplayName>HotspotShade</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily
+        Name="Windows.Universal"
+        MinVersion="10.0.17763.0"
+        MaxVersionTested="10.0.22621.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="x-generate" />
+  </Resources>
+
+  <Applications>
+    <Application
+        Id="App"
+        Executable="$targetnametoken$.exe"
+        EntryPoint="HotspotShade.WinUI2.App">
+      <uap:VisualElements
+          DisplayName="HotspotShade (simulated)"
+          Description="A simulated WinUI 2 UI prototype. No engine."
+          BackgroundColor="#101012"
+          Square150x150Logo="Assets\Square150x150Logo.png"
+          Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:SplashScreen
+            Image="Assets\SplashScreen.png"
+            BackgroundColor="#101012" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+
+  <!-- No Capabilities element. This package declares no network, location,
+       microphone, or other capability. It opens no socket. -->
+</Package>
