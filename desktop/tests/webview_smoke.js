@@ -164,7 +164,10 @@
         window.innerWidth + 'x' + window.innerHeight);
       note(checks, failures, label + '_sidebar',
         Math.abs(sidebar.width - expectedSidebar) <= 4,
-        String(Math.round(sidebar.width)));
+        'width=' + Math.round(sidebar.width) +
+          ', media=' + window.matchMedia('(max-width: 820px)').matches +
+          ', token=' + getComputedStyle(document.documentElement).getPropertyValue('--sidebar-width').trim() +
+          ', visibility=' + document.visibilityState);
       note(checks, failures, label + '_content_bounded',
         view.width > 400 && view.width <= 721,
         String(Math.round(view.width)));
@@ -479,7 +482,10 @@
         return false;
       }).then(function (changed) {
         note(checks, failures, 'theme_toggle', themeBefore !== themeAfter && changed,
-          themeBefore + ' -> ' + themeAfter);
+          themeBefore + ' -> ' + themeAfter +
+          ', background=' + backgroundBefore + ' -> ' + getComputedStyle(document.body).backgroundColor +
+          ', token=' + getComputedStyle(document.documentElement).getPropertyValue('--bg').trim() +
+          ', visibility=' + document.visibilityState);
         window.__hotspotshadeMenu('theme');
         try {
           if (storedThemeBefore === null) localStorage.removeItem('hs-theme');
