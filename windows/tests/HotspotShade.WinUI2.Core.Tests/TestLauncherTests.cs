@@ -169,12 +169,12 @@ namespace HotspotShade.WinUI2.Core.Tests
                 string root = FindWindowsRoot();
                 AssertEx.True(root != null, "windows root");
                 string launcher = Path.Combine(root, "src", "HotspotShade.WinUI2.TestLauncher");
-                string program = File.ReadAllText(Path.Combine(launcher, "Program.cs"));
-                string http = File.ReadAllText(Path.Combine(launcher, "LauncherHttp.cs"));
-                string manifest = File.ReadAllText(Path.Combine(launcher, "app.manifest"));
-                string project = File.ReadAllText(Path.Combine(launcher, "HotspotShade.WinUI2.TestLauncher.csproj"));
-                string host = File.ReadAllText(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", "Win32EngineHost.cs"));
-                string runtime = File.ReadAllText(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", "BrokerRuntime.cs"));
+                string program = SourceText.Read(Path.Combine(launcher, "Program.cs"));
+                string http = SourceText.Read(Path.Combine(launcher, "LauncherHttp.cs"));
+                string manifest = SourceText.Read(Path.Combine(launcher, "app.manifest"));
+                string project = SourceText.Read(Path.Combine(launcher, "HotspotShade.WinUI2.TestLauncher.csproj"));
+                string host = SourceText.Read(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", "Win32EngineHost.cs"));
+                string runtime = SourceText.Read(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", "BrokerRuntime.cs"));
 
                 // The listener ownership check comes before the secret copy
                 // and the send in the one request path.
@@ -194,7 +194,7 @@ namespace HotspotShade.WinUI2.Core.Tests
                 AssertEx.Contains(http, "OptionRedirectPolicy = 88", "fixed redirect policy");
                 AssertEx.Contains(project, "Win32EngineHost.cs", "the reviewed engine host");
                 AssertEx.Contains(
-                    File.ReadAllText(Path.Combine(launcher, "LauncherAssembly.cs")),
+                    SourceText.Read(Path.Combine(launcher, "LauncherAssembly.cs")),
                     "DllImportSearchPath.System32",
                     "native DLLs load from System32 only");
 
@@ -215,7 +215,7 @@ namespace HotspotShade.WinUI2.Core.Tests
                     "returnTryCreate(executablePath,trustedRoot,port,true,outhost,outplan,outfailure);",
                     "the old entry keeps the administrator requirement");
                 AssertEx.Contains(Squash(host), "if(requireAdministrator&&!IsElevated())", "the administrator check");
-                string endpoints = File.ReadAllText(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", "EngineEndpoints.cs"));
+                string endpoints = SourceText.Read(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", "EngineEndpoints.cs"));
                 AssertEx.Contains(
                     Squash(endpoints),
                     "Win32EngineHost.TryCreate(path,root,port,false,handoff,outhost,outplan,outfailure)",

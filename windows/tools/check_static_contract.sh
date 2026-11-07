@@ -87,7 +87,7 @@ ok "the app has no demo, preview, or simulated surface"
 if ! grep -q '<Version>2.8.7</Version>' "$project"; then
     fail "WinUI 2.8.7 is not pinned"
 fi
-if ! grep -q '<Version>6.2.15</Version>' "$project"; then
+if ! grep -q '<Version>6.2.14</Version>' "$project"; then
     fail "the UWP package is not pinned"
 fi
 if grep -q '<Version>[^<]*\(\*\|\[\|(\)' "$project"; then

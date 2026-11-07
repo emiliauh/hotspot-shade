@@ -19,7 +19,13 @@
     <!-- NativeAOT: the elevated starter has no .NET host, so no
          DOTNET_STARTUP_HOOKS, profiler, or DOTNET_ROOT value from the user
          environment can load code into it. Publishing needs the MSVC
-         linker (Visual Studio "Desktop development with C++"). -->
+         linker (Visual Studio "Desktop development with C++").
+         Build with .NET SDK 8.0.427 or later 8.0.x (windows\global.json).
+         The SDK chooses the NativeAOT compiler and runtime version. SDK
+         10.x and 8.0 SDKs before 8.0.427 choose 8.0.31, which has advisory
+         GHSA-p3jp-9v83-76w9 (fixed in 8.0.33). TreatWarningsAsErrors turns
+         that advisory (NU1903) into a build error, which is intended: do not
+         add NoWarn or WarningsNotAsErrors for it. -->
     <PublishAot>true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
     <UseSystemResourceKeys>true</UseSystemResourceKeys>

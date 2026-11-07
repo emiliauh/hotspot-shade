@@ -2557,7 +2557,8 @@ const RESULT_MARGIN_SECONDS: u64 = 2;
 /// after the target device closed the connection. A source device that misses
 /// the close could then add trust for a pairing that the target device already
 /// reported as failed. A silent source device can hold the GUI for at most
-/// about 246 seconds; the person can cancel at any time.
+/// about 246 seconds, or 247 seconds on Windows; the person can cancel at any
+/// time.
 #[derive(Clone, Copy, Debug)]
 pub struct PairTimeouts {
     pub connect: Duration,
@@ -2566,10 +2567,23 @@ pub struct PairTimeouts {
     /// From REVEAL to RESULT. It covers [`SOURCE_MAX_DECISION_SECONDS`].
     pub result: Duration,
 }
+/// The connect bound for one pairing listener connection.
+///
+/// Windows reports a refused connect only after it retries the SYN that the
+/// peer reset. That took about 2 seconds on loopback on Windows Server 2025
+/// build 26100. A 2-second bound there reports a closed listener as a timeout
+/// (`not_responding`) instead of a refusal (`not_running`). Windows therefore
+/// gets 3 seconds. macOS and Linux report the reset at once and keep 2
+/// seconds.
+#[cfg(windows)]
+pub(crate) const LISTENER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(not(windows))]
+pub(crate) const LISTENER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
 impl Default for PairTimeouts {
     fn default() -> Self {
         Self {
-            connect: Duration::from_secs(2),
+            connect: LISTENER_CONNECT_TIMEOUT,
             challenge: Duration::from_secs(2),
             result: Duration::from_secs(SOURCE_MAX_DECISION_SECONDS + RESULT_MARGIN_SECONDS),
         }
@@ -2856,7 +2870,7 @@ pub(crate) fn probe_unpaired_at(
         address,
         iface,
         audit,
-        Duration::from_secs(2),
+        LISTENER_CONNECT_TIMEOUT,
         Some(cancel),
     )
     .map_err(|e| match e.kind() {
@@ -2864,9 +2878,9 @@ pub(crate) fn probe_unpaired_at(
         io::ErrorKind::TimedOut => PairError::TimedOut,
         _ => PairError::Unreachable,
     })?;
-    // The connect has its own 2 second bound. The exchange gets a full 2
-    // seconds after the connect, so a slow hotspot link does not leave the
-    // handshake with no time.
+    // The connect has its own bound, `LISTENER_CONNECT_TIMEOUT`. The
+    // exchange gets a full 2 seconds after the connect, so a slow hotspot
+    // link does not leave the handshake with no time.
     let deadline = Instant::now() + Duration::from_secs(2);
     let l_s = identity.public();
     let ephemeral = new_secret()?;
@@ -2999,7 +3013,7 @@ fn authenticated_command(
         address,
         iface,
         audit,
-        Duration::from_secs(2),
+        LISTENER_CONNECT_TIMEOUT,
         Some(cancel),
     )
     .map_err(|e| match e.kind() {
@@ -3007,9 +3021,9 @@ fn authenticated_command(
         io::ErrorKind::TimedOut => PairError::TimedOut,
         _ => PairError::Unreachable,
     })?;
-    // The connect has its own 2 second bound. The exchange gets a full 2
-    // seconds after the connect, so a slow hotspot link does not leave the
-    // handshake with no time.
+    // The connect has its own bound, `LISTENER_CONNECT_TIMEOUT`. The
+    // exchange gets a full 2 seconds after the connect, so a slow hotspot
+    // link does not leave the handshake with no time.
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut reader = FrameReader::default();
     let l_s = identity.public();

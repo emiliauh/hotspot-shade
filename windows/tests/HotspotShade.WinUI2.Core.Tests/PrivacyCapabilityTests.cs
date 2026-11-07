@@ -184,7 +184,7 @@ namespace HotspotShade.WinUI2.Core.Tests
                     card.Descendants().Any(e => (string)e.Attribute("Text") == "{x:Bind Privacy.StorageNote, Mode=OneTime}"),
                     "privacy storage note is missing");
 
-                string codeBehind = File.ReadAllText(Path.Combine(appDir, "MainPage.xaml.cs"));
+                string codeBehind = SourceText.Read(Path.Combine(appDir, "MainPage.xaml.cs"));
                 AssertEx.Contains(codeBehind, "PrivacyCapabilityViewModel Privacy", "page privacy property");
                 int privacyIndex = codeBehind.IndexOf("Privacy = new PrivacyCapabilityViewModel();", StringComparison.Ordinal);
                 int initIndex = codeBehind.IndexOf("this.InitializeComponent();", StringComparison.Ordinal);
@@ -193,7 +193,7 @@ namespace HotspotShade.WinUI2.Core.Tests
 
                 string viewModel = Path.Combine(appDir, "ViewModels", "PrivacyCapabilityViewModel.cs");
                 AssertEx.True(File.Exists(viewModel), "privacy view model is missing");
-                string viewModelText = File.ReadAllText(viewModel);
+                string viewModelText = SourceText.Read(viewModel);
                 AssertEx.Contains(viewModelText, "CanEnable", "view model enable state");
                 AssertEx.DoesNotContain(viewModelText, "IsEnabled = true", "view model must not enable a control");
             });

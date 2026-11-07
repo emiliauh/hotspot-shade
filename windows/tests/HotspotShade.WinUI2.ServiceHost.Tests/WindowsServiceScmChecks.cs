@@ -709,7 +709,7 @@ namespace HotspotShade.WinUI2.ServiceHost.Tests
                 };
                 for (int fileIndex = 0; fileIndex < files.Length; fileIndex++)
                 {
-                    string text = File.ReadAllText(files[fileIndex]);
+                    string text = SourceText.Read(files[fileIndex]);
                     for (int wordIndex = 0; wordIndex < forbidden.Length; wordIndex++)
                     {
                         ServiceHostAssert.DoesNotContain(
@@ -724,13 +724,13 @@ namespace HotspotShade.WinUI2.ServiceHost.Tests
             {
                 string root = RepoRoot();
                 ServiceHostAssert.True(root != null, "repo root");
-                string solution = File.ReadAllText(
+                string solution = SourceText.Read(
                     Path.Combine(root, "windows", "HotspotShade.WinUI2.sln"));
                 ServiceHostAssert.DoesNotContain(
                     solution,
                     "HotspotShade.WinUI2.Service",
                     "not in the solution");
-                string appProject = File.ReadAllText(
+                string appProject = SourceText.Read(
                     Path.Combine(
                         root,
                         "windows",

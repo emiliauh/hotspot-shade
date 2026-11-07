@@ -516,9 +516,10 @@ fn status_failure_state(error: &PairError, paired: bool) -> &'static str {
 /// Probe the pairing listener once over a normalized outer socket pinned to
 /// `iface`. The interface is not optional: every egress socket carries the
 /// physical pin, so no caller can open an unpinned probe. The probe sends no
-/// proxy token. It is bounded: 2 seconds for the connection and 2 seconds for
-/// the exchange. Return None when `cancel` stopped the probe; a cancelled
-/// probe is not an answer.
+/// proxy token. It is bounded: `pairing::LISTENER_CONNECT_TIMEOUT` for each
+/// connection (2 seconds, or 3 seconds on Windows, where a refusal takes about
+/// 2 seconds) and 2 seconds for the exchange. Return None when `cancel` stopped
+/// the probe; a cancelled probe is not an answer.
 pub(crate) fn probe_listener(
     address: SocketAddr,
     iface: u32,
@@ -536,7 +537,7 @@ pub(crate) fn probe_listener(
         address,
         Some(iface),
         &audit,
-        Duration::from_secs(2),
+        pairing::LISTENER_CONNECT_TIMEOUT,
         Some(cancel),
     ) {
         if error.kind() == io::ErrorKind::Interrupted {
@@ -820,12 +821,20 @@ mod tests {
     }
 
     fn loopback_iface() -> u32 {
-        let name = if cfg!(target_os = "macos") {
+        // Windows names the loopback pseudo-interface `loopback_0` for
+        // if_nametoindex. Its index is 1 on every Windows version.
+        let name = if cfg!(windows) {
+            "loopback_0"
+        } else if cfg!(target_os = "macos") {
             "lo0"
         } else {
             "lo"
         };
-        crate::normalization::interface_index(name).unwrap()
+        let index = crate::normalization::interface_index(name).unwrap();
+        if cfg!(windows) {
+            assert_eq!(index, 1, "unexpected Windows loopback index");
+        }
+        index
     }
 
     fn probe(address: SocketAddr, paired: bool) -> ListenerAnswer {

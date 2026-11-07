@@ -40,6 +40,48 @@ $windows = Split-Path -Parent $PSScriptRoot
 $repo = Split-Path -Parent $windows
 $payload = Join-Path $windows "out\payload"
 
+# The build needs .NET SDK 8.0.427 or later 8.0.x. Older 8.0 SDKs and every
+# 10.x SDK pull a NativeAOT compiler and runtime from the 8.0.31 patch level.
+# That level has a known advisory (GHSA-p3jp-9v83-76w9, fixed in 8.0.33), and
+# the elevated starter build treats the advisory as an error. windows\global.json
+# asks for 8.0.427. dotnet reads global.json from the current folder, so run
+# every dotnet command from the windows folder.
+$minimumSdk = [Version]"8.0.427"
+$previousPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+Push-Location -LiteralPath $windows
+try {
+    $sdkText = (& dotnet --version 2>&1 | Out-String).Trim()
+    $sdkOk = ($LASTEXITCODE -eq 0)
+} catch {
+    $sdkText = $_.Exception.Message
+    $sdkOk = $false
+} finally {
+    Pop-Location
+    $ErrorActionPreference = $previousPreference
+}
+if (-not $sdkOk -or $sdkText -notmatch '^(\d+\.\d+\.\d+)') {
+    throw ("No usable .NET SDK was found. Install .NET SDK 8.0.427 or a later 8.0.x SDK " +
+        "from https://dotnet.microsoft.com/download/dotnet/8.0 (it can sit next to newer SDKs). " +
+        "dotnet said: $sdkText")
+}
+$sdkVersion = [Version]$Matches[1]
+if ($sdkVersion.Major -ne 8 -or $sdkVersion -lt $minimumSdk) {
+    throw ("The .NET SDK in use is $sdkText. This build needs .NET SDK 8.0.427 or a later 8.0.x SDK. " +
+        "Install it from https://dotnet.microsoft.com/download/dotnet/8.0 and run this script again.")
+}
+$1
+# Run dotnet from the windows folder so it reads windows\global.json.
+function Invoke-WindowsDotnet([string]$Failure, [string[]]$Arguments) {
+    Push-Location -LiteralPath $windows
+    try {
+        & dotnet @Arguments
+        if ($LASTEXITCODE -ne 0) { throw "$Failure with exit code $LASTEXITCODE." }
+    } finally {
+        Pop-Location
+    }
+}
+
 if (Test-Path -LiteralPath $payload) {
     Remove-Item -LiteralPath $payload -Recurse -Force
 }
@@ -59,8 +101,18 @@ Copy-Item -LiteralPath $engine -Destination (Join-Path $payload "Engine\hotspots
 
 $contained = if ($FrameworkDependent) { "false" } else { "true" }
 Write-Host "Publishing the broker (self-contained: $contained)."
-& dotnet publish (Join-Path $windows "src\HotspotShade.WinUI2.Broker\HotspotShade.WinUI2.Broker.csproj") -c Release -r win-x64 --self-contained $contained -o (Join-Path $payload "Broker")
-if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed for the broker with exit code $LASTEXITCODE." }
+Invoke-WindowsDotnet -Failure "dotnet publish failed for the broker" -Arguments @("publish", (Join-Path $windows "src\HotspotShade.WinUI2.Broker\HotspotShade.WinUI2.Broker.csproj"), "-c", "Release", "-r", "win-x64", "--self-contained", $contained, "-o", (Join-Path $payload "Broker"))
+if ($contained -eq "true") {
+    # A self-contained broker carries its own runtime. Refuse a payload whose
+    # runtime is older than 8.0.33, the first patch without the advisory.
+    $coreLib = Join-Path $payload "Broker\System.Private.CoreLib.dll"
+    if (-not (Test-Path -LiteralPath $coreLib)) { throw "The self-contained broker has no System.Private.CoreLib.dll." }
+    $runtimeText = (Get-Item -LiteralPath $coreLib).VersionInfo.ProductVersion
+    if ($runtimeText -notmatch '^(\d+\.\d+\.\d+)' -or [Version]$Matches[1] -lt [Version]"8.0.33" -or ([Version]$Matches[1]).Major -ne 8) {
+        throw "The broker runtime is $runtimeText. It must be .NET 8.0.33 or later 8.0.x. Install .NET SDK 8.0.427 or later and run this script again."
+    }
+    Write-Host "Broker runtime: $runtimeText."
+}
 
 # The elevated starter runs with administrator rights. NativeAOT removes the
 # .NET host, so no startup hook, profiler, or DOTNET_ROOT value from the user
@@ -69,8 +121,7 @@ if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed for the broker with exit
 # Elevate.csproj. Do not pass PublishAot as a global -p property here: it also
 # reaches the netstandard2.0 Core reference and fails with NETSDK1207.
 Write-Host "Publishing the elevated starter (NativeAOT)."
-& dotnet publish (Join-Path $windows "src\HotspotShade.WinUI2.Elevate\HotspotShade.WinUI2.Elevate.csproj") -c Release -r win-x64 -o (Join-Path $payload "Elevate")
-if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed for the elevated starter with exit code $LASTEXITCODE." }
+Invoke-WindowsDotnet -Failure "dotnet publish failed for the elevated starter" -Arguments @("publish", (Join-Path $windows "src\HotspotShade.WinUI2.Elevate\HotspotShade.WinUI2.Elevate.csproj"), "-c", "Release", "-r", "win-x64", "-o", (Join-Path $payload "Elevate"))
 $managed = Get-ChildItem -LiteralPath (Join-Path $payload "Elevate") -Filter "*.dll" -ErrorAction SilentlyContinue
 if ($managed) { throw "The elevated starter folder holds DLLs; the NativeAOT publish did not produce a single native program." }
 Get-ChildItem -LiteralPath (Join-Path $payload "Elevate") -Filter "*.pdb" | Remove-Item

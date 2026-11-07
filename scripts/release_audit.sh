@@ -2874,11 +2874,11 @@ EOF
   digest_bad=0
   for verifier in verify-macos-binary verify-ios-ipa verify-macos-app; do
     block=$(job_block "$workflow" "$verifier")
-    printf '%s\n' "$block" | grep -xF '        value: ${{ steps.digest.outputs.sha256 }}' >/dev/null || digest_bad=1
+    printf '%s\n' "$block" | grep -xF '      sha256: ${{ steps.digest.outputs.sha256 }}' >/dev/null || digest_bad=1
     printf '%s\n' "$block" | grep -xF '      - name: Record the verified artifact digest' >/dev/null || digest_bad=1
   done
   integrity_block=$(job_block "$workflow" artifact-integrity)
-  printf '%s\n' "$integrity_block" | grep -xF '        value: ${{ steps.manifest.outputs.sha256 }}' >/dev/null || digest_bad=1
+  printf '%s\n' "$integrity_block" | grep -xF '      manifest-sha256: ${{ steps.manifest.outputs.sha256 }}' >/dev/null || digest_bad=1
   printf '%s\n' "$integrity_block" | grep -F 'sh scripts/release_manifest.sh --expect "$BINARY_SHA256"' >/dev/null || digest_bad=1
   printf '%s\n' "$release_block" | grep -xF '          MANIFEST_SHA256: ${{ needs.artifact-integrity.outputs.manifest-sha256 }}' >/dev/null || digest_bad=1
   printf '%s\n' "$release_block" | grep -xF '          sh scripts/release_manifest.sh --expect "$MANIFEST_SHA256" release/SHA256SUMS' >/dev/null || digest_bad=1

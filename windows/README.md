@@ -282,6 +282,7 @@ icon, and direct mode.
 ```text
 windows/
   BUILD_AND_TEST_ON_PC.md        prerequisites, build, install, live test, cleanup
+  global.json                    requires .NET SDK 8.0.427 or a later 8.0.x
   HotspotShade.WinUI2.sln
   PARITY.md
   SERVICE_BOUNDARY.md            the separate service foundation, not used by the app
@@ -311,6 +312,8 @@ windows/
                                  host foundation
   tools/
     stage_payload.ps1            builds windows/out/payload for the package
+    check_package_dependencies.ps1  checks that a built package's manifest
+                                 matches its bundled dependency files
     check_static_contract.sh     checks the package contract, docs, and ASCII
     check_csharp_balance.mjs     checks C# delimiters
 ```
@@ -333,11 +336,19 @@ service foundation. The app does not use them. Their hermetic tests still run.
 | Dependency | Version | Reason |
 |---|---|---|
 | `Microsoft.UI.Xaml` | 2.8.7 | WinUI 2 controls: `MenuBar`, `NavigationView`, `ProgressBar`, `ProgressRing`. |
-| `Microsoft.NETCore.UniversalWindowsPlatform` | 6.2.15 | UWP runtime and build support. |
+| `Microsoft.NETCore.UniversalWindowsPlatform` | 6.2.14 | UWP runtime and build support. Not 6.2.15: that version made a package that Windows refused to install (see below). |
 | Windows Desktop Extensions for the UWP | the target SDK | `FullTrustProcessLauncher`. |
-| .NET SDK | 8.0.100 or later (8.0.x) | Builds the Core library, the broker, the starter, and the test runner. |
-| Windows 11 SDK | 10.0.22621.0 | UWP target platform. |
-| Visual Studio 2022 | 17.10 or later | UWP workload, XAML compiler, packaging. |
+| .NET SDK | 8.0.427 or later (8.0.x), set in `global.json` | Builds the Core library, the broker, the starter, and the test runner. Older 8.0 SDKs and 10.x SDKs build the NativeAOT starter at patch level 8.0.31, which has advisory GHSA-p3jp-9v83-76w9 (fixed in 8.0.33). |
+| Windows 11 SDK | 10.0.22621.0 by default; 10.0.26100.0 works with `/p:HotspotShadeSdkVersion=10.0.26100.0` | UWP target platform. |
+| Visual Studio | 2022 17.10 or later, or 2026 (18.10 tested) | UWP workload, XAML compiler, packaging. |
+
+Why 6.2.14: with 6.2.15 the package manifest required Microsoft .NET Native
+Framework and Runtime 2.3 at 2.3.60521.0 or later, but the dependency files
+that the build put in `Dependencies\x64` were 2.3.60518.0, so `Add-AppxPackage`
+failed with `0x80073CF3`. To test a newer version, build with
+`/p:HotspotShadeUwpVersion=6.2.NN` and run
+`windows\tools\check_package_dependencies.ps1` on the output folder before you
+install. See [BUILD_AND_TEST_ON_PC.md](BUILD_AND_TEST_ON_PC.md), section 4.4.
 
 The package versions are exact pins. The broker and the starter use the Windows
 SDK projection and kernel32, advapi32, shell32, winhttp, and iphlpapi through
@@ -364,7 +375,27 @@ files, and the C# delimiter check reports 125 C# files. These are source
 counts. No Windows host has run the checks.
 
 `dotnet build` cannot build the UWP project. Use MSBuild from a Developer
-Command Prompt or Developer PowerShell for VS 2022.
+Command Prompt or Developer PowerShell for Visual Studio 2022 or 2026.
+
+Build notes from the first native Windows build (Windows Server 2025 build
+26100, Visual Studio Community 2026 18.10 with the UWP workload, Windows SDK
+10.0.26100):
+
+- Use a short checkout path such as `C:\src\hs`. Long paths hit the 260
+  character limit (MAX_PATH).
+- Build in PowerShell or the Visual Studio developer shell, not Git Bash. The
+  NativeAOT publish needs `ProgramFiles(x86)` to find the MSVC linker, and Git
+  Bash drops it.
+- With Visual Studio 2026, `vswhere.exe` must be on `PATH` in the developer
+  shell.
+- Install .NET SDK 8.0.427 or later 8.0.x. `global.json` requires it, and
+  `stage_payload.ps1` stops with a plain message when it is missing.
+- Git for Windows may check files out with CRLF. The root `.gitattributes`
+  keeps text files as LF, which the source-reading checks rely on.
+- A UWP app does not launch when UAC is turned off (`EnableLUA` set to 0). Test
+  as a standard user to see the single UAC prompt at Turn on.
+- On the real install, the starter's install-root check returned Trusted: the
+  owner was SYSTEM, and only TrustedInstaller and SYSTEM had full control.
 
 ## What the UI does
 

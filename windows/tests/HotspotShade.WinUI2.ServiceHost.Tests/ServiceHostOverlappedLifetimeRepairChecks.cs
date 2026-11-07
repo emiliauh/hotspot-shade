@@ -402,7 +402,7 @@ namespace HotspotShade.WinUI2.ServiceHost.Tests
         {
             string root = RepoRoot();
             ServiceHostAssert.True(root != null, "repo root");
-            return File.ReadAllText(Path.Combine(
+            return SourceText.Read(Path.Combine(
                 root,
                 "windows",
                 "src",

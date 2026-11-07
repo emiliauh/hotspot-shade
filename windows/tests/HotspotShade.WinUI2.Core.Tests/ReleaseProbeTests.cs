@@ -395,7 +395,7 @@ namespace HotspotShade.WinUI2.Core.Tests
                     "HotspotShade.WinUI2.ReleaseProbe",
                     "HotspotShade.WinUI2.ReleaseProbe.csproj");
                 AssertEx.True(File.Exists(project), "probe project exists");
-                string text = File.ReadAllText(project);
+                string text = SourceText.Read(project);
                 AssertEx.Contains(text, "<TargetFramework>net8.0</TargetFramework>", "target");
                 AssertEx.DoesNotContain(text, "PackageReference", "no package dependency");
                 AssertEx.Contains(
@@ -403,10 +403,10 @@ namespace HotspotShade.WinUI2.Core.Tests
                     "HotspotShade.WinUI2.Core.csproj",
                     "the probe uses the shared contract");
 
-                string solution = File.ReadAllText(Path.Combine(root, "HotspotShade.WinUI2.sln"));
+                string solution = SourceText.Read(Path.Combine(root, "HotspotShade.WinUI2.sln"));
                 AssertEx.DoesNotContain(solution, "ReleaseProbe", "the probe is not in the app build");
 
-                string runnerSource = File.ReadAllText(Path.Combine(
+                string runnerSource = SourceText.Read(Path.Combine(
                     root,
                     "src",
                     "HotspotShade.WinUI2.ReleaseProbe",

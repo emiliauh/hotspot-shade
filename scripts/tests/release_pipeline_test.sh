@@ -2636,7 +2636,7 @@ expect_status 1 "$status" "a changed build command must fail"
 expect_text "rust-macos differs from the reviewed policy block" "the audit must reject a changed build command"
 
 # The verifier must publish the digest of the bytes it audited.
-sed 's#value: \${{ steps.digest.outputs.sha256 }}#value: ${{ github.run_id }}#' \
+sed 's#sha256: \${{ steps.digest.outputs.sha256 }}#sha256: ${{ github.run_id }}#' \
   "$work/ci.bak" > "$ci_file"
 expect_yaml_valid "$ci_file" "the changed verifier digest fixture"
 audit_status

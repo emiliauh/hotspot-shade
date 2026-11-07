@@ -1581,12 +1581,30 @@ fn verify_windows_control_handles(token: Option<u64>, parent: Option<u64>) -> Re
         if token == parent {
             return Err("token and parent handles must be different".into());
         }
-        #[link(name = "kernel32")]
+        // KernelBase.dll exports CompareObjectHandles. The kernel32 import
+        // library on Windows 11 24H2 and Server 2025 has no entry for it, so
+        // link it with raw-dylib. On x86 the export name is undecorated,
+        // unlike the default stdcall import name.
+        #[cfg_attr(
+            target_arch = "x86",
+            link(
+                name = "kernelbase",
+                kind = "raw-dylib",
+                import_name_type = "undecorated"
+            )
+        )]
+        #[cfg_attr(
+            not(target_arch = "x86"),
+            link(name = "kernelbase", kind = "raw-dylib")
+        )]
         extern "system" {
             fn CompareObjectHandles(
                 first: *mut std::ffi::c_void,
                 second: *mut std::ffi::c_void,
             ) -> i32;
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
             fn SetLastError(error: u32);
             fn GetLastError() -> u32;
         }

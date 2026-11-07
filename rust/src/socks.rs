@@ -330,10 +330,8 @@ fn handle_client(mut client: TcpStream, peer: SocketAddr, s: &Arc<Shared>) -> io
                 }
             };
             // Keep the flow usable if the local kernel rejects this option.
-            let _ = normalization::set_tcp_keepalive(
-                &outer,
-                normalization::TcpKeepalive::SOURCE_DEVICE,
-            );
+            // The first failure is reported once with fixed text.
+            crate::relay::enable_outer_keepalive(&outer);
             let bound = outer.local_addr().unwrap_or_else(|_| zero_addr());
             reply(&mut client, 0, bound)?;
             relay(client, outer, s)

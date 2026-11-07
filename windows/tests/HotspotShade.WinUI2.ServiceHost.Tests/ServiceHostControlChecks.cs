@@ -851,7 +851,7 @@ namespace HotspotShade.WinUI2.ServiceHost.Tests
             {
                 string root = RepoRoot();
                 ServiceHostAssert.True(root != null, "repo root");
-                string composition = File.ReadAllText(Path.Combine(
+                string composition = SourceText.Read(Path.Combine(
                     root,
                     "windows",
                     "src",
@@ -883,7 +883,7 @@ namespace HotspotShade.WinUI2.ServiceHost.Tests
             {
                 string root = RepoRoot();
                 ServiceHostAssert.True(root != null, "repo root");
-                string rust = File.ReadAllText(
+                string rust = SourceText.Read(
                     Path.Combine(root, "rust", "src", "desktop_control.rs"));
                 ServiceHostAssert.Contains(rust, "*b\"HSDC\"", "magic");
                 ServiceHostAssert.Contains(rust, "const VERSION: u8 = 1;", "version");

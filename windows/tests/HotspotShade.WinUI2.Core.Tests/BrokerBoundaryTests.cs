@@ -393,7 +393,7 @@ namespace HotspotShade.WinUI2.Core.Tests
             {
                 string root = FindWindowsRoot();
                 AssertEx.True(root != null, "windows root");
-                string table = File.ReadAllText(Path.Combine(
+                string table = SourceText.Read(Path.Combine(
                     root,
                     "src",
                     "HotspotShade.WinUI2.TestLauncher",
@@ -447,7 +447,7 @@ namespace HotspotShade.WinUI2.Core.Tests
             {
                 string root = FindWindowsRoot();
                 AssertEx.True(root != null, "windows root");
-                string manifest = File.ReadAllText(Path.Combine(root, "src", "HotspotShade.WinUI2", "Package.appxmanifest"));
+                string manifest = SourceText.Read(Path.Combine(root, "src", "HotspotShade.WinUI2", "Package.appxmanifest"));
                 AssertEx.Contains(manifest, "EntryPoint=\"Windows.FullTrustApplication\"", "full-trust entry point");
                 // 2 bytes per UTF-16 character stays well under ~100 KB.
                 AssertEx.True(
@@ -459,7 +459,7 @@ namespace HotspotShade.WinUI2.Core.Tests
             {
                 string root = FindWindowsRoot();
                 AssertEx.True(root != null, "windows root");
-                string host = File.ReadAllText(Path.Combine(
+                string host = SourceText.Read(Path.Combine(
                     root,
                     "src",
                     "HotspotShade.WinUI2.Broker",
@@ -482,13 +482,13 @@ namespace HotspotShade.WinUI2.Core.Tests
                     copyAt >= 0 && taskAt > copyAt,
                     "the host copies the secret before the launch task starts");
 
-                string runtime = File.ReadAllText(Path.Combine(
+                string runtime = SourceText.Read(Path.Combine(
                     root,
                     "src",
                     "HotspotShade.WinUI2.Broker",
                     "BrokerRuntime.cs"));
                 AssertEx.Contains(runtime, "args.Length != 0", "no broker arguments");
-                string endpoints = File.ReadAllText(Path.Combine(
+                string endpoints = SourceText.Read(Path.Combine(
                     root,
                     "src",
                     "HotspotShade.WinUI2.Broker",
@@ -499,7 +499,7 @@ namespace HotspotShade.WinUI2.Core.Tests
                     "fixed engine path");
                 AssertEx.Contains(endpoints, "ListenerTable.Check(engine.Port, engine.ProcessId)", "listener owner check before every request");
 
-                string client = File.ReadAllText(Path.Combine(
+                string client = SourceText.Read(Path.Combine(
                     root,
                     "src",
                     "HotspotShade.WinUI2.TestLauncher",
@@ -508,7 +508,7 @@ namespace HotspotShade.WinUI2.Core.Tests
                 AssertEx.Contains(client, "OptionRedirectPolicy = 88", "fixed redirect policy");
                 AssertEx.DoesNotContain(client, "System" + ".Net", "no managed proxy or name lookup");
 
-                string appProject = File.ReadAllText(Path.Combine(
+                string appProject = SourceText.Read(Path.Combine(
                     root,
                     "src",
                     "HotspotShade.WinUI2",
@@ -531,8 +531,8 @@ namespace HotspotShade.WinUI2.Core.Tests
                     "HotspotShade.WinUI2.Broker.csproj");
                 AssertEx.True(File.Exists(solution), "solution");
                 AssertEx.True(File.Exists(project), "broker project");
-                AssertEx.Contains(File.ReadAllText(solution), "HotspotShade.WinUI2.Broker.csproj", "solution entry");
-                string text = File.ReadAllText(project);
+                AssertEx.Contains(SourceText.Read(solution), "HotspotShade.WinUI2.Broker.csproj", "solution entry");
+                string text = SourceText.Read(project);
                 AssertEx.Contains(text, "net8.0-windows", "Windows target");
                 AssertEx.Contains(text, "x64", "x64 target");
                 AssertEx.Contains(text, "HotspotShade.WinUI2.Core.csproj", "core reference");
@@ -618,7 +618,7 @@ namespace HotspotShade.WinUI2.Core.Tests
 
         private static string ReadBrokerSource(string root, string name)
         {
-            return File.ReadAllText(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", name)).Replace("\r\n", "\n");
+            return SourceText.Read(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", name));
         }
 
         private static string FindWindowsRoot()

@@ -181,11 +181,30 @@ mod win32 {
             overlapped: *mut c_void,
         ) -> i32;
         pub fn SetHandleInformation(handle: Handle, mask: u32, flags: u32) -> i32;
-        pub fn CompareObjectHandles(first: Handle, second: Handle) -> i32;
         pub fn SetLastError(error: u32);
         pub fn GetLastError() -> u32;
         pub fn CloseHandle(handle: Handle) -> i32;
         pub fn GetStdHandle(which: u32) -> Handle;
+    }
+
+    // KernelBase.dll exports CompareObjectHandles. The kernel32 import
+    // library on Windows 11 24H2 and Server 2025 has no entry for it, so link
+    // it with raw-dylib. On x86 the export name is undecorated, unlike the
+    // default stdcall import name.
+    #[cfg_attr(
+        target_arch = "x86",
+        link(
+            name = "kernelbase",
+            kind = "raw-dylib",
+            import_name_type = "undecorated"
+        )
+    )]
+    #[cfg_attr(
+        not(target_arch = "x86"),
+        link(name = "kernelbase", kind = "raw-dylib")
+    )]
+    extern "system" {
+        pub fn CompareObjectHandles(first: Handle, second: Handle) -> i32;
     }
 
     pub const STD_INPUT_HANDLE: u32 = 0xffff_fff6;

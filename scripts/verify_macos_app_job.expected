@@ -1,9 +1,7 @@
     name: Verify macOS app artifact
     needs: [macos-app]
     outputs:
-      sha256:
-        description: SHA-256 of the verified macOS app archive
-        value: ${{ steps.digest.outputs.sha256 }}
+      sha256: ${{ steps.digest.outputs.sha256 }}
     runs-on: macos-latest
     timeout-minutes: 10
     steps:

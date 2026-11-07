@@ -2449,7 +2449,7 @@ namespace HotspotShade.WinUI2.Core.Tests
             {
                 string root = FindRepoRoot();
                 AssertEx.True(root != null, "repo root");
-                string guard = File.ReadAllText(Path.Combine(root, "rust", "src", "windows_route_verify.rs"));
+                string guard = SourceText.Read(Path.Combine(root, "rust", "src", "windows_route_verify.rs"));
                 AssertEx.Contains(guard, "require_token_destination_proof", "gate function");
                 AssertEx.Contains(guard, "observe_token_destination", "physical adapter and gateway observation");
                 AssertEx.Contains(guard, "TOKEN_DESTINATION_REFUSED", "fixed refusal");
@@ -2461,7 +2461,7 @@ namespace HotspotShade.WinUI2.Core.Tests
                 AssertEx.True(root != null, "windows root");
                 foreach (string file in Files(Path.Combine(root, "src"), "*.cs"))
                 {
-                    string text = File.ReadAllText(file);
+                    string text = SourceText.Read(file);
                     AssertEx.DoesNotContain(text, "Create" + "Service", file);
                     // StartServiceCtrlDispatcherW is the reviewed SCM receive
                     // path. Every other StartService API remains forbidden.
@@ -2480,11 +2480,11 @@ namespace HotspotShade.WinUI2.Core.Tests
                 string app = Path.Combine(root, "src", "HotspotShade.WinUI2");
                 foreach (string file in Directory.EnumerateFiles(app, "*.cs", SearchOption.AllDirectories))
                 {
-                    string text = File.ReadAllText(file);
+                    string text = SourceText.Read(file);
                     AssertEx.DoesNotContain(text, "EngineServiceClient", file);
                     AssertEx.DoesNotContain(text, "EngineServiceBoundary", file);
                 }
-                string project = File.ReadAllText(Path.Combine(app, "HotspotShade.WinUI2.csproj"));
+                string project = SourceText.Read(Path.Combine(app, "HotspotShade.WinUI2.csproj"));
                 AssertEx.DoesNotContain(project, "HotspotShade.WinUI2.ServiceHost", "no service host reference");
                 AssertEx.DoesNotContain(project, "HotspotShade.WinUI2.Service.csproj", "no service reference");
             });
@@ -2495,7 +2495,7 @@ namespace HotspotShade.WinUI2.Core.Tests
                 AssertEx.True(root != null, "windows root");
                 string doc = Path.Combine(root, "SERVICE_BOUNDARY.md");
                 AssertEx.True(File.Exists(doc), "SERVICE_BOUNDARY.md");
-                string text = File.ReadAllText(doc);
+                string text = SourceText.Read(doc);
                 AssertEx.Contains(text, "UNAPPROVED", "design status");
                 AssertEx.Contains(text, "not production ready", "readiness");
                 AssertEx.Contains(text, "G1", "G1");
@@ -2508,7 +2508,7 @@ namespace HotspotShade.WinUI2.Core.Tests
                 AssertEx.Contains(text, "allowed, not blocked", "same-user allowed");
                 AssertEx.Contains(text, "remote clients", "remote client rule");
                 AssertEx.Contains(text, "Repaired review findings", "repair record");
-                string readme = File.ReadAllText(Path.Combine(root, "README.md"));
+                string readme = SourceText.Read(Path.Combine(root, "README.md"));
                 AssertEx.Contains(readme, "service boundary foundation", "README foundation");
             });
         }

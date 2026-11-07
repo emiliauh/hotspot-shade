@@ -152,7 +152,7 @@ namespace HotspotShade.WinUI2.Core.Tests
                 AssertEx.Equal(2, names.Count, "capability count");
                 AssertEx.Equal("allowElevation", names[0], "elevation capability for Turn on");
                 AssertEx.Equal("runFullTrust", names[1], "full-trust broker capability");
-                string text = File.ReadAllText(manifest);
+                string text = SourceText.Read(manifest);
                 AssertEx.DoesNotContain(text, "internetClient", "internet capability");
                 AssertEx.DoesNotContain(text, "privateNetworkClientServer", "private network capability");
                 AssertEx.DoesNotContain(text, "(simulated)", "simulated display name");
@@ -168,7 +168,7 @@ namespace HotspotShade.WinUI2.Core.Tests
 
             runner.Check("contract: no signing material is committed", delegate
             {
-                string project = File.ReadAllText(appProject);
+                string project = SourceText.Read(appProject);
                 AssertEx.DoesNotContain(project, "PackageCertificateKeyFile", "certificate key file");
                 foreach (string file in Files(root, "*.pfx", "*.cer", "*.key", "*.pem", "*.mobileprovision"))
                 {
@@ -181,7 +181,7 @@ namespace HotspotShade.WinUI2.Core.Tests
                 foreach (string file in Files(Path.Combine(root, "src"), "*.cs"))
                 {
                     string normalized = file.Replace('\\', '/');
-                    string text = File.ReadAllText(file);
+                    string text = SourceText.Read(file);
                     bool releaseProbe = normalized.Contains("/src/HotspotShade.WinUI2.ReleaseProbe/");
                     // The broker, the starter, the console launcher, and the
                     // window core name the wintun.dll file to check that it is
@@ -242,7 +242,7 @@ namespace HotspotShade.WinUI2.Core.Tests
                 {
                     foreach (string file in Files(scoped[dir], "*.cs"))
                     {
-                        string text = File.ReadAllText(file);
+                        string text = SourceText.Read(file);
                         for (int index = 0; index < names.Length; index++)
                         {
                             AssertEx.DoesNotContain(text, names[index], names[index] + " in " + file);
@@ -256,7 +256,7 @@ namespace HotspotShade.WinUI2.Core.Tests
                 string[] words = { "simulated", "Simulated", "Simulate", "simulate", "Demo", "demo", "preview", "Preview", "fake", "Fake" };
                 foreach (string file in Files(appDir, "*.cs", "*.xaml", "*.appxmanifest"))
                 {
-                    string text = File.ReadAllText(file);
+                    string text = SourceText.Read(file);
                     for (int index = 0; index < words.Length; index++)
                     {
                         AssertEx.DoesNotContain(text, words[index], "demo word in " + file);
@@ -269,7 +269,7 @@ namespace HotspotShade.WinUI2.Core.Tests
                 }
                 foreach (string file in Files(Path.Combine(root, "src", "HotspotShade.WinUI2.Core", "App"), "*.cs"))
                 {
-                    string text = File.ReadAllText(file);
+                    string text = SourceText.Read(file);
                     AssertEx.DoesNotContain(text, "simulated", "simulated data in " + file);
                     AssertEx.DoesNotContain(text, "--demo", "demo engine in " + file);
                 }
@@ -290,18 +290,53 @@ namespace HotspotShade.WinUI2.Core.Tests
                 AssertEx.True(versions.ContainsKey("Microsoft.UI.Xaml"), "WinUI package is missing");
                 AssertEx.True(versions.ContainsKey("Microsoft.NETCore.UniversalWindowsPlatform"), "UWP package is missing");
                 AssertEx.Equal("2.8.7", versions["Microsoft.UI.Xaml"], "WinUI 2 version");
-                AssertEx.Equal("6.2.15", versions["Microsoft.NETCore.UniversalWindowsPlatform"], "UWP package version");
+                AssertEx.Equal("6.2.14", versions["Microsoft.NETCore.UniversalWindowsPlatform"], "UWP package version");
                 XElement uwp = project.Descendants().Single(e => e.Name.LocalName == "PackageReference" &&
                     (string)e.Attribute("Include") == "Microsoft.NETCore.UniversalWindowsPlatform");
                 XElement testVersion = uwp.Elements().Single(e => e.Name.LocalName == "Version" && e.Attribute("Condition") != null);
-                AssertEx.Equal("6.2.14", testVersion.Value.Trim(), "UWP test package version");
-                AssertEx.Contains((string)testVersion.Attribute("Condition"), "HotspotShadeTestUwp6214", "UWP test version condition");
+                AssertEx.Equal("$(HotspotShadeUwpVersion)", testVersion.Value.Trim(), "UWP override package version");
+                AssertEx.Contains((string)testVersion.Attribute("Condition"), "HotspotShadeUwpVersion", "UWP override version condition");
                 foreach (KeyValuePair<string, string> pair in versions)
                 {
                     AssertEx.False(pair.Value.IndexOf('*') >= 0, "floating version for " + pair.Key);
                     AssertEx.False(pair.Value.IndexOf('[') >= 0, "range version for " + pair.Key);
                     AssertEx.False(pair.Value.IndexOf('(') >= 0, "range version for " + pair.Key);
                 }
+            });
+
+            runner.Check("contract: the .NET SDK is pinned and the payload build checks it", delegate
+            {
+                string globalJson = SourceText.Read(Path.Combine(root, "global.json"));
+                AssertEx.Contains(globalJson, "\"version\": \"8.0.427\"", "SDK 8.0.427 is the floor");
+                AssertEx.Contains(globalJson, "\"rollForward\": \"latestFeature\"", "later 8.0.x SDKs are allowed");
+                AssertEx.Contains(globalJson, "\"allowPrerelease\": false", "no preview SDK");
+                string stage = SourceText.Read(Path.Combine(root, "tools", "stage_payload.ps1"));
+                AssertEx.Contains(stage, "[Version]\"8.0.427\"", "the script knows the SDK floor");
+                AssertEx.Contains(stage, "This build needs .NET SDK 8.0.427 or a later 8.0.x SDK", "plain message for an old SDK");
+                AssertEx.Contains(stage, "Invoke-WindowsDotnet", "dotnet runs from the windows folder");
+                AssertEx.Contains(stage, "[Version]\"8.0.33\"", "the self-contained broker runtime is checked after the publish");
+                string starter = SourceText.Read(Path.Combine(root, "src", "HotspotShade.WinUI2.Elevate", "HotspotShade.WinUI2.Elevate.csproj"));
+                AssertEx.Contains(starter, "<TreatWarningsAsErrors>true</TreatWarningsAsErrors>", "the starter keeps the advisory as an error");
+                AssertEx.DoesNotContain(starter, "<NoWarn>", "no warning is suppressed");
+                AssertEx.DoesNotContain(starter, "<WarningsNotAsErrors>", "no warning is excused from the error rule");
+                AssertEx.True(File.Exists(Path.Combine(root, "tools", "check_package_dependencies.ps1")), "the dependency check script exists");
+            });
+
+            runner.Check("contract: payload content items do not break a compile-only build", delegate
+            {
+                XDocument project = XDocument.Load(appProject);
+                List<XElement> payload = project.Descendants()
+                    .Where(e => e.Name.LocalName == "Content" && ((string)e.Attribute("Include") ?? "").Contains("$(HotspotShadePayloadDir)Engine"))
+                    .ToList();
+                AssertEx.Equal(2, payload.Count, "engine and adapter content items");
+                foreach (XElement item in payload)
+                {
+                    string condition = (string)item.Attribute("Condition") ?? "";
+                    AssertEx.Contains(condition, "Exists('", "an absent payload file is skipped: " + (string)item.Attribute("Include"));
+                }
+                string text = SourceText.Read(appProject);
+                AssertEx.Contains(text, "Name=\"HotspotShadeCheckPayload\"", "a package build still requires the payload");
+                AssertEx.Contains(text, "!Exists('$(HotspotShadePayloadDir)Engine\\hotspotshade.exe')", "a missing engine stops a package build");
             });
 
             runner.Check("contract: manifest assets exist", delegate
@@ -328,14 +363,14 @@ namespace HotspotShade.WinUI2.Core.Tests
 
             runner.Check("contract: docs state the prototype limits", delegate
             {
-                string readme = File.ReadAllText(Path.Combine(root, "README.md"));
+                string readme = SourceText.Read(Path.Combine(root, "README.md"));
                 AssertEx.Contains(readme, "UWP", "UWP architecture");
                 AssertEx.Contains(readme, "WinUI 2", "WinUI 2");
                 AssertEx.Contains(readme, "not production ready", "readiness statement");
                 AssertEx.Contains(readme, "BUILD_AND_TEST_ON_PC.md", "PC build guide link");
                 AssertEx.True(File.Exists(Path.Combine(root, "BUILD_AND_TEST_ON_PC.md")), "PC build guide");
                 AssertEx.Contains(readme, "Windows 11 SDK", "SDK prerequisite");
-                string parity = File.ReadAllText(Path.Combine(root, "PARITY.md"));
+                string parity = SourceText.Read(Path.Combine(root, "PARITY.md"));
                 AssertEx.Contains(parity, "Incomplete", "incomplete parity");
                 AssertEx.Contains(parity, "not production ready", "parity readiness");
             });
@@ -344,7 +379,7 @@ namespace HotspotShade.WinUI2.Core.Tests
             {
                 foreach (string file in Files(root, "*.cs", "*.xaml", "*.md", "*.sh", "*.csproj", "*.appxmanifest", "*.xml", "*.config"))
                 {
-                    string text = File.ReadAllText(file);
+                    string text = SourceText.Read(file);
                     for (int index = 0; index < text.Length; index++)
                     {
                         for (int check = 0; check < ForbiddenPunctuation.Length; check++)

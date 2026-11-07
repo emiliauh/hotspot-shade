@@ -409,6 +409,34 @@ fn checked_int_option(value: i32, length: i32) -> io::Result<i32> {
     Ok(value)
 }
 
+/// Read a Winsock boolean option such as `SO_KEEPALIVE` or `TCP_NODELAY`.
+///
+/// Winsock documents these options as `BOOL`, but a read returns a single
+/// byte on current Windows (measured on Server 2025 build 26100). Accept a
+/// one-byte or a four-byte result and decode each length on its own. Integer
+/// options such as the TTL keep the strict four-byte check in `get_int`.
+fn get_bool(socket: RawSocket, level: i32, option: i32) -> io::Result<bool> {
+    let mut value = [0u8; 4];
+    let mut length = value.len() as i32;
+    let rc = unsafe { getsockopt(socket, level, option, value.as_mut_ptr(), &mut length) };
+    if rc == SOCKET_ERROR {
+        Err(last_wsa_error())
+    } else {
+        checked_bool_option(value, length)
+    }
+}
+
+fn checked_bool_option(value: [u8; 4], length: i32) -> io::Result<bool> {
+    match length {
+        1 => Ok(value[0] != 0),
+        4 => Ok(i32::from_ne_bytes(value) != 0),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "socket option returned an invalid length",
+        )),
+    }
+}
+
 fn set_nonblocking(socket: RawSocket, enabled: bool) -> io::Result<()> {
     let mut mode: u32 = u32::from(enabled);
     if unsafe { ioctlsocket(socket, FIONBIO, &mut mode) } == SOCKET_ERROR {
@@ -1009,8 +1037,8 @@ fn set_tcp_keepalive_socket(socket: RawSocket, keepalive: TcpKeepalive) -> io::R
     if result == SOCKET_ERROR {
         return Err(last_wsa_error());
     }
-    let verified = get_int(socket, SOL_SOCKET, SO_KEEPALIVE).and_then(|enabled| {
-        if enabled == 0 {
+    let verified = get_bool(socket, SOL_SOCKET, SO_KEEPALIVE).and_then(|enabled| {
+        if !enabled {
             Err(io::Error::other("tcp keepalive verification failed"))
         } else {
             Ok(())
@@ -1213,6 +1241,33 @@ mod tests {
             let error = checked_int_option(0, length).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
+    }
+
+    #[test]
+    fn boolean_option_read_accepts_one_or_four_bytes_only() {
+        assert!(checked_bool_option([1, 0, 0, 0], 1).unwrap());
+        assert!(!checked_bool_option([0, 0, 0, 0], 1).unwrap());
+        // A one-byte result decodes the first byte only. Stale bytes after
+        // it must not turn a false value into true.
+        assert!(!checked_bool_option([0, 1, 1, 1], 1).unwrap());
+        assert!(checked_bool_option(1i32.to_ne_bytes(), 4).unwrap());
+        assert!(!checked_bool_option(0i32.to_ne_bytes(), 4).unwrap());
+        for length in [-1, 0, 2, 3, 5, 8] {
+            let error = checked_bool_option([1, 1, 1, 1], length).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn boolean_option_read_reports_a_fresh_socket_without_keepalive() {
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let audit = Audit::default();
+        let client = tcp_start(server.local_addr().unwrap(), None, &audit).unwrap();
+        assert!(!get_bool(client.as_raw_socket(), SOL_SOCKET, SO_KEEPALIVE).unwrap());
+        set_tcp_keepalive(&client, TcpKeepalive::SOURCE_DEVICE).unwrap();
+        assert!(get_bool(client.as_raw_socket(), SOL_SOCKET, SO_KEEPALIVE).unwrap());
+        let (_peer, _) = server.accept().unwrap();
+        assert_eq!(audit.snapshot(), (1, 0));
     }
 
     #[link(name = "kernel32")]
@@ -1852,10 +1907,7 @@ mod tests {
             .unwrap();
             let (_accepted, _) = server.accept().unwrap();
             set_tcp_keepalive(&client, keepalive).unwrap();
-            assert_ne!(
-                get_int(client.as_raw_socket(), SOL_SOCKET, SO_KEEPALIVE).unwrap(),
-                0
-            );
+            assert!(get_bool(client.as_raw_socket(), SOL_SOCKET, SO_KEEPALIVE).unwrap());
             let ttl = if server.local_addr().unwrap().is_ipv4() {
                 i32::try_from(client.ttl().unwrap()).unwrap()
             } else {
@@ -1872,10 +1924,7 @@ mod tests {
         let audit = Audit::default();
         let client = tcp_start(server.local_addr().unwrap(), None, &audit).unwrap();
         set_tcp_keepalive(&client, TcpKeepalive::SOURCE_DEVICE).unwrap();
-        assert_ne!(
-            get_int(client.as_raw_socket(), SOL_SOCKET, SO_KEEPALIVE).unwrap(),
-            0
-        );
+        assert!(get_bool(client.as_raw_socket(), SOL_SOCKET, SO_KEEPALIVE).unwrap());
         let (_peer, _) = server.accept().unwrap();
         assert_eq!(audit.snapshot(), (1, 0));
     }

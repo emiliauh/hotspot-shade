@@ -1,9 +1,7 @@
     name: Assemble and checksum the release set
     needs: [verify-macos-binary, verify-ios-ipa, verify-macos-app]
     outputs:
-      manifest-sha256:
-        description: SHA-256 of the verified SHA256SUMS manifest
-        value: ${{ steps.manifest.outputs.sha256 }}
+      manifest-sha256: ${{ steps.manifest.outputs.sha256 }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

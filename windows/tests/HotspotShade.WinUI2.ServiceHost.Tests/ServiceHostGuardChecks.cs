@@ -181,7 +181,7 @@ namespace HotspotShade.WinUI2.ServiceHost.Tests
             {
                 string root = RepoRoot();
                 ServiceHostAssert.True(root != null, "repo root");
-                string guard = File.ReadAllText(Path.Combine(root, "rust", "src", "windows_route_verify.rs"));
+                string guard = SourceText.Read(Path.Combine(root, "rust", "src", "windows_route_verify.rs"));
                 ServiceHostAssert.Contains(guard, "require_token_destination_proof", "guard function");
                 ServiceHostAssert.Contains(guard, "observe_token_destination", "physical adapter and gateway observation");
                 ServiceHostAssert.Contains(guard, "TOKEN_DESTINATION_REFUSED", "fixed refusal");
@@ -214,7 +214,7 @@ namespace HotspotShade.WinUI2.ServiceHost.Tests
                 };
                 for (int fileIndex = 0; fileIndex < files.Length; fileIndex++)
                 {
-                    string text = File.ReadAllText(files[fileIndex]);
+                    string text = SourceText.Read(files[fileIndex]);
                     for (int wordIndex = 0; wordIndex < forbidden.Length; wordIndex++)
                     {
                         ServiceHostAssert.DoesNotContain(
@@ -229,13 +229,13 @@ namespace HotspotShade.WinUI2.ServiceHost.Tests
             {
                 string root = RepoRoot();
                 ServiceHostAssert.True(root != null, "repo root");
-                string solution = File.ReadAllText(
+                string solution = SourceText.Read(
                     Path.Combine(root, "windows", "HotspotShade.WinUI2.sln"));
                 ServiceHostAssert.DoesNotContain(
                     solution,
                     "HotspotShade.WinUI2.ServiceHost",
                     "not in the solution");
-                string appProject = File.ReadAllText(
+                string appProject = SourceText.Read(
                     Path.Combine(
                         root,
                         "windows",
@@ -260,7 +260,7 @@ namespace HotspotShade.WinUI2.ServiceHost.Tests
             {
                 string root = RepoRoot();
                 ServiceHostAssert.True(root != null, "repo root");
-                string server = File.ReadAllText(Path.Combine(
+                string server = SourceText.Read(Path.Combine(
                     root,
                     "windows",
                     "src",
@@ -272,7 +272,7 @@ namespace HotspotShade.WinUI2.ServiceHost.Tests
                 ServiceHostAssert.Contains(server, "TryValidatePipeServerCreate", "server validate");
                 ServiceHostAssert.Contains(server, "TryBuildPipeSddl", "sddl");
 
-                string client = File.ReadAllText(Path.Combine(
+                string client = SourceText.Read(Path.Combine(
                     root,
                     "windows",
                     "src",
@@ -282,7 +282,7 @@ namespace HotspotShade.WinUI2.ServiceHost.Tests
                 ServiceHostAssert.Contains(client, "SecurityIdentification", "identification");
                 ServiceHostAssert.Contains(client, "TryValidatePipeClientAccess", "client validate");
 
-                string handshake = File.ReadAllText(Path.Combine(
+                string handshake = SourceText.Read(Path.Combine(
                     root,
                     "windows",
                     "src",
@@ -299,7 +299,7 @@ namespace HotspotShade.WinUI2.ServiceHost.Tests
             {
                 string root = RepoRoot();
                 ServiceHostAssert.True(root != null, "repo root");
-                string readme = File.ReadAllText(Path.Combine(
+                string readme = SourceText.Read(Path.Combine(
                     root,
                     "windows",
                     "src",

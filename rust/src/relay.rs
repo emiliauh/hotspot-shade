@@ -120,6 +120,31 @@ const ICMP_SESSION_IDLE: Duration = Duration::from_secs(5);
 const ICMP_SESSION_MAX_AGE: Duration = Duration::from_secs(300);
 const ICMP_PENDING_LIMIT: usize = 4;
 
+/// Fixed text for the first outer socket keepalive failure in a process.
+pub(crate) const KEEPALIVE_FAILED_MESSAGE: &str =
+    "[relay] tcp keepalive could not be enabled on an outer socket; flows continue without dead-peer detection";
+
+static KEEPALIVE_FAILURE_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Turn on TCP keepalive for an outer socket without failing the flow.
+///
+/// A rejected keepalive leaves the flow usable, but a silent dead peer is then
+/// found only by an application timeout. The first failure in the process is
+/// written once to standard error with fixed text. The text holds no address
+/// and no error detail. Later failures are not repeated.
+pub(crate) fn enable_outer_keepalive(stream: &TcpStream) {
+    let result =
+        normalization::set_tcp_keepalive(stream, normalization::TcpKeepalive::SOURCE_DEVICE);
+    if first_keepalive_failure(&result, &KEEPALIVE_FAILURE_REPORTED) {
+        eprintln!("{KEEPALIVE_FAILED_MESSAGE}");
+    }
+}
+
+/// Return true only for the first failed result seen through `reported`.
+fn first_keepalive_failure(result: &io::Result<()>, reported: &AtomicBool) -> bool {
+    result.is_err() && !reported.swap(true, Ordering::Relaxed)
+}
+
 // Phone proxy streams carry small control and echo frames as well as data.
 fn phone_tcp_start(
     address: SocketAddr,
@@ -127,8 +152,7 @@ fn phone_tcp_start(
     audit: &normalization::Audit,
 ) -> io::Result<TcpStream> {
     let stream = normalization::tcp_start(address, iface, audit)?;
-    // Keep the flow usable if the local kernel rejects a keepalive option.
-    let _ = normalization::set_tcp_keepalive(&stream, normalization::TcpKeepalive::SOURCE_DEVICE);
+    enable_outer_keepalive(&stream);
     stream.set_nodelay(true)?;
     Ok(stream)
 }
@@ -139,7 +163,7 @@ fn direct_tcp_start(
     audit: &normalization::Audit,
 ) -> io::Result<TcpStream> {
     let stream = normalization::tcp_start(address, iface, audit)?;
-    let _ = normalization::set_tcp_keepalive(&stream, normalization::TcpKeepalive::SOURCE_DEVICE);
+    enable_outer_keepalive(&stream);
     Ok(stream)
 }
 
@@ -3494,19 +3518,25 @@ mod tests {
                 length: *mut i32,
             ) -> i32;
         }
-        let mut enabled: i32 = 0;
-        let mut length = std::mem::size_of_val(&enabled) as i32;
+        // Winsock returns one byte for this BOOL option on current Windows
+        // and four bytes on some providers. Decode each length on its own.
+        let mut enabled = [0u8; 4];
+        let mut length = enabled.len() as i32;
         let result = unsafe {
             getsockopt(
                 stream.as_raw_socket(),
                 SOL_SOCKET,
                 SO_KEEPALIVE,
-                (&mut enabled as *mut i32).cast(),
+                enabled.as_mut_ptr(),
                 &mut length,
             )
         };
         assert_eq!(result, 0);
-        enabled != 0
+        match length {
+            1 => enabled[0] != 0,
+            4 => i32::from_ne_bytes(enabled) != 0,
+            other => panic!("unexpected SO_KEEPALIVE length {other}"),
+        }
     }
 
     /// Set SO_LINGER to zero so that close sends a reset.
@@ -3548,6 +3578,18 @@ mod tests {
             },
             0
         );
+    }
+
+    #[test]
+    fn keepalive_failure_is_reported_once_with_fixed_text() {
+        let reported = AtomicBool::new(false);
+        assert!(!first_keepalive_failure(&Ok(()), &reported));
+        let failed = || Err(io::Error::other("detail for 192.0.2.1"));
+        assert!(first_keepalive_failure(&failed(), &reported));
+        assert!(!first_keepalive_failure(&failed(), &reported));
+        assert!(!first_keepalive_failure(&Ok(()), &reported));
+        assert!(!KEEPALIVE_FAILED_MESSAGE.contains('{'));
+        assert!(KEEPALIVE_FAILED_MESSAGE.is_ascii());
     }
 
     #[test]

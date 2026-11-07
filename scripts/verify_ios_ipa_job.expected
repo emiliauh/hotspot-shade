@@ -1,9 +1,7 @@
     name: Verify iOS IPA artifact
     needs: [ios]
     outputs:
-      sha256:
-        description: SHA-256 of the verified iOS IPA
-        value: ${{ steps.digest.outputs.sha256 }}
+      sha256: ${{ steps.digest.outputs.sha256 }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

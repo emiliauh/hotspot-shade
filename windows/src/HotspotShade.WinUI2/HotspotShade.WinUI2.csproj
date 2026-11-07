@@ -94,10 +94,20 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Pinned to 6.2.14 on purpose. The first native Windows build of 6.2.15
+         (WIN-TRB125LSOIF, 2026-11-06) made a package that Add-AppxPackage
+         rejected with 0x80073CF3. The manifest required Microsoft .NET Native
+         Framework and Runtime 2.3 at 2.3.60521.0 or later, but the dependency
+         .appx files in Dependencies\x64 were 2.3.60518.0. The two disagree
+         inside the 2.3.15-rel-2605-2102 runtime package: its .targets files
+         say 60521 and its .appx files are 60518. The 6.2.14 package agrees
+         with itself and installed on the same host.
+         To test a newer release, pass /p:HotspotShadeUwpVersion=6.2.NN. Then
+         run windows\tools\check_package_dependencies.ps1 on the output
+         folder before you try to install it. See BUILD_AND_TEST_ON_PC.md. -->
     <PackageReference Include="Microsoft.NETCore.UniversalWindowsPlatform">
-      <Version>6.2.15</Version>
-      <!-- Use the host's installed 2.2 native runtime for the isolated preview test. -->
-      <Version Condition="'$(HotspotShadeTestUwp6214)' == 'true'">6.2.14</Version>
+      <Version>6.2.14</Version>
+      <Version Condition="'$(HotspotShadeUwpVersion)' != ''">$(HotspotShadeUwpVersion)</Version>
     </PackageReference>
     <PackageReference Include="Microsoft.UI.Xaml">
       <Version>2.8.7</Version>
@@ -131,7 +141,12 @@
     <Content Include="$(HotspotShadePayloadDir)Elevate\**\*.*">
       <Link>Elevate\%(RecursiveDir)%(Filename)%(Extension)</Link>
     </Content>
-    <Content Include="$(HotspotShadePayloadDir)Engine\hotspotshade.exe">
+    <!-- The Exists() condition keeps a compile-only build (CI passes
+         HotspotShadeSkipPayloadCheck=true and stages nothing) from failing
+         with APPX0702 on a missing file. A package build never reaches this
+         case: HotspotShadeCheckPayload below stops it with an error when the
+         engine is missing, so an installable package always includes it. -->
+    <Content Include="$(HotspotShadePayloadDir)Engine\hotspotshade.exe" Condition="Exists('$(HotspotShadePayloadDir)Engine\hotspotshade.exe')">
       <Link>Engine\hotspotshade.exe</Link>
     </Content>
     <Content Include="$(HotspotShadePayloadDir)Engine\wintun.dll" Condition="Exists('$(HotspotShadePayloadDir)Engine\wintun.dll')">

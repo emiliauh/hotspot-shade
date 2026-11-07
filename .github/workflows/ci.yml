@@ -342,9 +342,7 @@ jobs:
     name: Verify macOS binary artifact
     needs: [rust-macos]
     outputs:
-      sha256:
-        description: SHA-256 of the verified macOS binary
-        value: ${{ steps.digest.outputs.sha256 }}
+      sha256: ${{ steps.digest.outputs.sha256 }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -366,9 +364,7 @@ jobs:
     name: Verify iOS IPA artifact
     needs: [ios]
     outputs:
-      sha256:
-        description: SHA-256 of the verified iOS IPA
-        value: ${{ steps.digest.outputs.sha256 }}
+      sha256: ${{ steps.digest.outputs.sha256 }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -390,9 +386,7 @@ jobs:
     name: Verify macOS app artifact
     needs: [macos-app]
     outputs:
-      sha256:
-        description: SHA-256 of the verified macOS app archive
-        value: ${{ steps.digest.outputs.sha256 }}
+      sha256: ${{ steps.digest.outputs.sha256 }}
     runs-on: macos-latest
     timeout-minutes: 10
     steps:
@@ -417,9 +411,7 @@ jobs:
     name: Assemble and checksum the release set
     needs: [verify-macos-binary, verify-ios-ipa, verify-macos-app]
     outputs:
-      manifest-sha256:
-        description: SHA-256 of the verified SHA256SUMS manifest
-        value: ${{ steps.manifest.outputs.sha256 }}
+      manifest-sha256: ${{ steps.manifest.outputs.sha256 }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

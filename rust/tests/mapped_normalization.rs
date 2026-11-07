@@ -61,7 +61,12 @@ fn ipv4_loopback_uses_audited_ipv4_sockets() {
     let _accepted = listener.accept().unwrap();
     let udp = normalization::udp_socket(IpAddr::V4(Ipv4Addr::LOCALHOST), None, &audit).unwrap();
     assert!(stream.local_addr().unwrap().is_ipv4());
-    assert!(udp.local_addr().unwrap().is_ipv4());
+    // Windows reports WSAEINVAL for local_addr on an unbound socket. A UDP
+    // connect binds the socket on every platform and sends no datagram.
+    udp.connect(listener.local_addr().unwrap()).unwrap();
+    let local = udp.local_addr().unwrap();
+    assert!(local.is_ipv4());
+    assert!(local.ip().is_loopback());
     assert_eq!(stream.ttl().unwrap(), 65);
     assert_eq!(udp.ttl().unwrap(), 65);
     assert_eq!(audit.snapshot(), (2, 0));

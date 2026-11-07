@@ -224,7 +224,7 @@ namespace HotspotShade.WinUI2.Core.Tests
             {
                 string root = FindWindowsRoot();
                 AssertEx.True(root != null, "windows folder");
-                string starter = File.ReadAllText(Path.Combine(root, "src", "HotspotShade.WinUI2.Elevate", "Program.cs"));
+                string starter = SourceText.Read(Path.Combine(root, "src", "HotspotShade.WinUI2.Elevate", "Program.cs"));
                 int server = starter.IndexOf("GetNamedPipeServerProcessId(pipe", StringComparison.Ordinal);
                 int brokerImage = starter.IndexOf("SameFinalPath(FinalPathOf(ImagePath(broker))", StringComparison.Ordinal);
                 int read = starter.IndexOf("ReadExact(pipe", StringComparison.Ordinal);
@@ -239,7 +239,7 @@ namespace HotspotShade.WinUI2.Core.Tests
                 AssertEx.Contains(starter, "InstallSecurity.MatchesPackage(root, packageName, FinalPathOf(PackagePathOf(packageName)))", "the root is the package folder Windows reports");
                 AssertEx.Contains(starter, "InstallSecurity.IsTrustedDriveType(DriveTypeOf(root))", "fixed disk only");
                 AssertEx.Contains(starter, "FileReadAttributes | ReadControl | FileReadData", "read data, so share modes take effect");
-                string project = File.ReadAllText(Path.Combine(root, "src", "HotspotShade.WinUI2.Elevate", "HotspotShade.WinUI2.Elevate.csproj"));
+                string project = SourceText.Read(Path.Combine(root, "src", "HotspotShade.WinUI2.Elevate", "HotspotShade.WinUI2.Elevate.csproj"));
                 AssertEx.Contains(project, "<LinkerArg Include=\"/DEPENDENTLOADFLAG:0x800\" />", "imports load from System32 only");
                 AssertEx.True(compare > duplicate && start > compare, "duplicated handles are compared before the engine starts");
                 AssertEx.Contains(starter, "FileReadAttributes | ReadControl", "opened for attributes and security only");
@@ -258,7 +258,7 @@ namespace HotspotShade.WinUI2.Core.Tests
                 AssertEx.Contains(starter, "CancelSynchronousIo(mainThread)", "the watchdog unblocks a pending read first");
                 foreach (string broker in new[] { "ElevatedEngineLauncher.cs", "BrokerService.cs" })
                 {
-                    string text = File.ReadAllText(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", broker));
+                    string text = SourceText.Read(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", broker));
                     AssertEx.Contains(text, "InstallRules.IsPackageStorePath(", broker + " keeps the text pre-filter");
                     AssertEx.Contains(text, "A text pre-filter only.", broker + " says it is a pre-filter");
                 }

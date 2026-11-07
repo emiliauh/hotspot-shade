@@ -393,13 +393,13 @@ namespace HotspotShade.WinUI2.Core.Tests
 
                 string root = FindWindowsRoot();
                 AssertEx.True(root != null, "windows root");
-                string service = File.ReadAllText(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", "BrokerService.cs"));
+                string service = SourceText.Read(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", "BrokerService.cs"));
                 AssertEx.Equal(1, Occurrences(service, "ElevatedEngineLauncher.Launch("), "one launcher call");
                 int turnOn = service.IndexOf("private BrokerReply TurnOn(", StringComparison.Ordinal);
                 int turnOff = service.IndexOf("private BrokerReply AbortStart(", StringComparison.Ordinal);
                 int call = service.IndexOf("ElevatedEngineLauncher.Launch(", StringComparison.Ordinal);
                 AssertEx.True(turnOn > 0 && call > turnOn && call < turnOff, "the launcher runs inside TurnOn only");
-                string launcher = File.ReadAllText(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", "ElevatedEngineLauncher.cs"));
+                string launcher = SourceText.Read(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", "ElevatedEngineLauncher.cs"));
                 AssertEx.Equal(1, Occurrences(launcher, "info.lpVerb = \"runas\";"), "one elevation verb");
                 foreach (string manifest in new[]
                 {
@@ -436,9 +436,9 @@ namespace HotspotShade.WinUI2.Core.Tests
                 AssertEx.Equal(EngineLaunchFailure.HandleInvalid, failure, "fixed failure");
 
                 string root = FindWindowsRoot();
-                string host = File.ReadAllText(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", "Win32EngineHost.cs"));
-                string starter = File.ReadAllText(Path.Combine(root, "src", "HotspotShade.WinUI2.Elevate", "Program.cs"));
-                string launcher = File.ReadAllText(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", "ElevatedEngineLauncher.cs"));
+                string host = SourceText.Read(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", "Win32EngineHost.cs"));
+                string starter = SourceText.Read(Path.Combine(root, "src", "HotspotShade.WinUI2.Elevate", "Program.cs"));
+                string launcher = SourceText.Read(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", "ElevatedEngineLauncher.cs"));
                 foreach (string text in new[] { host, starter })
                 {
                     AssertEx.Contains(text, "ProcThreadAttributeHandleList", "explicit inherited-handle list");
@@ -460,14 +460,14 @@ namespace HotspotShade.WinUI2.Core.Tests
                 AssertEx.Contains(starter, "GetWindowsDirectoryW", "values from the Windows directory");
                 AssertEx.DoesNotContain(starter, "GetEnvironmentVariable", "no value from the user environment");
                 AssertEx.DoesNotContain(starter, "WindowsPrincipal", "elevation from the token, not a role lookup");
-                string starterProject = File.ReadAllText(Path.Combine(root, "src", "HotspotShade.WinUI2.Elevate", "HotspotShade.WinUI2.Elevate.csproj"));
+                string starterProject = SourceText.Read(Path.Combine(root, "src", "HotspotShade.WinUI2.Elevate", "HotspotShade.WinUI2.Elevate.csproj"));
                 AssertEx.Contains(starterProject, "<PublishAot>true</PublishAot>", "the elevated starter has no .NET host");
-                string stage = File.ReadAllText(Path.Combine(root, "tools", "stage_payload.ps1"));
+                string stage = SourceText.Read(Path.Combine(root, "tools", "stage_payload.ps1"));
                 // PublishAot comes from the starter project. A global -p property
                 // would also reach the netstandard2.0 Core reference (NETSDK1207).
                 AssertEx.DoesNotContain(stage, "-p:PublishAot", "no global PublishAot property");
                 AssertEx.Contains(stage, "the NativeAOT publish did not produce a single native program", "the payload checks the starter is native");
-                string pipe = File.ReadAllText(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", "RendezvousPipe.cs"));
+                string pipe = SourceText.Read(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", "RendezvousPipe.cs"));
                 AssertEx.Contains(pipe, "(A;;RC;;;OW)", "the pipe owner cannot take WRITE_DAC");
                 AssertEx.Contains(launcher, "SetApartmentState(System.Threading.ApartmentState.STA)", "ShellExecuteEx runs on an STA thread");
                 // The only ShellExecuteEx parameter is the rendezvous token.
