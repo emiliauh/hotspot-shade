@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -6,7 +7,7 @@ using System.Threading;
 using HotspotShade.WinUI2.Core.App;
 using HotspotShade.WinUI2.Core.Engine;
 
-// Load kernel32 and advapi32 from System32 only.
+// Load kernel32, kernelbase, and advapi32 from System32 only.
 [assembly: DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
 
 namespace HotspotShade.WinUI2.Elevate
@@ -17,14 +18,26 @@ namespace HotspotShade.WinUI2.Elevate
     // 2. Refuses to run unless it is elevated.
     // 3. Opens the broker pipe with identification-level impersonation only,
     //    so the pipe server cannot act with this elevated token.
-    // 4. Checks that the pipe server is the packaged broker, by image path.
-    // 5. Duplicates the three pipe handles that the broker named into itself
-    //    as inheritable handles, and checks that each one is a pipe.
-    // 6. Starts the packaged engine with a fixed argument list and an
-    //    explicit inherited-handle list, and answers with its process id.
+    // 4. Finds the package root from the final path of its own image, then
+    //    checks that the pipe server is the packaged broker, by process id
+    //    and the final path of its image, before it reads any byte.
+    // 5. Reads the request, then verifies the install location before it
+    //    duplicates any handle or creates any process: the package root,
+    //    the Engine folder, the engine, and wintun.dll are each opened, their
+    //    final paths must be where the package puts them below a WindowsApps
+    //    package store, and their owner and DACL must pass InstallSecurity.
+    //    The handles stay open, without delete sharing, until the engine
+    //    process exists, so no folder can be renamed or swapped in between.
+    // 6. Duplicates the three pipe handles that the broker named into itself
+    //    as inheritable handles, and checks that each one is a pipe and that
+    //    no two are the same object.
+    // 7. Starts the packaged engine by its verified final path with a fixed
+    //    argument list and an explicit inherited-handle list, and answers
+    //    with its process id.
     // It never reads the bearer secret or the pairing frame: the engine
     // reads them from the inherited pipes. A watchdog ends the program if
-    // any step stalls.
+    // any step stalls; it and any unexpected failure first send a failure
+    // reply, so the broker does not wait for its own timeout.
     //
     // The starter is published with NativeAOT, so it loads no .NET host,
     // startup hook, or profiler that the user environment could name. The
@@ -45,11 +58,42 @@ namespace HotspotShade.WinUI2.Elevate
         private const uint CreateUnicodeEnvironment = 0x00000400;
         private const uint CreateNoWindow = 0x08000000;
         private const uint ProcThreadAttributeHandleList = 0x00020002;
+        private const int ErrorFileNotFound = 2;
+        private const int ErrorPathNotFound = 3;
         private const int ErrorAccessDenied = 5;
         private const int WatchdogMilliseconds = 45000;
+        private const int WatchdogReplyMilliseconds = 2000;
         private const uint TokenQuery = 0x0008;
         private const int TokenElevationClass = 20;
+        private const uint ThreadTerminate = 0x0001;
 
+        // The install-location check opens each object with these rights
+        // only: enough to read its final path, owner, and DACL.
+        private const uint FileReadAttributes = 0x00000080;
+        private const uint ReadControl = 0x00020000;
+        private const uint FileShareRead = 0x00000001;
+        private const uint FileShareWrite = 0x00000002;
+        private const uint FileShareDelete = 0x00000004;
+        private const uint FileFlagBackupSemantics = 0x02000000;
+        private const uint FileAttributeDirectory = 0x00000010;
+        private const uint VolumeNameDos = 0;
+        private const int SeFileObject = 1;
+        private const uint OwnerSecurityInformation = 0x00000001;
+        private const uint DaclSecurityInformation = 0x00000004;
+
+        private const string BrokerFolder = "Broker";
+        private const string BrokerFileName = "HotspotShade.WinUI2.Broker.exe";
+        private const string EngineFolder = "Engine";
+        private const string AdapterFileName = "wintun.dll";
+
+        // The pipe handle that a failure reply may still use. The main thread
+        // clears it under the gate before it closes the handle, so the
+        // watchdog never writes to a closed or reused handle value.
+        private static readonly object replyGate = new object();
+        private static IntPtr replyPipe;
+        // Set once a reply was written, so the broker never sees two.
+        private static int replied;
+        private static IntPtr mainThread;
         private static Timer watchdog;
 
         [STAThread]
@@ -63,28 +107,60 @@ namespace HotspotShade.WinUI2.Elevate
             {
                 return (int)ElevationReplyCode.NotElevated;
             }
-            watchdog = new Timer(delegate { Environment.Exit((int)ElevationReplyCode.Failed); }, null, WatchdogMilliseconds, Timeout.Infinite);
+            mainThread = OpenThread(ThreadTerminate, false, GetCurrentThreadId());
+            watchdog = new Timer(OnWatchdog, null, WatchdogMilliseconds, Timeout.Infinite);
             try
             {
                 return Run(args[0]);
             }
             catch (Exception)
             {
+                SendFailure();
                 return (int)ElevationReplyCode.Failed;
+            }
+        }
+
+        // The watchdog sends a best-effort failure reply and ends the
+        // program. A synchronous read on the same pipe would hold the write
+        // back, so it cancels the main thread's blocking call first, and it
+        // waits for the write only briefly.
+        private static void OnWatchdog(object state)
+        {
+            try
+            {
+                Thread writer = new Thread(WatchdogReply);
+                writer.IsBackground = true;
+                writer.Start();
+                writer.Join(WatchdogReplyMilliseconds);
+            }
+            catch (Exception)
+            {
+            }
+            Environment.Exit((int)ElevationReplyCode.Failed);
+        }
+
+        private static void WatchdogReply()
+        {
+            if (mainThread != IntPtr.Zero)
+            {
+                CancelSynchronousIo(mainThread);
+            }
+            SendFailure();
+        }
+
+        private static void SendFailure()
+        {
+            lock (replyGate)
+            {
+                if (replyPipe != IntPtr.Zero)
+                {
+                    TryReply(replyPipe, ElevationReplyCode.Failed, 0);
+                }
             }
         }
 
         private static int Run(string token)
         {
-            string here = AppContext.BaseDirectory.TrimEnd('\\', '/');
-            string root = Path.GetDirectoryName(here);
-            if (string.IsNullOrEmpty(root))
-            {
-                return (int)ElevationReplyCode.Failed;
-            }
-            string brokerPath = Path.Combine(root, "Broker", "HotspotShade.WinUI2.Broker.exe");
-            string enginePath = Path.Combine(root, "Engine", EngineLaunchRules.ExecutableName);
-
             IntPtr pipe = CreateFileW(
                 @"\\.\pipe\" + ElevationProtocol.PipeName(token),
                 GenericRead | GenericWrite,
@@ -97,16 +173,31 @@ namespace HotspotShade.WinUI2.Elevate
             {
                 return (int)ElevationReplyCode.Failed;
             }
+            lock (replyGate)
+            {
+                replyPipe = pipe;
+            }
+            List<IntPtr> held = new List<IntPtr>();
             IntPtr broker = IntPtr.Zero;
             try
             {
-                byte[] frame = ReadExact(pipe, ElevationProtocol.RequestLength);
-                ElevationRequest request;
-                if (frame == null || !ElevationProtocol.TryDecodeRequest(frame, frame.Length, out request))
+                // The package root comes from the final path of this
+                // program's own image, never from a path that the caller or
+                // the environment can name.
+                IntPtr self;
+                string selfFinal;
+                ElevationReplyCode opened = OpenChecked(ImagePath(GetCurrentProcess()), false, held, out self, out selfFinal);
+                string root = opened == ElevationReplyCode.Started ? InstallSecurity.RootFromStarter(selfFinal) : null;
+                if (root == null)
                 {
-                    return Answer(pipe, ElevationReplyCode.Failed, 0);
+                    return Answer(
+                        pipe,
+                        opened == ElevationReplyCode.Started || opened == ElevationReplyCode.InstallUntrusted ? ElevationReplyCode.InstallUntrusted : ElevationReplyCode.Failed,
+                        0);
                 }
 
+                // The pipe server must be the packaged broker. This is
+                // checked before the starter reads any byte from the pipe.
                 uint serverId;
                 if (!GetNamedPipeServerProcessId(pipe, out serverId) || serverId == 0 || serverId > int.MaxValue)
                 {
@@ -122,21 +213,24 @@ namespace HotspotShade.WinUI2.Elevate
                         Marshal.GetLastWin32Error() == ErrorAccessDenied ? ElevationReplyCode.OtherAccount : ElevationReplyCode.BrokerRejected,
                         0);
                 }
-                if (!SamePath(ImagePath(broker), brokerPath))
+                string brokerPath = root + "\\" + BrokerFolder + "\\" + BrokerFileName;
+                if (!InstallSecurity.SameFinalPath(FinalPathOf(ImagePath(broker)), brokerPath))
                 {
                     return Answer(pipe, ElevationReplyCode.BrokerRejected, 0);
                 }
-                if (!InstallRules.IsProtectedPackageRoot(root, Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles)))
+
+                byte[] frame = ReadExact(pipe, ElevationProtocol.RequestLength);
+                ElevationRequest request;
+                if (frame == null || !ElevationProtocol.TryDecodeRequest(frame, frame.Length, out request))
                 {
-                    return Answer(pipe, ElevationReplyCode.InstallUntrusted, 0);
+                    return Answer(pipe, ElevationReplyCode.Failed, 0);
                 }
-                if (!File.Exists(enginePath))
+
+                string enginePath = root + "\\" + EngineFolder + "\\" + EngineLaunchRules.ExecutableName;
+                ElevationReplyCode verdict = VerifyInstall(root, self, enginePath, held);
+                if (verdict != ElevationReplyCode.Started)
                 {
-                    return Answer(pipe, ElevationReplyCode.EngineMissing, 0);
-                }
-                if (!File.Exists(Path.Combine(root, "Engine", "wintun.dll")))
-                {
-                    return Answer(pipe, ElevationReplyCode.AdapterDllMissing, 0);
+                    return Answer(pipe, verdict, 0);
                 }
 
                 IntPtr tokenHandle = IntPtr.Zero;
@@ -147,6 +241,14 @@ namespace HotspotShade.WinUI2.Elevate
                     if (!Duplicate(broker, request.TokenHandle, out tokenHandle)
                         || !Duplicate(broker, request.ParentHandle, out parentHandle)
                         || !Duplicate(broker, request.CredentialsHandle, out credentialsHandle))
+                    {
+                        return Answer(pipe, ElevationReplyCode.HandleRejected, 0);
+                    }
+                    // Three different handle values can still name one
+                    // pipe. The engine needs three different pipes.
+                    if (CompareObjectHandles(tokenHandle, parentHandle)
+                        || CompareObjectHandles(tokenHandle, credentialsHandle)
+                        || CompareObjectHandles(parentHandle, credentialsHandle))
                     {
                         return Answer(pipe, ElevationReplyCode.HandleRejected, 0);
                     }
@@ -180,19 +282,258 @@ namespace HotspotShade.WinUI2.Elevate
                     CloseIfSet(credentialsHandle);
                 }
             }
+            catch (Exception)
+            {
+                return Answer(pipe, ElevationReplyCode.Failed, 0);
+            }
             finally
             {
+                for (int index = 0; index < held.Count; index++)
+                {
+                    CloseIfSet(held[index]);
+                }
                 CloseIfSet(broker);
-                CloseHandle(pipe);
+                lock (replyGate)
+                {
+                    replyPipe = IntPtr.Zero;
+                    CloseHandle(pipe);
+                }
             }
         }
 
+        // The install-location check. Each object is opened by the path
+        // that the verified root implies, its final path must be that same
+        // path (so no link leads out of the package), and its owner and DACL
+        // must pass InstallSecurity. The handles go into held and stay open
+        // until the engine process exists.
+        private static ElevationReplyCode VerifyInstall(string root, IntPtr self, string enginePath, List<IntPtr> held)
+        {
+            string programFiles = FinalPathOf(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles));
+            if (!InstallSecurity.IsPackageStoreLocation(root, programFiles))
+            {
+                return ElevationReplyCode.InstallUntrusted;
+            }
+            ElevationReplyCode result = CheckObject(root, true, ElevationReplyCode.InstallUntrusted, held);
+            if (result != ElevationReplyCode.Started)
+            {
+                return result;
+            }
+            result = CheckObject(root + "\\" + EngineFolder, true, ElevationReplyCode.EngineMissing, held);
+            if (result != ElevationReplyCode.Started)
+            {
+                return result;
+            }
+            result = CheckObject(enginePath, false, ElevationReplyCode.EngineMissing, held);
+            if (result != ElevationReplyCode.Started)
+            {
+                return result;
+            }
+            result = CheckObject(root + "\\" + EngineFolder + "\\" + AdapterFileName, false, ElevationReplyCode.AdapterDllMissing, held);
+            if (result != ElevationReplyCode.Started)
+            {
+                return result;
+            }
+            // The starter's own image is below the root (RootFromStarter);
+            // it must be protected the same way.
+            return InstallSecurity.ReplyFor(SecurityOf(self), ElevationReplyCode.InstallUntrusted);
+        }
+
+        private static ElevationReplyCode CheckObject(string path, bool directory, ElevationReplyCode missing, List<IntPtr> held)
+        {
+            IntPtr handle;
+            string final;
+            ElevationReplyCode opened = OpenChecked(path, directory, held, out handle, out final);
+            if (opened == ElevationReplyCode.EngineMissing)
+            {
+                return missing;
+            }
+            if (opened != ElevationReplyCode.Started)
+            {
+                return opened;
+            }
+            if (!InstallSecurity.SameFinalPath(final, path))
+            {
+                return ElevationReplyCode.InstallUntrusted;
+            }
+            return InstallSecurity.ReplyFor(SecurityOf(handle), ElevationReplyCode.InstallUntrusted);
+        }
+
+        // Opens path for its attributes and security only, checks that it is
+        // a folder or a file as expected, and reads its final path. The
+        // handle goes into held. A folder is shared for read and write and a
+        // file for read only; neither allows delete, so nothing can rename,
+        // replace, or remove it while the handle is open. Returns Started on
+        // success, EngineMissing when the path does not exist,
+        // InstallUntrusted when the object has the wrong kind, and Failed
+        // for any other open failure.
+        private static ElevationReplyCode OpenChecked(string path, bool directory, List<IntPtr> held, out IntPtr handle, out string final)
+        {
+            handle = IntPtr.Zero;
+            final = null;
+            string normalized = InstallSecurity.NormalizeFinalPath(path);
+            if (normalized == null)
+            {
+                return ElevationReplyCode.InstallUntrusted;
+            }
+            IntPtr opened = CreateFileW(
+                @"\\?\" + normalized,
+                FileReadAttributes | ReadControl,
+                directory ? FileShareRead | FileShareWrite : FileShareRead,
+                IntPtr.Zero,
+                OpenExisting,
+                FileFlagBackupSemantics,
+                IntPtr.Zero);
+            if (opened == IntPtr.Zero || opened == new IntPtr(-1))
+            {
+                int error = Marshal.GetLastWin32Error();
+                return error == ErrorFileNotFound || error == ErrorPathNotFound
+                    ? ElevationReplyCode.EngineMissing
+                    : ElevationReplyCode.Failed;
+            }
+            held.Add(opened);
+            BY_HANDLE_FILE_INFORMATION info;
+            if (!GetFileInformationByHandle(opened, out info))
+            {
+                return ElevationReplyCode.Failed;
+            }
+            if (((info.dwFileAttributes & FileAttributeDirectory) != 0) != directory)
+            {
+                return ElevationReplyCode.InstallUntrusted;
+            }
+            final = FinalPath(opened);
+            if (final == null)
+            {
+                return ElevationReplyCode.Failed;
+            }
+            handle = opened;
+            return ElevationReplyCode.Started;
+        }
+
+        // The final path of a file or folder, or null. Used for the broker
+        // image and Program Files, which the starter does not hold open.
+        private static string FinalPathOf(string path)
+        {
+            string normalized = InstallSecurity.NormalizeFinalPath(path);
+            if (normalized == null)
+            {
+                return null;
+            }
+            IntPtr opened = CreateFileW(
+                @"\\?\" + normalized,
+                FileReadAttributes,
+                FileShareRead | FileShareWrite | FileShareDelete,
+                IntPtr.Zero,
+                OpenExisting,
+                FileFlagBackupSemantics,
+                IntPtr.Zero);
+            if (opened == IntPtr.Zero || opened == new IntPtr(-1))
+            {
+                return null;
+            }
+            try
+            {
+                return FinalPath(opened);
+            }
+            finally
+            {
+                CloseHandle(opened);
+            }
+        }
+
+        private static string FinalPath(IntPtr handle)
+        {
+            char[] buffer = new char[1024];
+            uint length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Length, VolumeNameDos);
+            if (length >= buffer.Length && length < 32768)
+            {
+                buffer = new char[length + 1];
+                length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Length, VolumeNameDos);
+            }
+            if (length == 0 || length >= buffer.Length)
+            {
+                return null;
+            }
+            return new string(buffer, 0, (int)length);
+        }
+
+        // The owner and DACL of an open object, judged by InstallSecurity.
+        private static InstallCheck SecurityOf(IntPtr handle)
+        {
+            IntPtr owner;
+            IntPtr group;
+            IntPtr dacl;
+            IntPtr sacl;
+            IntPtr descriptor;
+            uint status = GetSecurityInfo(
+                handle,
+                SeFileObject,
+                OwnerSecurityInformation | DaclSecurityInformation,
+                out owner,
+                out group,
+                out dacl,
+                out sacl,
+                out descriptor);
+            if (status != 0)
+            {
+                return InstallCheck.Malformed;
+            }
+            try
+            {
+                if (owner == IntPtr.Zero || !IsValidSid(owner))
+                {
+                    return InstallCheck.Malformed;
+                }
+                int ownerLength = GetLengthSid(owner);
+                if (ownerLength < 8 || ownerLength > 68)
+                {
+                    return InstallCheck.Malformed;
+                }
+                byte[] ownerBytes = new byte[ownerLength];
+                Marshal.Copy(owner, ownerBytes, 0, ownerLength);
+                byte[] daclBytes = null;
+                if (dacl != IntPtr.Zero)
+                {
+                    int size = Marshal.ReadInt16(dacl, 2) & 0xFFFF;
+                    if (size < 8)
+                    {
+                        return InstallCheck.Malformed;
+                    }
+                    daclBytes = new byte[size];
+                    Marshal.Copy(dacl, daclBytes, 0, size);
+                }
+                return InstallSecurity.Evaluate(ownerBytes, daclBytes);
+            }
+            finally
+            {
+                if (descriptor != IntPtr.Zero)
+                {
+                    LocalFree(descriptor);
+                }
+            }
+        }
+
+        // Writes the reply and reports the exit code. A Started reply that
+        // could not be written is a failure: the broker then closes the
+        // parent-liveness pipe, which stops the engine.
         private static int Answer(IntPtr pipe, ElevationReplyCode code, int processId)
         {
+            bool sent = TryReply(pipe, code, processId);
+            if (code == ElevationReplyCode.Started)
+            {
+                return sent ? 0 : (int)ElevationReplyCode.Failed;
+            }
+            return (int)code;
+        }
+
+        private static bool TryReply(IntPtr pipe, ElevationReplyCode code, int processId)
+        {
+            if (Interlocked.Exchange(ref replied, 1) != 0)
+            {
+                return false;
+            }
             byte[] reply = ElevationProtocol.EncodeReply(code, processId);
             int written;
-            WriteFile(pipe, reply, reply.Length, out written, IntPtr.Zero);
-            return code == ElevationReplyCode.Started ? 0 : (int)code;
+            return WriteFile(pipe, reply, reply.Length, out written, IntPtr.Zero) && written == reply.Length;
         }
 
         private static bool Duplicate(IntPtr broker, long value, out IntPtr copy)
@@ -356,25 +697,6 @@ namespace HotspotShade.WinUI2.Elevate
             return name.ToString(0, size);
         }
 
-        private static bool SamePath(string left, string right)
-        {
-            if (string.IsNullOrEmpty(left) || string.IsNullOrEmpty(right))
-            {
-                return false;
-            }
-            try
-            {
-                return string.Equals(
-                    Path.GetFullPath(left).TrimEnd('\\'),
-                    Path.GetFullPath(right).TrimEnd('\\'),
-                    StringComparison.OrdinalIgnoreCase);
-            }
-            catch (Exception)
-            {
-                return false;
-            }
-        }
-
         // True when this process holds an elevated token (TokenElevation).
         private static bool IsElevated()
         {
@@ -444,6 +766,24 @@ namespace HotspotShade.WinUI2.Elevate
             public int dwThreadId;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct BY_HANDLE_FILE_INFORMATION
+        {
+            public uint dwFileAttributes;
+            public uint ftCreationTimeLow;
+            public uint ftCreationTimeHigh;
+            public uint ftLastAccessTimeLow;
+            public uint ftLastAccessTimeHigh;
+            public uint ftLastWriteTimeLow;
+            public uint ftLastWriteTimeHigh;
+            public uint dwVolumeSerialNumber;
+            public uint nFileSizeHigh;
+            public uint nFileSizeLow;
+            public uint nNumberOfLinks;
+            public uint nFileIndexHigh;
+            public uint nFileIndexLow;
+        }
+
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         private static extern IntPtr CreateFileW(
             string name,
@@ -496,6 +836,46 @@ namespace HotspotShade.WinUI2.Elevate
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr handle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenThread(uint access, bool inherit, uint threadId);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CancelSynchronousIo(IntPtr thread);
+
+        // Windows 10 1607 and later; the package needs 10.0.19041.
+        [DllImport("kernelbase.dll")]
+        private static extern bool CompareObjectHandles(IntPtr first, IntPtr second);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandle(IntPtr file, out BY_HANDLE_FILE_INFORMATION information);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern uint GetFinalPathNameByHandleW(IntPtr file, [Out] char[] path, uint size, uint flags);
+
+        // Returns a Win32 error code; it does not set the last error.
+        [DllImport("advapi32.dll")]
+        private static extern uint GetSecurityInfo(
+            IntPtr handle,
+            int objectType,
+            uint securityInfo,
+            out IntPtr owner,
+            out IntPtr group,
+            out IntPtr dacl,
+            out IntPtr sacl,
+            out IntPtr securityDescriptor);
+
+        [DllImport("advapi32.dll")]
+        private static extern bool IsValidSid(IntPtr sid);
+
+        [DllImport("advapi32.dll")]
+        private static extern int GetLengthSid(IntPtr sid);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr LocalFree(IntPtr memory);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool InitializeProcThreadAttributeList(IntPtr attributeList, int count, int flags, ref IntPtr size);

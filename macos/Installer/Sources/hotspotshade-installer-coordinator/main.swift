@@ -21,6 +21,7 @@ usage:
   hotspotshade-installer-coordinator preview-recover-service
   hotspotshade-installer-coordinator preview-status
   hotspotshade-installer-coordinator preview-uninstall
+  hotspotshade-installer-coordinator preview-clear-cleanup-block
   hotspotshade-installer-coordinator sandbox-init --sandbox-root PATH
   hotspotshade-installer-coordinator verify --payload PATH --manifest PATH --team TEAM
   hotspotshade-installer-coordinator install --sandbox-root PATH --payload PATH --manifest PATH --team TEAM
@@ -185,6 +186,17 @@ func execute(_ command: String, _ raw: [String]) throws {
         print("The installed app and the placed preview tree are not part of this removal.")
         print("The state directory, its lock files, /var/lib/hotspotshade, and /Library/PrivilegedHelperTools are kept.")
 
+    case "preview-clear-cleanup-block":
+        guard raw.isEmpty else { throw UsageError(description: "preview-clear-cleanup-block takes no options") }
+        let report = try PreviewSystemInstaller.clearCleanupBlock()
+        for check in report.checks { print("checked: \(check.rawValue)") }
+        for name in report.removed { print("removed \(name)") }
+        for name in report.alreadyAbsent { print("already absent: \(name)") }
+        print("No route, interface, or process was changed.")
+        if !report.removed.isEmpty {
+            print("If you booted out the helper, load it again with: sudo launchctl bootstrap system /Library/LaunchDaemons/dev.hotspotshade.mac.helper.plist")
+        }
+
     case "sandbox-init":
         let arguments = try Arguments(
             raw,
@@ -283,7 +295,7 @@ if arguments.isEmpty || arguments == ["--help"] {
 let rootAllowedCommands = [
     "self-check",
     "preview-install", "preview-resume", "preview-recover-files",
-    "preview-recover-service", "preview-status", "preview-uninstall",
+    "preview-recover-service", "preview-status", "preview-uninstall", "preview-clear-cleanup-block",
 ]
 guard geteuid() != 0 || rootAllowedCommands.contains(arguments[0]) else {
     refuse("The install coordinator must not run as root.")
@@ -299,6 +311,8 @@ do {
 } catch let error as ServiceTransactionError {
     refuse("HotspotShade coordinator refused: \(error.description)")
 } catch let error as PreviewCleanupError {
+    refuse("HotspotShade coordinator refused: \(error.description)")
+} catch let error as PreviewClearError {
     refuse("HotspotShade coordinator refused: \(error.description)")
 } catch let error as InstallerError {
     refuse("HotspotShade coordinator refused: \(error.description)")

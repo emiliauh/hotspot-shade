@@ -853,7 +853,9 @@ namespace HotspotShade.WinUI2.Broker
             {
                 return BrokerCodes.AdapterDllMissing;
             }
-            if (!InstallRules.IsProtectedPackageRoot(root, Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles)))
+            // A text pre-filter only. The elevated starter verifies the final
+            // path, owner, and DACL of the install before it trusts it.
+            if (!InstallRules.IsPackageStorePath(root, Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles)))
             {
                 return BrokerCodes.InstallUntrusted;
             }

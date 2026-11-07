@@ -95,8 +95,10 @@ fn spawn_engine(label: &str, pass_grant_path: bool) -> (Child, u16, PathBuf, Pat
     // The macOS app passes one end of a Unix socket pair, and the root engine
     // refuses any other descriptor kind for its credentials.
     let (credential_writer, credential_reader) = UnixStream::pair().unwrap();
-    let (credential_write, credential_read) =
-        (credential_writer.into_raw_fd(), credential_reader.into_raw_fd());
+    let (credential_write, credential_read) = (
+        credential_writer.into_raw_fd(),
+        credential_reader.into_raw_fd(),
+    );
     write_handoff(credential_write, &identity, &credentials).expect("write the handoff");
     unsafe {
         libc::close(credential_write);

@@ -68,6 +68,13 @@ struct HotspotWatchTests {
         precondition(HotspotInterface.discover(snapshot([bridge100, bridge101],
                                                         [ipv4("bridge100"), ipv4("bridge101")]))
                      == .ambiguous)
+        // The identity-aware pass keeps ambiguous apart from unreadable, so
+        // Start can say which one it saw. Decisions treat both the same.
+        precondition(HotspotInterface.classify(.ambiguous) == .ambiguous)
+        precondition(HotspotInterface.classify(.unreadable) == .unreadable)
+        var ambiguousDetector = HotspotLossDetector(boundIdentity: HotspotInterface.Identity(
+            name: "bridge100", address: HotspotInterface.hotspotAddress))
+        precondition(ambiguousDetector.observe(.ambiguous, now: 0) == .keepRunning)
         // A missing or conflicting link type is inconclusive.
         precondition(HotspotInterface.discover(snapshot([], [ipv4("bridge100")])) == .unreadable)
         precondition(HotspotInterface.discover(snapshot([unknown], [ipv4("bridge102")])) == .unreadable)

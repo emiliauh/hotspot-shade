@@ -180,6 +180,53 @@ struct PairingListenerPolicyTests {
         }
         precondition(gone.observe(.present("hotspot"), listening: false, pollInterval: 2) == .start("hotspot"))
 
+        // A failed bind leaves no listener, so no stop action can come. The
+        // policy still reports the loss once, so the server can drop the
+        // "another app uses the port" line when the hotspot is simply gone.
+        var lost = PairingListenerPolicy(clock: { now }, latestLink: { nil })
+        precondition(!lost.takeHotspotLoss())
+        precondition(lost.observe(.present("hotspot"), listening: false, pollInterval: 5) == .start("hotspot"))
+        precondition(lost.failed() == PairingListenerPolicy.failureMessage)
+        precondition(lost.failed() == nil)
+        for _ in 0..<15 {
+            precondition(lost.observe(.absent, listening: false, pollInterval: 5) == .none)
+            precondition(!lost.takeHotspotLoss(), "a short absence is not a loss")
+            now += 5
+        }
+        precondition(lost.observe(.absent, listening: false, pollInterval: 5) == .none)
+        precondition(lost.takeHotspotLoss(), "a long absence with no listener is a loss")
+        precondition(!lost.takeHotspotLoss(), "the loss is reported once")
+        precondition(lost.lastStopCause == nil, "no listener means no stop cause")
+        // A new hotspot is a new situation: it starts at once and its first
+        // failure is reported as a first failure.
+        precondition(lost.observe(.present("hotspot"), listening: false, pollInterval: 5) == .start("hotspot"))
+        precondition(lost.failed() == PairingListenerPolicy.failureMessage)
+        // An unreadable result and a short gap are not a loss.
+        precondition(lost.observe(.unreadable, listening: false, pollInterval: 5) == .none)
+        precondition(!lost.takeHotspotLoss())
+        // A different address counts as a change after the same interval.
+        for _ in 0..<15 {
+            precondition(lost.observe(.present("other"), listening: false, pollInterval: 5) == .none)
+            now += 5
+        }
+        precondition(lost.observe(.present("other"), listening: false, pollInterval: 5) == .none)
+        precondition(lost.takeHotspotLoss(), "a changed address is a loss")
+        // A link that is no longer the supported one is a loss at once, even
+        // with no listener.
+        var linkGone: HotspotInterface.LinkObservation? = .present(
+            HotspotInterface.Identity(name: "bridge100", address: "hotspot"))
+        var linkLoss = PairingListenerPolicy(clock: { now }, latestLink: { linkGone })
+        precondition(linkLoss.observe(.present("hotspot"), listening: false, pollInterval: 5) == .start("hotspot"))
+        precondition(!linkLoss.takeHotspotLoss())
+        linkGone = .unsupported(HotspotInterface.Identity(name: "en0", address: "hotspot"))
+        precondition(linkLoss.observe(.present("hotspot"), listening: false, pollInterval: 5) == .none)
+        precondition(linkLoss.takeHotspotLoss(), "an unsupported link is a loss with no listener")
+        linkGone = .present(HotspotInterface.Identity(name: "bridge100", address: "hotspot"))
+        precondition(linkLoss.observe(.present("hotspot"), listening: false, pollInterval: 5) == .start("hotspot"))
+        linkGone = .present(HotspotInterface.Identity(name: "bridge101", address: "hotspot"))
+        precondition(linkLoss.observe(.present("hotspot"), listening: false, pollInterval: 5) == .none)
+        precondition(linkLoss.takeHotspotLoss(), "a replaced link is a loss with no listener")
+
         // The poll runs only while the app is active.
         precondition(HotspotPoll.interval(proxyRunning: false, active: true) == 5)
         precondition(HotspotPoll.interval(proxyRunning: true, active: true) == 2)

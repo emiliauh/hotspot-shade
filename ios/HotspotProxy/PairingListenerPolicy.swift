@@ -41,6 +41,11 @@ struct PairingListenerPolicy {
     private var retryAt: TimeInterval = 0
     private var failureReported = false
     private(set) var lastStopCause: StopCause?
+    /// True after the policy saw the hotspot go away or change, whether or not a
+    /// listener existed. `takeHotspotLoss` reports it once. A failure line that
+    /// blames the pairing port needs this: with no listener there is no `.stop`
+    /// action, and the line would outlive its cause.
+    private var hotspotLoss = false
 
     init(clock: @escaping () -> TimeInterval,
          latestLink: @escaping () -> HotspotInterface.LinkObservation? = {
@@ -104,6 +109,7 @@ struct PairingListenerPolicy {
         address = nil
         identity = nil
         resetObservations()
+        noteHotspotLoss()
         guard listening else { return .none }
         lastStopCause = cause
         return .stop
@@ -121,6 +127,7 @@ struct PairingListenerPolicy {
                 address = nil
                 identity = nil
                 resetObservations()
+                noteHotspotLoss()
                 guard listening else { return .none }
                 lastStopCause = .absent
                 return .stop
@@ -130,6 +137,20 @@ struct PairingListenerPolicy {
             lastMissingAt = now
         }
         return .none
+    }
+
+    /// Report once that the hotspot went away or changed since the last call.
+    mutating func takeHotspotLoss() -> Bool {
+        defer { hotspotLoss = false }
+        return hotspotLoss
+    }
+
+    /// A new hotspot is a new situation. Its first bind failure is a first
+    /// failure again, and it needs no wait left over from the old one.
+    private mutating func noteHotspotLoss() {
+        hotspotLoss = true
+        failureReported = false
+        retryAt = 0
     }
 
     mutating func failed() -> String? {

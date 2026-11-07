@@ -252,7 +252,7 @@ namespace HotspotShade.WinUI2.Core.App
                 case BrokerCodes.AdapterDllMissing:
                     return "wintun.dll is missing from this install, so Turn on is unavailable. Add the official wintun.dll and reinstall HotspotShade.";
                 case BrokerCodes.InstallUntrusted:
-                    return "This copy of HotspotShade is not installed from a package, so Turn on is unavailable. Install the HotspotShade package, then try again.";
+                    return "This copy of HotspotShade is not installed from a package in a protected Windows apps folder, so Turn on is unavailable. Install the HotspotShade package, then try again.";
                 case BrokerCodes.ElevationCancelled:
                     return "The administrator prompt was cancelled, so the tunnel did not start.";
                 case BrokerCodes.ElevationFailed:

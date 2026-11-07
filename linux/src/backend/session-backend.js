@@ -19,7 +19,10 @@
  * returns the app to the user engine, which still holds the pairing. A stop
  * that is not confirmed keeps the root engine as the status source and marks
  * the status as uncertain, so the page never shows Off for it. A running false
- * answer does not clear that mark. Pairing and forget are refused while a
+ * answer does not clear that mark; only a helper exit that proves the state
+ * does, and every status read looks for that exit. A later Turn off asks the
+ * helper client to close its request pipe again and re-read the outcome.
+ * Pairing and forget are refused while a
  * root tunnel runs or a stop is unconfirmed. A root engine whose tunnel
  * stopped by itself is stopped through the helper before a new start, a
  * pairing, or a forget.
@@ -31,6 +34,7 @@
 const { BackendError } = require('./errors');
 
 const CLEANUP_MESSAGE = 'The tunnel stop could not be confirmed. The privileged engine may still hold the routes. Inspect the routes, then turn the tunnel off again, or quit and start HotspotShade again.';
+const STATUS_READ_ATTEMPTS = 3;
 const TIMEOUT_REASONS = Object.freeze(['helper_exit_timeout', 'engine_stop_timeout']);
 
 function isPlainObject(value) {
@@ -47,6 +51,9 @@ function confirmedStop(result) {
     && result.cleanupUnconfirmed !== true
     && result.stillRunning !== true;
 }
+
+/* What a confirmed root stop returns. It is not read from the user engine. */
+const STOP_CONFIRMED = Object.freeze({ source: 'user', running: false, stopped: true });
 
 function cleanupError() {
   return new BackendError('engine_stop_incomplete', CLEANUP_MESSAGE);
@@ -80,7 +87,8 @@ function createSessionBackend(options) {
     throw new TypeError('A root engine client factory is required.');
   }
 
-  /* { client, ready, stopping } for the one root engine session. */
+  /* { client, ready, stopping, stopSettled, outcome } for the one root engine
+   * session. */
   let root = null;
   /* Set when a root stop was not confirmed. It lives outside the root client,
    * so no later status answer can clear it. Only a confirmed result can. */
@@ -109,10 +117,15 @@ function createSessionBackend(options) {
   /* Stop one root session through its engine and its helper. The flight is
    * kept on the session, so a stop, a failed start, and a quit share one
    * result. */
-  function stopRoot(entry) {
-    if (entry.stopping) return entry.stopping;
-    entry.stopping = (async function () {
-      if (entry.ready) {
+  function stopRoot(entry, options) {
+    /* A retry re-attempts a stop whose previous attempt ended without a
+     * confirmation. It never replaces an attempt that is still running. */
+    const retry = !!options && options.retry === true
+      && entry.stopping && entry.stopSettled === true && root === entry && cleanupPending;
+    if (entry.stopping && !retry) return entry.stopping;
+    entry.stopSettled = false;
+    const flight = (async function () {
+      if (entry.ready && !retry) {
         try {
           await entry.client.call('stop');
         } catch (error) {
@@ -121,11 +134,18 @@ function createSessionBackend(options) {
       }
       let result;
       try {
-        result = await entry.client.stop();
+        /* The client caches its first stop result. A retry asks it to close
+         * the helper request pipe again and classify the helper's state now. */
+        result = retry && typeof entry.client.retryStop === 'function'
+          ? await entry.client.retryStop()
+          : await entry.client.stop();
       } catch (error) {
         result = { stopped: false, timedOut: false, failed: true, reason: 'helper_stop_failed' };
       }
       const confirmed = confirmedStop(result);
+      const outcome = { confirmed: confirmed, result: result };
+      entry.outcome = outcome;
+      entry.stopSettled = true;
       if (root === entry) {
         if (confirmed) {
           root = null;
@@ -134,9 +154,10 @@ function createSessionBackend(options) {
           cleanupPending = true;
         }
       }
-      return { confirmed: confirmed, result: result };
+      return outcome;
     })();
-    return entry.stopping;
+    entry.stopping = flight;
+    return flight;
   }
 
   /* A stop result is kept, but the helper can exit after it. Classify that
@@ -149,7 +170,19 @@ function createSessionBackend(options) {
   async function lateConfirmation() {
     const entry = root;
     if (!entry || !cleanupPending || !entry.stopping) return false;
-    const outcome = await entry.stopping;
+    await entry.stopping;
+    return evaluateLateConfirmation();
+  }
+
+  /* The same check with no wait: it reads the helper exit that the client has
+   * already recorded. A stop attempt that is still running decides for itself,
+   * so the check leaves it alone. Every status read calls this, so a mark from
+   * a stop whose helper exited later clears without a user action. */
+  function evaluateLateConfirmation() {
+    const entry = root;
+    if (!entry || !cleanupPending || !entry.stopping) return false;
+    if (entry.stopSettled !== true) return false;
+    const outcome = entry.outcome;
     if (root !== entry || !cleanupPending) return !cleanupPending;
     const client = entry.client;
     const exit = typeof client.exitInfo === 'function' ? client.exitInfo() : null;
@@ -177,12 +210,8 @@ function createSessionBackend(options) {
     const entry = root;
     if (!entry) return;
     if (entry.ready) {
-      let status = null;
-      try {
-        status = await entry.client.call('status');
-      } catch (error) {
-        status = null;
-      }
+      const read = await readRootStatus(entry);
+      const status = read.status;
       if (root !== entry) {
         /* A concurrent stop settled this session while the status read ran. */
         if (cleanupPending) throw cleanupError();
@@ -192,9 +221,26 @@ function createSessionBackend(options) {
       if (status && status.running === true) {
         throw new BackendError(blockedCode, 'Turn off the tunnel first.', 409);
       }
+      /* A read that failed for another reason than a lost engine does not
+       * prove the tunnel is off. Never stop a tunnel that may still run. */
+      if (!status && !read.lost) {
+        throw new BackendError(blockedCode, 'The tunnel status could not be read. Try again in a moment.', 409);
+      }
     }
     const outcome = await stopRoot(entry);
     if (!outcome.confirmed) throw cleanupError();
+  }
+
+  /* Read the root engine's status. `lost` is true when the client reports
+   * that its engine stopped or is stopping, which is the one failure that
+   * proves the root tunnel is not running. Any other failure, such as a
+   * timeout, proves nothing. */
+  async function readRootStatus(entry) {
+    try {
+      return { status: await entry.client.call('status'), lost: false };
+    } catch (error) {
+      return { status: null, lost: !!error && error.code === 'engine_stopped' };
+    }
   }
 
   /* One pairing or forget request in flight. A start waits for none of them;
@@ -210,15 +256,38 @@ function createSessionBackend(options) {
     }
   }
 
+  /* A read that began before the session changed hands answers for the old
+   * source: a user engine that says running false after the root tunnel is
+   * live, or a root engine that a stop already closed. Stamp each read with
+   * the generation and the source, drop a stale answer, and read again. */
   async function status() {
-    let value;
-    try {
-      value = await sourceClient().call('status');
-    } catch (error) {
-      if (cleanupPending) throw cleanupError();
-      throw error;
+    for (let attempt = 0; attempt < STATUS_READ_ATTEMPTS; attempt += 1) {
+      if (cleanupPending) evaluateLateConfirmation();
+      const stampGeneration = generation;
+      const stampRoot = root;
+      const client = sourceClient();
+      let value = null;
+      let failure = null;
+      try {
+        value = await client.call('status');
+      } catch (error) {
+        failure = error;
+      }
+      if (stampGeneration !== generation || stampRoot !== root || client !== sourceClient()) {
+        /* The session changed hands during the read. Drop the answer or the
+         * failure, and read again from the current source. */
+        continue;
+      }
+      if (failure) {
+        /* A stopped or lost root engine cannot answer, but the mark is still
+         * pending. Answer with the uncertain status itself, so the page keeps
+         * the "Try to turn off" action instead of showing an engine loss. */
+        if (cleanupPending) return markUncertain(null);
+        throw failure;
+      }
+      return cleanupPending ? markUncertain(value) : value;
     }
-    return cleanupPending ? markUncertain(value) : value;
+    throw new BackendError('status_changed', 'The tunnel changed while its status was read. Check again.');
   }
 
   function start(startOptions) {
@@ -236,16 +305,16 @@ function createSessionBackend(options) {
       const existing = root;
       if (existing) {
         if (existing.ready) {
-          let current = null;
-          try {
-            current = await existing.client.call('status');
-          } catch (error) {
-            current = null;
-          }
+          const read = await readRootStatus(existing);
+          const current = read.status;
           /* A live root tunnel answers its own start, which reports that it
            * already runs. */
           if (current && current.running === true && root === existing && !existing.stopping) {
             return existing.client.call('start', params);
+          }
+          /* An unreadable status is not proof that the tunnel is off. */
+          if (!current && !read.lost && root === existing && !existing.stopping) {
+            throw new BackendError('status_unavailable', 'The tunnel status could not be read. Try again in a moment.');
           }
         }
         /* An auto-stopped or lost root engine is stopped through the helper
@@ -323,11 +392,15 @@ function createSessionBackend(options) {
       const entry = root;
       if (entry) {
         if (cleanupPending && await lateConfirmation()) {
-          return userClient.call('status');
+          return Object.assign({}, STOP_CONFIRMED);
         }
-        const outcome = await stopRoot(entry);
+        /* A later Turn off after an unconfirmed attempt tries again. */
+        const outcome = await stopRoot(entry, { retry: cleanupPending });
         if (!outcome.confirmed) throw cleanupError();
-        return userClient.call('status');
+        /* The user engine may have died while the root engine ran. A fixed
+         * confirmation keeps a confirmed stop from reading as a failed one;
+         * the next status poll reports an engine loss on its own. */
+        return Object.assign({}, STOP_CONFIRMED);
       }
       return userClient.call('stop');
     })();

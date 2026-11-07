@@ -56,6 +56,25 @@ struct PairingSuspensionTests {
         } == 0
     }
 
+    /// Listen on the loopback pairing port so the server cannot bind it. Return
+    /// the descriptor, or -1.
+    static func holdPort(_ port: UInt16) -> Int32 {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return -1 }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = port.bigEndian
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let bound = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0, listen(fd, 1) == 0 else { close(fd); return -1 }
+        return fd
+    }
+
     static func setOverride() {
         let defaults = UserDefaults.standard
         defaults.set(HotspotInterface.testLoopback.name, forKey: HotspotInterface.testInterfaceKey)
@@ -162,6 +181,28 @@ struct PairingSuspensionTests {
               "a zero port suspends the listener")
         check(wait(until: { canBind(PairingProtocol.port) }, timeout: 5),
               "a zero port releases port \(PairingProtocol.port)")
+
+        // 7. A busy pairing port shows the unavailable line. Suspending pairing
+        // clears it, because the line must not outlive its cause. The hotspot
+        // loss path needs 15 poll intervals, so the policy test covers it.
+        let blocker = holdPort(PairingProtocol.port)
+        check(blocker >= 0, "the test can hold port \(PairingProtocol.port)")
+        server.configurePairing(port: proxyPort, token: token)
+        check(wait(until: { latest.pairingUnavailable }, timeout: 15),
+              "a busy pairing port sets the unavailable flag")
+        check(!latest.pairingReady, "a busy pairing port is not ready")
+        server.suspendPairing()
+        check(wait(until: { !latest.pairingUnavailable }, timeout: 5),
+              "suspending pairing clears the unavailable flag")
+        server.configurePairing(port: proxyPort, token: token)
+        check(wait(until: { latest.pairingUnavailable }, timeout: 15),
+              "the busy port is reported again after a new configure")
+        server.configurePairing(port: proxyPort, token: "")
+        check(wait(until: { !latest.pairingUnavailable }, timeout: 5),
+              "an empty token clears the unavailable flag")
+        close(blocker)
+        check(wait(until: { canBind(PairingProtocol.port) }, timeout: 5),
+              "the test released port \(PairingProtocol.port)")
 
         server.stop()
         _ = wait(until: { true }, timeout: 0.2)

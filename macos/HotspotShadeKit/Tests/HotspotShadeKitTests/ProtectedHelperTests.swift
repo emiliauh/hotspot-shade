@@ -4649,7 +4649,11 @@ final class ProtectedHelperTests: XCTestCase {
             XCTAssertEqual(startError.value as? HelperTrustError, HelperTrustError.cancelled)
             if transport.startCalls == 1 {
                 XCTAssertEqual(transport.stopCalls, 1, "A late engine must be stopped.")
-                XCTAssertEqual(engine.lastStop, .stopped)
+                // The cancelled start stops its own late engine and records
+                // `.stopped`. The explicit stop can run after that and find no
+                // engine, which records `.notRunning`. Both orders leave the
+                // engine stopped exactly once.
+                XCTAssertTrue([.stopped, .notRunning].contains(engine.lastStop), "\(engine.lastStop)")
             } else {
                 XCTAssertEqual(transport.startCalls, 0)
                 XCTAssertEqual(transport.stopCalls, 0)

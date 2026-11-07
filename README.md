@@ -20,8 +20,9 @@ between your computer and your phone.
 > in an unsigned build, and an unsigned or ad-hoc app fails closed at Turn on
 > with a plain unavailable message. The app has no demo mode; the Dashboard,
 > pairing, status, and Settings use the real engine as your account. No
-> Developer ID certificate or root installation is available in this
-> repository, so the signed helper launch and live route cleanup are untested.
+> Developer ID certificate is available in this repository. A locally signed
+> release candidate passed one live iPhone test on 2026-11-06, including route
+> cleanup after Turn off; that does not prove other networks or carriers.
 > Do not describe an unsigned macOS build as protected.
 
 ## How it works
@@ -49,8 +50,8 @@ There are two modes:
 | Platform | Role | Status |
 |---|---|---|
 | macOS 14+ (Apple silicon) | Target | **Prototype.** An earlier build was verified on a live hotspot. The current app's administrator-start security boundary needs work. |
-| iOS 17+ | Source | **Prototype.** CI builds an unsigned IPA that you sign yourself. The current build still needs physical-device and cross-platform hotspot tests. |
-| Android 8.0+ | Source | **Prototype.** Emulator tests exercise pairing and proxy traffic with test network inputs. Production hotspot discovery, background presence, and cellular binding need further work and device validation. Not yet tested on a real phone, carrier, or hotspot. |
+| iOS 17+ | Source | **Prototype.** CI builds an unsigned IPA that you sign yourself. The signed release candidate is installed and launched on a physical iPhone, and the source proxy started on a real hotspot. Cross-platform live tunnel tests remain open. |
+| Android 8.0+ | Source | **Prototype.** Emulator tests exercise pairing and proxy traffic with test network inputs. Production hotspot discovery and cellular binding need further work and device validation. Background status is implemented and JVM and loopback tested. Not yet tested on a real phone, carrier, or hotspot. |
 | Linux | Target | **Desktop integration incomplete.** An earlier CLI snapshot passed isolated VM tunnel tests. The current uncommitted route cleanup changes need fresh review and VM evidence. The packaged Electron app has not yet been shown to start a real tunnel. Not yet tested on a live hotspot. |
 | Windows 10/11 | Target | **Source device proxy mode and pairing implemented; never run on a Windows host.** Before each use of the source device token, the engine checks the routing table. The source device must be the default gateway of a physical Ethernet or Wi-Fi adapter, and that adapter must be the one the tunnel pins to. A VPN, a split default route, or a virtual adapter blocks the start with a fixed message. During a run, the first failed check turns the tunnel off. This check does not prove that the gateway is your source device. The v1 proxy sends a reusable token in cleartext over the hotspot link. Pairing, cancel, forget, and the pairing handoff to an elevated engine use the same API as macOS and Linux. Direct mode and SOCKS5 mode are not implemented. The command-line GUI requires an authenticated launcher with `--token-fd` and `--parent-fd`. The WinUI 2 app in `windows/` is that launcher: it starts the engine as the standard user for the dashboard, pairing, and status, and asks for one UAC prompt only at Turn on, when a packaged elevated starter starts the tunnel engine with the pairing handoff. It has no demo mode, has not been built or run on Windows yet, and is the app to test with `windows/BUILD_AND_TEST_ON_PC.md`. The console app in `windows/src/HotspotShade.WinUI2.TestLauncher` stays as a diagnostic fallback. |
 
@@ -126,9 +127,10 @@ connection. The authenticated transport design is not implemented.
 
 The unsigned macOS app can run its real engine as the signed-in user for the
 dashboard, pairing, settings, and diagnostics. Starting a tunnel needs the signed
-protected helper, and the installer currently refuses installation. The Windows
-app is a simulated preview. The Linux app's real tunnel integration still needs
-live verification.
+protected helper, which the local preview coordinator installs (see
+macos/Helper/README.md). The Windows app is wired to the real engine through its
+broker and elevated starter, and it has not been built or run on Windows yet.
+The Linux app's real tunnel integration still needs live verification.
 
 On macOS or Linux, the unprivileged command-line `phone` adapter can exercise
 the source proxy for applications configured to use its local SOCKS listener:

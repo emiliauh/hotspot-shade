@@ -1288,13 +1288,18 @@ fn drain_control_pipe(handle: *mut std::ffi::c_void, available: u32) -> ControlP
 
 /// Validate one inherited Windows GUI control handle.
 ///
-/// The launcher creates the handle. It must be a pipe with read access.
-/// `GetFileType` reports `FILE_TYPE_PIPE` for a socket handle too, so it cannot
-/// tell a pipe from a socket. `GetNamedPipeInfo` succeeds only on a pipe: it
-/// rejects a socket and accepts the synchronous anonymous pipe that the trusted
-/// broker creates. `PeekNamedPipe` succeeds only on a handle that can read: a
-/// write-only end is not a control channel, because the secret cannot be read
-/// and a parent close cannot be observed.
+/// The launcher creates the handle. It must be a pipe with read access. A type
+/// check alone cannot establish that: `GetFileType` reports `FILE_TYPE_PIPE`
+/// for a socket handle too, so it cannot tell an anonymous pipe from a socket.
+/// The check is the pair. `GetNamedPipeInfo` succeeds only on a pipe and needs
+/// only `FILE_READ_ATTRIBUTES`, so it rejects a socket and accepts the
+/// synchronous anonymous pipe that the trusted broker creates. `PeekNamedPipe`
+/// then proves the access rule that the control channel needs: the handle must
+/// be open for reading, which means `GENERIC_READ` (it includes `FILE_READ_DATA`
+/// and `FILE_READ_ATTRIBUTES`). A write-only end is refused, because the secret
+/// cannot be read and a parent close cannot be observed. A handle that passes
+/// is therefore a readable pipe, and the caller clears its inherit flag before
+/// any child process starts.
 #[cfg(windows)]
 fn validate_windows_control_pipe(handle: *mut std::ffi::c_void, label: &str) -> Result<(), String> {
     #[link(name = "kernel32")]
@@ -1820,8 +1825,9 @@ fn run() -> Result<(), String> {
                 Some(handle) => Some(handle.read_latest().map_err(|error| error.message().to_string())?),
                 None => None,
             };
-            set_startup_stage(StartupStage::Listener);
+            set_startup_stage(StartupStage::Arguments);
             let port=option(&args,"--port").unwrap_or_else(||"8787".into()).parse::<u16>().map_err(|_|"invalid port")?;
+            set_startup_stage(StartupStage::Listener);
             let mut server=GuiServer::bind(port).map_err(|e|e.to_string())?;
             if let Some(token) = token {
                 server.set_token(token);
@@ -2378,6 +2384,39 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|v| v.to_string()).collect()
+    }
+
+    #[test]
+    fn a_failed_gui_startup_prints_one_fixed_reason_line() {
+        assert_eq!(startup_failure_line(StartupStage::None), None);
+        for (stage, code) in [
+            (StartupStage::Arguments, "arguments_invalid"),
+            (
+                StartupStage::ControlDescriptors,
+                "control_descriptor_invalid",
+            ),
+            (
+                StartupStage::CredentialsDescriptor,
+                "credentials_descriptor_invalid",
+            ),
+            (StartupStage::Token, "token_invalid"),
+            (
+                StartupStage::CredentialsHandoff,
+                "credentials_handoff_invalid",
+            ),
+            (StartupStage::Listener, "listener_failed"),
+            (StartupStage::PortFile, "port_file_failed"),
+            (StartupStage::CredentialsImport, "credentials_import_failed"),
+        ] {
+            assert_eq!(
+                startup_failure_line(stage).as_deref(),
+                Some(format!("hotspotshade-start-failure: {code}").as_str())
+            );
+            // The stored value maps back to the same stage.
+            STARTUP_STAGE.store(stage as u8, Ordering::Release);
+            assert_eq!(StartupStage::current(), stage);
+        }
+        set_startup_stage(StartupStage::None);
     }
 
     /// One anonymous synchronous pipe for the Windows control-handle tests.

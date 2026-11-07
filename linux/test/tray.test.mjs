@@ -35,6 +35,16 @@ test('the tray state follows the engine status', () => {
   cleanupMenu[3].click();
   assert.equal(attempts, 1);
   assert.equal(trayState({ running: true, state: 'unknown' }, null, true).stopEnabled, false);
+  /* A pending cleanup mark is cleared only by a stop attempt, so the tray
+   * offers it with a running false answer too. */
+  const pending = trayState({ running: false, paired: true, cleanup_blocked: true, state: 'unknown' }, { state: 'idle' });
+  assert.equal(pending.stopEnabled, true);
+  assert.equal(pending.stopIsAttempt, true);
+  assert.equal(pending.startEnabled, false);
+  const pendingMenu = createTrayMenuTemplate({ status: { running: false, cleanup_blocked: true, state: 'unknown' } });
+  assert.equal(pendingMenu[3].label, 'Try to turn off');
+  assert.equal(pendingMenu[3].enabled, true);
+  assert.equal(trayState({ running: false, paired: true, cleanup_blocked: true }, null, true).stopEnabled, false);
   assert.equal(trayState({ running: false, paired: false }, { state: 'idle' }).label, 'Not paired');
   assert.equal(trayState({ running: false, paired: true }, { state: 'idle' }).label, 'Ready');
   assert.equal(trayState({ running: false, paired: true, phone: { state: 'not_trusted' } }, { state: 'idle' }).label, 'Not trusted');

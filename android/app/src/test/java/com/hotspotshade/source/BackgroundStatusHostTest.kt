@@ -88,6 +88,140 @@ class BackgroundStatusHostTest {
     }
 
     @Test
+    fun aTickThatReadNotVisibleBeforeTheActivityStartedClosesItsListener() {
+        val harness = Harness()
+        // The tick has read visible() == false. The activity then claims the
+        // port and the worker releases it, while the tick is still binding.
+        harness.onFactory = {
+            BackgroundStatusHost.activityStarted()
+            BackgroundStatusHost.releasePortNow()
+        }
+        try {
+            harness.host.start()
+
+            val stale = harness.listeners.single()
+            assertEquals("The stale listener is closed before the tick ends.", 1, stale.closeCount)
+            assertTrue(!stale.isRunning())
+
+            // The next tick publishes normally once nothing moves the fence.
+            harness.onFactory = null
+            harness.host.tickNow()
+            assertEquals(2, harness.listeners.size)
+            assertTrue(harness.listeners[1].isRunning())
+        } finally {
+            BackgroundStatusHost.activityStopped()
+            harness.host.stop()
+        }
+    }
+
+    @Test
+    fun aPortClaimDuringTheTokenLoadOpensNoListener() {
+        val harness = Harness()
+        harness.onTokenLoad = { BackgroundStatusHost.activityStarted() }
+        try {
+            harness.host.start()
+
+            assertEquals("No listener binds after the fence moved.", 0, harness.listeners.size)
+        } finally {
+            BackgroundStatusHost.activityStopped()
+            harness.host.stop()
+        }
+    }
+
+    @Test
+    fun aVisibleReadUnderTheLockAfterTheBindClosesTheListener() {
+        val harness = Harness()
+        harness.onFactory = { harness.visible = true }
+        harness.host.start()
+
+        val stale = harness.listeners.single()
+        assertEquals(1, stale.closeCount)
+        assertTrue(!stale.isRunning())
+        harness.host.stop()
+    }
+
+    @Test
+    fun aRolledBackStartLeavesNoRegistryEntryAndAStopLeavesNone() {
+        val host = BackgroundStatusHost(
+            binding = { sourceBinding() },
+            visible = { false },
+            loadToken = { "test-token" },
+            trust = MemoryPairingTrustStore(),
+            identity = FakeIdentity,
+            clock = { 0L },
+            tokenEpoch = { 0L },
+            listenerFactory = { _, _, _, _ -> FakeListener() },
+            schedulerFactory = { throw IllegalStateException("no thread") },
+            pollMillis = 20L,
+        )
+
+        host.start()
+
+        assertTrue("A failed start is removed from the registry.", !BackgroundStatusHost.isRegistered(host))
+    }
+
+    @Test
+    fun aStartThatIsStoppedWhileTheSchedulerIsBuiltStaysUnregistered() {
+        lateinit var host: BackgroundStatusHost
+        host = BackgroundStatusHost(
+            binding = { sourceBinding() },
+            visible = { false },
+            loadToken = { "test-token" },
+            trust = MemoryPairingTrustStore(),
+            identity = FakeIdentity,
+            clock = { 0L },
+            tokenEpoch = { 0L },
+            listenerFactory = { _, _, _, _ -> FakeListener() },
+            schedulerFactory = {
+                host.stop()
+                java.util.concurrent.Executors.newSingleThreadScheduledExecutor()
+            },
+            pollMillis = 20L,
+        )
+
+        host.start()
+
+        assertTrue(!BackgroundStatusHost.isRegistered(host))
+    }
+
+    @Test
+    fun aRollbackDoesNotRemoveTheRegistrationOfALaterStart() {
+        var calls = 0
+        lateinit var host: BackgroundStatusHost
+        val executors = mutableListOf<java.util.concurrent.ScheduledExecutorService>()
+        host = BackgroundStatusHost(
+            binding = { sourceBinding() },
+            visible = { true },
+            loadToken = { "test-token" },
+            trust = MemoryPairingTrustStore(),
+            identity = FakeIdentity,
+            clock = { 0L },
+            tokenEpoch = { 0L },
+            listenerFactory = { _, _, _, _ -> FakeListener() },
+            schedulerFactory = {
+                calls += 1
+                if (calls == 1) {
+                    // A stop and a new start run while this start still builds.
+                    host.stop()
+                    host.start()
+                    throw IllegalStateException("late failure")
+                }
+                java.util.concurrent.Executors.newSingleThreadScheduledExecutor().also { executors.add(it) }
+            },
+            pollMillis = 20L,
+        )
+
+        try {
+            host.start()
+
+            assertTrue(BackgroundStatusHost.isRegistered(host))
+        } finally {
+            host.stop()
+            executors.forEach { it.shutdownNow() }
+        }
+    }
+
+    @Test
     fun theListenerStopsWhenTheActivityReturns() {
         val harness = Harness()
         harness.host.start()
@@ -279,11 +413,14 @@ class BackgroundStatusHostTest {
         var tokenLoads = 0
         var lastPrompt: ((PairingPrompt?) -> Unit)? = null
         var lastAddress: InetAddress? = null
+        var onFactory: (() -> Unit)? = null
+        var onTokenLoad: (() -> Unit)? = null
         val host = BackgroundStatusHost(
             binding = { binding },
             visible = { visible },
             loadToken = {
                 tokenLoads += 1
+                onTokenLoad?.invoke()
                 token
             },
             trust = MemoryPairingTrustStore(),
@@ -293,6 +430,7 @@ class BackgroundStatusHostTest {
             listenerFactory = { _, address, _, onPrompt ->
                 lastAddress = address
                 lastPrompt = onPrompt
+                onFactory?.invoke()
                 val fail = failedStarts > 0
                 if (fail) failedStarts -= 1
                 FakeListener(failStart = fail).also { listeners.add(it) }

@@ -50,6 +50,8 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
     /// Keep-alive is on by default. The choice is saved.
     @Published var backgroundLocation = UserDefaults.standard.object(forKey: "keepAwake") as? Bool ?? true
     @Published var pairedLaptops = 0
+    /// The trusted target devices that Settings lists. Public keys give the labels.
+    @Published private(set) var trustedTargets: [TrustedTarget] = []
     /// The prompt that the user already answered. The alert does not show it again.
     @Published var answeredPairingID: UUID?
     @Published var activity: [ActivityEntry] = []
@@ -192,6 +194,7 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
             // The snapshot carries the trusted count on every change, so a
             // remote FORGET updates the Dashboard and Settings at once.
             self.pairedLaptops = snapshot.trustedCount
+            self.refreshTrustedTargets()
             if snapshot.trustRevision != self.trustRevision {
                 self.trustRevision = snapshot.trustRevision
                 if let change = snapshot.lastTrustChange { self.recordActivity(change.activity) }
@@ -201,6 +204,7 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
             self.updateLocation()
         }
         pairedLaptops = trust.count
+        refreshTrustedTargets()
         // A run that did not stop by itself was closed by iOS. Record it once.
         if UserDefaults.standard.bool(forKey: "wasListening") {
             stopLog.record(.appClosed)
@@ -436,6 +440,18 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
     /// change, and the app records the plain activity line once.
     func forgetPairedLaptops() {
         trust.removeAll()
+    }
+
+    /// Forget one target device by its full public key. This removes trust only.
+    /// The token does not change, and the target device must pair again with a prompt.
+    func forgetTarget(_ target: TrustedTarget) {
+        trust.remove(target.key)
+        refreshTrustedTargets()
+    }
+
+    private func refreshTrustedTargets() {
+        let list = TrustedTarget.list(trust.keys)
+        if list != trustedTargets { trustedTargets = list }
     }
 
     // MARK: Diagnostics
@@ -860,6 +876,10 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
             hotspotIdentity = nil
             hotspotState = .absent
             setAddresses("Hotspot IPv4 address not found.")
+        case .ambiguous:
+            hotspotIdentity = nil
+            hotspotState = .ambiguous
+            setAddresses("Cannot tell which link is the hotspot.")
         case .unreadable:
             hotspotIdentity = nil
             hotspotState = .unreadable
@@ -925,7 +945,7 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         case .keepRunning:
             // Keep the Manual connection address current from the same
             // observation. An unreadable read proves no change, so leave it.
-            if observation != .unreadable { applyHotspotObservation(observation) }
+            if observation != .unreadable, observation != .ambiguous { applyHotspotObservation(observation) }
         case .lost:
             applyHotspotObservation(.absent)
             stopForLostHotspot(.hotspotLost)
@@ -1029,16 +1049,56 @@ extension ProxyModel: TokenLifecycleHost {
     }
 }
 
+/// The Settings actions that ask first. One dialog shows whichever is open, so
+/// two requests cannot compete for the same screen.
+private enum SettingsConfirmation: Equatable {
+    case forgetTarget(TrustedTarget)
+    case forgetAll
+    case rotateToken
+    case replaceInvalidToken
+    case restoreLegacyToken
+
+    var title: String {
+        switch self {
+        case .forgetTarget: return ConfirmationText.forgetTargetTitle
+        case .forgetAll: return ConfirmationText.forgetAllTitle
+        case .rotateToken: return ConfirmationText.rotateTokenTitle
+        case .replaceInvalidToken: return ConfirmationText.replaceInvalidTokenTitle
+        case .restoreLegacyToken: return ConfirmationText.restoreLegacyTokenTitle
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .forgetTarget(let target): return ConfirmationText.forgetTargetMessage(label: target.label)
+        case .forgetAll: return ConfirmationText.forgetAllMessage
+        case .rotateToken: return ConfirmationText.rotateTokenMessage
+        case .replaceInvalidToken: return ConfirmationText.replaceInvalidTokenMessage
+        case .restoreLegacyToken: return ConfirmationText.restoreLegacyTokenMessage
+        }
+    }
+
+    var confirmLabel: String {
+        switch self {
+        case .forgetTarget: return "Forget"
+        case .forgetAll: return "Forget All"
+        case .rotateToken: return "Rotate Token"
+        case .replaceInvalidToken: return "Replace Token"
+        case .restoreLegacyToken: return "Restore Token"
+        }
+    }
+}
+
 struct ContentView: View {
     @StateObject private var model = ProxyModel()
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var showActivity = false
     @State private var showDetails = false
-    @State private var showForgetAll = false
-    @State private var showRotateToken = false
-    @State private var showReplaceInvalidToken = false
-    @State private var showRestoreLegacyToken = false
+    /// The one open confirmation. `confirming` shows it. The value stays set
+    /// after a dismissal so the title does not change while the dialog leaves.
+    @State private var confirmation: SettingsConfirmation?
+    @State private var confirming = false
     @FocusState private var portFieldFocused: Bool
     private var running: Bool { model.snapshot.state == "Listening" || model.snapshot.state == "Starting" }
     /// A Start failure stays visible until the user tries again or the proxy starts.
@@ -1140,8 +1200,18 @@ struct ContentView: View {
                                       tint: .secondary,
                                       text: notice)
                 }
-                if model.pairedLaptops > 0 {
-                    Button("Forget paired target devices", role: .destructive) { showForgetAll = true }
+                if model.trustedTargets.isEmpty {
+                    if model.pairedLaptops == 0 {
+                        SettingsStatusRow(symbol: "link", tint: .secondary,
+                                          text: model.pairingDisplay.emptyListHelp)
+                    }
+                } else {
+                    ForEach(model.trustedTargets) { target in
+                        TrustedTargetRow(target: target) { ask(.forgetTarget(target)) }
+                    }
+                }
+                if model.pairedLaptops > 0 || !model.trustedTargets.isEmpty {
+                    Button("Forget all target devices", role: .destructive) { ask(.forgetAll) }
                         .accessibilityHint("Asks for confirmation.")
                 }
             }
@@ -1253,7 +1323,7 @@ struct ContentView: View {
                     }
                     if model.tokenNeedsRestore {
                         Button("Restore saved token...") {
-                            showRestoreLegacyToken = true
+                            ask(.restoreLegacyToken)
                         }
                         .disabled(!model.canRestoreLegacyToken)
                         if model.proxyActive {
@@ -1268,7 +1338,7 @@ struct ContentView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     } else if model.tokenNeedsReplacement {
                         Button("Replace invalid token...", role: .destructive) {
-                            showReplaceInvalidToken = true
+                            ask(.replaceInvalidToken)
                         }
                         .disabled(!model.canReplaceInvalidToken)
                         if model.proxyActive {
@@ -1282,7 +1352,7 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    Button("Rotate token") { showRotateToken = true }
+                    Button("Rotate token") { ask(.rotateToken) }
                         .disabled(!model.canRotateToken)
                     Text(model.canRotateToken
                          ? ConfirmationText.rotateTokenNote
@@ -1323,29 +1393,14 @@ struct ContentView: View {
             }
         }
         .onAppear { model.refreshAddresses() }
-        .confirmationDialog(ConfirmationText.forgetAllTitle, isPresented: $showForgetAll, titleVisibility: .visible) {
-            Button("Forget All", role: .destructive) { model.forgetPairedLaptops() }
+        .confirmationDialog(confirmation?.title ?? "",
+                            isPresented: $confirming,
+                            titleVisibility: .visible,
+                            presenting: confirmation) { item in
+            Button(item.confirmLabel, role: .destructive) { perform(item) }
             Button("Cancel", role: .cancel) {}
-        } message: {
-            Text(ConfirmationText.forgetAllMessage)
-        }
-        .confirmationDialog(ConfirmationText.rotateTokenTitle, isPresented: $showRotateToken, titleVisibility: .visible) {
-            Button("Rotate Token", role: .destructive) { model.rotateToken() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text(ConfirmationText.rotateTokenMessage)
-        }
-        .confirmationDialog(ConfirmationText.replaceInvalidTokenTitle, isPresented: $showReplaceInvalidToken, titleVisibility: .visible) {
-            Button("Replace Token", role: .destructive) { model.replaceInvalidToken() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text(ConfirmationText.replaceInvalidTokenMessage)
-        }
-        .confirmationDialog(ConfirmationText.restoreLegacyTokenTitle, isPresented: $showRestoreLegacyToken, titleVisibility: .visible) {
-            Button("Restore Token", role: .destructive) { model.restoreLegacyToken() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text(ConfirmationText.restoreLegacyTokenMessage)
+        } message: { item in
+            Text(item.message)
         }
         .scrollDismissesKeyboard(.interactively)
         .toolbar {
@@ -1353,6 +1408,21 @@ struct ContentView: View {
                 Spacer()
                 Button("Done") { portFieldFocused = false }
             }
+        }
+    }
+
+    private func ask(_ item: SettingsConfirmation) {
+        confirmation = item
+        confirming = true
+    }
+
+    private func perform(_ item: SettingsConfirmation) {
+        switch item {
+        case .forgetTarget(let target): model.forgetTarget(target)
+        case .forgetAll: model.forgetPairedLaptops()
+        case .rotateToken: model.rotateToken()
+        case .replaceInvalidToken: model.replaceInvalidToken()
+        case .restoreLegacyToken: model.restoreLegacyToken()
         }
     }
 
@@ -1486,6 +1556,28 @@ private struct SettingsStatusRow: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .accessibilityElement(children: .combine)
+    }
+}
+
+/// One trusted target device in Settings. The label is a short digest of its
+/// public key. Forget removes trust only. The list asks for confirmation first.
+private struct TrustedTargetRow: View {
+    var target: TrustedTarget
+    var onForget: () -> Void
+
+    var body: some View {
+        HStack(spacing: SourceMetrics.space8) {
+            Image(systemName: "checkmark.seal")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Text(target.label)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Forget", role: .destructive, action: onForget)
+                .buttonStyle(.borderless)
+                .accessibilityLabel(target.forgetAccessibilityLabel)
+                .accessibilityHint("Asks for confirmation.")
+        }
     }
 }
 

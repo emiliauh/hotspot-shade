@@ -27,8 +27,9 @@ function trayState(status, pair, unavailable, tunnelMode) {
   const demo = !!data && data.demo === true;
   const unknown = !!data && data.state === 'unknown';
   const direct = tunnelMode === 'direct';
+  const cleanupBlocked = !!data && data.cleanup_blocked === true;
   const blocked = unavailable === true || unknown || (!!data && !runningKnown) ||
-    (!!data && data.cleanup_blocked === true);
+    cleanupBlocked;
   let label = 'Starting';
   if (blocked) {
     /* A configured engine that cannot run has no status to report. "Starting"
@@ -48,8 +49,10 @@ function trayState(status, pair, unavailable, tunnelMode) {
     demo: demo,
     tooltip: 'HotspotShade. ' + label + '.',
     startEnabled: !blocked && !!data && (direct || paired) && !running && !!pairing && pairing.state !== 'connecting' && pairing.state !== 'confirm' && pairing.state !== 'starting',
-    stopEnabled: running && unavailable !== true,
-    stopIsAttempt: blocked && running && unavailable !== true
+    /* A pending cleanup mark is cleared only by a stop attempt, so the tray
+     * offers it even when the engine answers running false. */
+    stopEnabled: (running || cleanupBlocked) && unavailable !== true,
+    stopIsAttempt: blocked && (running || cleanupBlocked) && unavailable !== true
   };
 }
 

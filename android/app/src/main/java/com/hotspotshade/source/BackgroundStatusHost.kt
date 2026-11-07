@@ -95,9 +95,11 @@ internal class BackgroundStatusHost(
             if (running) return
             running = true
             generation += 1
+            // Register under the lock so a stop() or rollback that follows cannot
+            // run its remove before this add and leave a stale entry.
+            hosts.add(this)
             generation
         }
-        hosts.add(this)
         if (pollMillis <= 0L) {
             runTickSafely(started)
             return
@@ -122,16 +124,21 @@ internal class BackgroundStatusHost(
                 TimeUnit.MILLISECONDS,
             )
         } catch (_: Exception) {
-            synchronized(lock) {
+            val owned = synchronized(lock) {
                 if (generation == started) {
                     running = false
                     generation += 1
                     scheduler = null
+                    // Only the start that owns the registration removes it. A newer
+                    // start after a stop() has added the host again.
+                    hosts.remove(this)
+                    true
+                } else {
+                    false
                 }
             }
-            hosts.remove(this)
             executor?.shutdownNow()
-            closeListener()
+            if (owned) closeListener()
         }
     }
 
@@ -140,8 +147,8 @@ internal class BackgroundStatusHost(
      * idempotent and never starts a replacement listener.
      */
     fun stop() {
-        hosts.remove(this)
         val active = synchronized(lock) {
+            hosts.remove(this)
             running = false
             generation += 1
             scheduler?.shutdownNow()
@@ -179,6 +186,10 @@ internal class BackgroundStatusHost(
 
     private fun runTick(expected: Long) {
         if (!isCurrent(expected)) return
+        // Read the port-owner fence before the visibility read. A change after
+        // this point means the activity took the port after this tick decided
+        // it was free, so the tick must not publish a listener.
+        val fence = portOwnerFence.get()
         val visibleNow = try {
             visible()
         } catch (_: Exception) {
@@ -235,9 +246,16 @@ internal class BackgroundStatusHost(
         // The store load and the epoch must describe one token. A rotation or
         // reload that won the race would leave the loaded value stale.
         if (currentEpoch() != epoch) return
+        if (portOwnerFence.get() != fence) return
         val created = open(address, snapshot.port, token, snapshot.runId, epoch, expected) ?: return
         val keep = synchronized(lock) {
-            if (!running || generation != expected || listener != null) {
+            // The fence and the visibility read run under the host lock, like
+            // the generation check. releasePortNow() bumps the fence before it
+            // closes the listeners, so a tick that bound after that call sees a
+            // new fence here and closes its listener at once.
+            if (!running || generation != expected || listener != null ||
+                portOwnerFence.get() != fence || visibleOrUnknown()
+            ) {
                 false
             } else {
                 listener = created
@@ -249,6 +267,12 @@ internal class BackgroundStatusHost(
             }
         }
         if (!keep) closeQuietly(created)
+    }
+
+    private fun visibleOrUnknown(): Boolean = try {
+        visible()
+    } catch (_: Exception) {
+        true
     }
 
     private fun isCurrent(expected: Long): Boolean = synchronized(lock) {
@@ -407,15 +431,29 @@ internal class BackgroundStatusHost(
         // visible listener that loses that race shows a failed bind.
         @Volatile
         private var activityHoldsPort = false
+
+        // Bumped whenever the activity claims the port or the port is released.
+        // A tick that read "not visible" before a bump must not publish a
+        // listener afterward.
+        private val portOwnerFence = java.util.concurrent.atomic.AtomicLong()
         private val hosts = java.util.concurrent.CopyOnWriteArraySet<BackgroundStatusHost>()
 
         /** The activity is starting. Mark the port as its own. Does not block. */
         fun activityStarted() {
             activityHoldsPort = true
+            portOwnerFence.incrementAndGet()
         }
 
-        /** Close every live host listener now. The caller runs off the main thread. */
+        /** True while [host] is in the registry that [releasePortNow] walks. */
+        fun isRegistered(host: BackgroundStatusHost): Boolean = hosts.contains(host)
+
+        /**
+         * Close every live host listener now. The caller runs off the main thread.
+         * The fence bump comes first, so a tick that already read "not visible"
+         * cannot publish a listener after this call.
+         */
         fun releasePortNow() {
+            portOwnerFence.incrementAndGet()
             hosts.forEach { it.closeListener() }
         }
 

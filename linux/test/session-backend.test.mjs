@@ -202,9 +202,14 @@ test('an unconfirmed stop keeps the root engine as the status source and is neve
   await assert.rejects(backend.start({ mode: 'phone' }), (error) => error.code === 'engine_stop_incomplete');
   await assert.rejects(backend.beginPairing(), (error) => error.code === 'engine_stop_incomplete');
   await assert.rejects(backend.forget(), (error) => error.code === 'engine_stop_incomplete');
-  // A lost root engine keeps the cleanup message, not a plain engine error.
+  // A lost or stopping root engine cannot answer, but the mark stays: the
+  // status is the uncertain answer itself, so Try to turn off is still offered
+  // and the page never shows an engine loss for it.
   root.call = async () => { throw new BackendError('engine_stopped', 'The engine stopped.'); };
-  await assert.rejects(backend.status(), (error) => error.code === 'engine_stop_incomplete');
+  const lost = await backend.status();
+  assert.equal(lost.state, 'unknown');
+  assert.equal(lost.cleanup_blocked, true);
+  assert.equal(lost.error, CLEANUP_MESSAGE);
   // Quit reports the unconfirmed root stop, not the clean user engine stop.
   const quit = await backend.dispose();
   assert.equal(quit.reason, 'helper_exit_timeout');
@@ -366,4 +371,251 @@ test('a stop that settles the root session during a forget status read does not 
   await stopping;
   assert.ok(user.calls.indexOf('forget') !== -1);
   assert.equal(backend.session().elevated, false);
+});
+
+test('a confirmed root stop does not read the user engine, so a dead user engine is not a failed stop', async () => {
+  const user = fakeUser();
+  const root = fakeRoot();
+  const { backend } = session(user, [root]);
+  await backend.start({ mode: 'phone' });
+  user.call = async () => { throw new BackendError('engine_stopped', 'The engine stopped unexpectedly.'); };
+  const after = await backend.stop();
+  assert.deepEqual({ ...after }, { source: 'user', running: false, stopped: true });
+  assert.equal(backend.session().elevated, false);
+  /* The next poll reports the engine loss on its own. */
+  await assert.rejects(backend.status(), (error) => error.code === 'engine_stopped');
+});
+
+test('a late confirmation also returns the fixed answer when the user engine is gone', async () => {
+  const user = fakeUser();
+  const root = fakeRoot({ stopResult: { stopped: false, timedOut: true, failed: true, reason: 'helper_exit_timeout' } });
+  const { backend } = session(user, [root]);
+  await backend.start({ mode: 'direct' });
+  await assert.rejects(backend.stop());
+  root.setExit({ code: 0, signal: null });
+  user.call = async () => { throw new BackendError('engine_stopped', 'The engine stopped unexpectedly.'); };
+  const after = await backend.stop();
+  assert.equal(after.stopped, true);
+  assert.equal(backend.session().cleanupPending, false);
+});
+
+test('a status read clears a mark when the helper later exited 0 after a stop timeout', async () => {
+  const user = fakeUser();
+  const root = fakeRoot({ stopResult: { stopped: false, timedOut: true, failed: true, reason: 'helper_exit_timeout' } });
+  const { backend } = session(user, [root]);
+  await backend.start({ mode: 'direct' });
+  await assert.rejects(backend.stop());
+  const marked = await backend.status();
+  assert.equal(marked.cleanup_blocked, true);
+  assert.equal(backend.session().cleanupPending, true);
+  root.setExit({ code: 0, signal: null });
+  const status = await backend.status();
+  assert.equal(status.source, 'user', 'the status read evaluated the helper exit with no stop request');
+  assert.notEqual(status.cleanup_blocked, true);
+  assert.equal(backend.session().cleanupPending, false);
+  assert.equal(backend.session().elevated, false);
+});
+
+test('a status read clears a mark when pkexec was refused during the prompt (exit 126, no engine)', async () => {
+  const user = fakeUser();
+  const root = fakeRoot({ stopResult: { stopped: false, timedOut: false, failed: true, reason: 'authorization_unconfirmed' } });
+  root.engineSeen = false;
+  root.outputSettled = true;
+  const { backend } = session(user, [root]);
+  await backend.start({ mode: 'direct' });
+  await assert.rejects(backend.stop());
+  root.setExit({ code: 126, signal: null });
+  assert.equal((await backend.status()).source, 'user');
+  assert.equal(backend.session().cleanupPending, false);
+});
+
+test('a status read leaves the mark for a non-zero helper exit and while a stop attempt is running', async () => {
+  const user = fakeUser();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const root = fakeRoot({ stopResult: { stopped: false, timedOut: true, failed: true, reason: 'helper_exit_timeout' } });
+  const { backend } = session(user, [root]);
+  await backend.start({ mode: 'direct' });
+  await assert.rejects(backend.stop());
+  root.setExit({ code: 5, signal: null });
+  assert.equal((await backend.status()).cleanup_blocked, true);
+  root.setExit({ code: 0, signal: null });
+  /* A retry that is still running decides for itself; the poll never waits for it. */
+  root.retryStop = async () => { await gate; return { stopped: false, timedOut: true, failed: true, reason: 'helper_exit_timeout' }; };
+  root.setExit(null);
+  const retrying = backend.stop();
+  await new Promise((resolve) => setImmediate(resolve));
+  root.setExit({ code: 0, signal: null });
+  const during = await backend.status();
+  assert.equal(during.cleanup_blocked, true, 'the status read did not clear an attempt in flight');
+  release();
+  await assert.rejects(retrying, (error) => error.code === 'engine_stop_incomplete');
+  assert.equal((await backend.status()).source, 'user', 'the next read sees the exit and clears the mark');
+});
+
+test('a later Turn off re-attempts an unconfirmed stop instead of replaying the cached result', async () => {
+  const user = fakeUser();
+  const root = fakeRoot({ stopResult: { stopped: false, timedOut: true, failed: true, reason: 'helper_exit_timeout' } });
+  let retries = 0;
+  root.retryStop = async () => {
+    retries += 1;
+    return retries === 1
+      ? { stopped: false, timedOut: true, failed: true, reason: 'helper_exit_timeout' }
+      : { stopped: true, timedOut: false };
+  };
+  const { backend } = session(user, [root]);
+  await backend.start({ mode: 'direct' });
+  await assert.rejects(backend.stop(), (error) => error.code === 'engine_stop_incomplete');
+  assert.equal(retries, 0, 'the first attempt uses the normal stop');
+  await assert.rejects(backend.stop(), (error) => error.code === 'engine_stop_incomplete');
+  assert.equal(retries, 1);
+  const after = await backend.stop();
+  assert.equal(after.stopped, true);
+  assert.equal(retries, 2);
+  assert.equal(backend.session().cleanupPending, false);
+  assert.equal(backend.session().elevated, false);
+});
+
+test('a stop that is still in flight is shared, not retried', async () => {
+  const user = fakeUser();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const root = fakeRoot();
+  root.stop = async () => { await gate; return { stopped: true, timedOut: false }; };
+  const { backend } = session(user, [root]);
+  await backend.start({ mode: 'direct' });
+  const first = backend.stop();
+  const second = backend.stop();
+  assert.equal(first, second);
+  release();
+  await first;
+});
+
+test('a status read that began before Turn on never publishes the user engine answer once the root is live', async () => {
+  const user = fakeUser();
+  const root = fakeRoot();
+  let answers = 0;
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  user.call = async function (operation) {
+    user.calls.push(operation);
+    if (operation === 'status') {
+      answers += 1;
+      if (answers === 1) {
+        await firstGate;
+        return { source: 'user', running: false, paired: true, state: 'idle' };
+      }
+      return { source: 'user', running: false, paired: true, state: 'idle' };
+    }
+    if (operation === 'pairState') return { source: 'user', state: 'paired' };
+    if (operation === 'handoff') return { ok: true };
+    return { source: 'user', operation };
+  };
+  const { backend } = session(user, [root]);
+  const stale = backend.status();
+  await new Promise((resolve) => setImmediate(resolve));
+  await backend.start({ mode: 'phone' });
+  assert.equal(backend.session().ready, true);
+  releaseFirst();
+  const value = await stale;
+  assert.equal(value.source, 'root', 'the stale user answer was dropped and the root read replaced it');
+  assert.equal(value.running, true);
+});
+
+test('a status read that began on the root engine is dropped when a stop returns the app to the user engine', async () => {
+  const user = fakeUser();
+  const root = fakeRoot();
+  let releaseRead;
+  const readGate = new Promise((resolve) => { releaseRead = resolve; });
+  const { backend } = session(user, [root]);
+  await backend.start({ mode: 'phone' });
+  const originalCall = root.call;
+  let held = false;
+  root.call = async function (operation) {
+    if (operation === 'status' && !held) {
+      held = true;
+      await readGate;
+      return { source: 'root', running: true, paired: true, state: 'running' };
+    }
+    return originalCall.call(root, operation);
+  };
+  const stale = backend.status();
+  await new Promise((resolve) => setImmediate(resolve));
+  await backend.stop();
+  releaseRead();
+  const value = await stale;
+  assert.equal(value.source, 'user', 'a running true answer from the closed root engine is not published');
+  assert.equal(value.running, false);
+});
+
+test('an unconfirmed stop of a ready root answers a status read even when the real client throws while stopping', async () => {
+  const user = fakeUser();
+  const root = fakeRoot({ stopResult: { stopped: false, timedOut: true, failed: true, reason: 'helper_exit_timeout' } });
+  const { backend } = session(user, [root]);
+  await backend.start({ mode: 'direct' });
+  const originalStop = root.stop;
+  root.stop = async function () {
+    const result = await originalStop.call(root);
+    /* Like the real client: once stopping, every call is refused. */
+    root.call = async () => { throw new BackendError('engine_stopped', 'The engine is stopping.'); };
+    return result;
+  };
+  await assert.rejects(backend.stop(), (error) => error.code === 'engine_stop_incomplete');
+  const status = await backend.status();
+  assert.equal(status.cleanup_blocked, true);
+  assert.equal(status.state, 'unknown');
+  assert.equal(status.error, CLEANUP_MESSAGE);
+});
+
+test('a failed status read of a live root never stops it for pairing, forget, or a start', async () => {
+  for (const code of ['engine_timeout', 'engine_unavailable']) {
+    const user = fakeUser();
+    const root = fakeRoot();
+    const { backend } = session(user, [root]);
+    await backend.start({ mode: 'phone' });
+    const originalCall = root.call;
+    root.call = async function (operation) {
+      if (operation === 'status') throw new BackendError(code, 'The engine did not answer.');
+      return originalCall.call(root, operation);
+    };
+    await assert.rejects(backend.beginPairing(), (error) => error.code === 'tunnel_running');
+    await assert.rejects(backend.forget(), (error) => error.code === 'forget_blocked');
+    await assert.rejects(backend.start({ mode: 'phone' }), (error) => error.code === 'status_unavailable');
+    assert.equal(root.stopped, false, 'the live tunnel was not stopped');
+    assert.equal(backend.session().elevated, true);
+    root.call = originalCall;
+    await backend.stop();
+  }
+});
+
+test('a root engine that reports it stopped is stopped through the helper for pairing and a new start', async () => {
+  const user = fakeUser();
+  const first = fakeRoot();
+  const second = fakeRoot();
+  const { backend } = session(user, [first, second]);
+  await backend.start({ mode: 'phone' });
+  first.call = async () => { throw new BackendError('engine_stopped', 'The engine stopped unexpectedly.'); };
+  await backend.beginPairing();
+  assert.equal(first.stopped, true);
+  assert.equal(backend.session().elevated, false);
+});
+
+test('a status read that keeps changing hands is not published as a stale answer', async () => {
+  const user = fakeUser();
+  const gates = [];
+  user.call = async function (operation) {
+    if (operation !== 'status') return { source: 'user', operation };
+    await new Promise((resolve) => gates.push(resolve));
+    return { source: 'user', running: false, paired: true, state: 'idle' };
+  };
+  const { backend } = session(user, [fakeRoot(), fakeRoot(), fakeRoot(), fakeRoot()]);
+  const pending = backend.status();
+  for (let round = 0; round < 3; round += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+    /* A stop begins and bumps the generation while the read is in flight. */
+    const stopping = backend.stop().catch(() => {});
+    gates.splice(0).forEach((open) => open());
+    await stopping;
+  }
+  await assert.rejects(pending, (error) => error.code === 'status_changed');
 });

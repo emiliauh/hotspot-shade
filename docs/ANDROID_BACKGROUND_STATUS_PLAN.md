@@ -1,10 +1,13 @@
 # Android background status availability
 
-Status: implementation and tests under review. The responder has a status-only
-policy and the host fences one run and one token epoch. Service lifecycle hooks
-exist, but `BACKGROUND_STATUS_ENABLED` is false. The background listener is
-not active in this build. The ownership and handoff sections below describe the
-intended behavior if the gate is enabled after review and device testing.
+Status: enabled on 2026-11-06. `SourceProxyServiceLifecycle.BACKGROUND_STATUS_ENABLED`
+is `true`. The service creates the host in `onCreate`, starts it for a proxy
+run, and stops it on every terminal report and in `onDestroy`. The responder has
+a status-only policy, and the host fences one run and one token epoch. JVM and
+loopback tests cover the status-only policy, the run and token fences, the port
+handoff, and the service wiring. A real phone test is still open: screen lock,
+OEM background limits, and a real hotspot are not tested. Do not describe the
+host as proven on a phone.
 
 ## Problem
 
@@ -12,14 +15,15 @@ The target device probes TCP port 18090 on the source device gateway. Protocol
 v1 has one port for pairing, status, and presence. It has no separate health
 message.
 
-The Android activity currently stops the pairing listener in `onStop`. While
-the source proxy foreground service keeps running, the target device then gets
-a refused connection on port 18090. The target maps a refusal to `not_running`.
-After 90 seconds of continuous source device silence it stops the tunnel with
-`source_device_gone`.
+Before this change, the Android activity stopped the pairing listener in
+`onStop`. While the source proxy foreground service kept running, the target
+device then got a refused connection on port 18090. The target maps a refusal to
+`not_running`. After 90 seconds of continuous source device silence it stops the
+tunnel with `source_device_gone`.
 
-That result is wrong. The source proxy is still serving traffic. The target
-needs an authenticated status answer while the source app is in the background.
+That result is wrong for a running proxy. The source proxy is still serving
+traffic. The target needs an authenticated status answer while the source app is
+in the background.
 
 ## Goal and non-goals
 
@@ -52,7 +56,7 @@ binds only the controller's live hotspot address.
 | Condition | Port 18090 owner |
 |---|---|
 | Activity visible | Existing `PairingCoordinator` and `PairingServer` |
-| Activity not visible and a proxy run is live | New `BackgroundStatusHost` |
+| Activity not visible and a proxy run is live | `BackgroundStatusHost` |
 | Activity not visible and no proxy run is live | Nobody |
 
 The new host is
@@ -60,7 +64,8 @@ The new host is
 
 It polls every 500 ms. Each tick:
 
-1. Read the process visibility. A foreground activity means the host closes
+1. Read the port-owner flag and the process visibility. An activity that
+   started (`activityStarted`) or a foreground process means the host closes
    its listener and leaves the port to the activity.
 2. Read `SourceProxyRuntime.binding()` and the token epoch.
 3. Require a live run (`RUNNING` or `WAITING_FOR_NETWORK`), a bound IPv4
@@ -104,7 +109,9 @@ guard for this fence to hold.
 
 ### Activity visible to background
 
-`MainActivity.onStop` still stops `PairingViewModel` and its listener. Within
+`MainActivity.onStop` calls `PairingViewModel.setVisible(false)`. That stops
+the view model, stops its listener, and calls
+`BackgroundStatusHost.activityStopped()`, so the host may take the port. Within
 one 500 ms tick the host sees that the process is no longer foreground and the
 controller binding is still live. It binds port 18090. If the old listener is
 still closing, the bind fails and the next tick retries.
@@ -114,10 +121,18 @@ short handoff fits well inside the 90 second stop limit.
 
 ### Background to activity visible
 
-The host sees the foreground activity within one 500 ms tick and closes its
-listener. `PairingViewModel.start()` starts the normal listener again. The
-pairing coordinator already retries a failed bind every 3 seconds. A bind that
-loses this short race is retried with no change to its logic.
+`MainActivity.onStart` calls `PairingViewModel.setVisible(true)`. That marks the
+activity as the port owner with `BackgroundStatusHost.activityStarted()` before
+the visible listener starts, then runs `BackgroundStatusHost.releasePortNow()`
+and `coordinator.activate()` on the same worker. `releasePortNow` closes the
+background listener at once, so the visible listener can bind without waiting
+for an importance check to catch up. `PairingViewModel.start()` still starts the
+normal listener, and the pairing coordinator still retries a failed bind every 3
+seconds. A bind that loses the race is retried with no change to its logic.
+
+The poll-based visibility check remains as a second layer. If the activity
+callback is missing or late, the host closes its listener within one tick and
+leaves the port to the visible listener.
 
 ### Proxy stop or hotspot loss
 
@@ -190,34 +205,40 @@ These are not optional details. They decide whether the fix is safe.
   worsen that existing limit and must not claim to fix it.
 - A stored target key is pending confirmation after a process restart. The
   trust store does not report it as active until the person confirms it in the
-  current process. Do not bypass this to make background status work.
+  current process. This is a fail-closed design choice recorded in
+  `PairingStores.kt` (`FilePairingTrustStore`). Do not bypass it to make
+  background status work. A target saved before a restart therefore gets no
+  background status until it pairs again in the new process.
 - If the host cannot bind, cannot load the token, or has no active trust, the
   target eventually stops. That is the correct fail-closed result. There is no
   unsafe fallback.
 
 ## Integration
 
-The service integration already exists behind
-`SourceProxyServiceLifecycle.BACKGROUND_STATUS_ENABLED`. The service creates the
-host in `onCreate`, starts it for a run request, stops it on every terminal
-report and in `onDestroy`, and restarts it for a new run. Keep that gate closed
-until the service owner reviews the status-only responder policy, the run
-identity fence, and the token epoch fence. The host has no separate service
-setting to enable.
+The service integration is active. `SourceProxyServiceLifecycle.BACKGROUND_STATUS_ENABLED`
+is `true` as of 2026-11-06. The service creates the host in `onCreate`, starts it
+for a run request, stops it on every terminal report and in `onDestroy`, and
+restarts it for a new run. The host has no separate service setting to enable.
+The constant stays explicit so one value can turn the host off.
+
+The gate is enabled because the status-only responder policy, the run identity
+fence, and the token epoch fence are in place and tested. The tests are JVM and
+loopback only. A real device background test is still open, so the feature is
+enabled with that limit recorded, not as device-proven.
 
 The host is safe to start before the controller has bound. It opens nothing
 until the binding is live. `SourceProxyService.onDestroy` is the required stop
 point because it runs on normal stop, automatic stop, and service destruction.
 A skipped `onDestroy` (process kill) closes the sockets with the process.
 
-The activity keeps its current `onStart` and `onStop` calls. `MainActivity` is
-not the owner of the background listener.
+The activity signals the handoff from its existing `onStart` and `onStop` calls
+through `PairingViewModel.setVisible`. `MainActivity` does not own the
+background listener. The service does.
 
-If the service owner prefers an explicit activity callback instead of the
-process-importance check, pass a different `visible` lambda to
-`BackgroundStatusHost`. The port handoff and security rules are the same. The
-process-importance check is used here so the service can integrate without an
-edit to the UI lifecycle.
+The `visible` lambda combines the activity callback flag
+(`activityHoldsPort`) with the process-importance fallback. A different
+visibility source would change only that lambda, not the status-only policy, the
+port rules, or the run and token fences.
 
 ## Tests
 
@@ -226,10 +247,13 @@ holds these deterministic host tests with a fake listener:
 
 - a visible process does not bind;
 - the listener closes when the activity returns;
+- the activity releases the port at once without waiting for a tick;
+- a stopped host is not released again by the activity;
 - an idle or stopped run opens nothing;
 - a waiting run keeps the listener;
 - a stopped run closes the listener;
 - a changed hotspot address rebinds;
+- a changed proxy port rebinds;
 - a changed run identity rebinds at the same address and port;
 - a changed token epoch rebinds and reloads the token;
 - a live listener does not reload the token every tick;
@@ -258,6 +282,16 @@ gets a nonzero identity, a new live run gets a different value at the same
 address and port, repeated reports keep one value, and a stopped report has no
 identity.
 
+`SourceProxyServiceBackgroundStatusTest` covers the service wiring with a fake
+host: a new run starts a fresh host and token load, a stopped host stays closed,
+and a stop during the token load opens nothing. `SourceProxyServiceLifecycleTest`
+asserts that `BACKGROUND_STATUS_ENABLED` is `true` and keeps the reason next to
+the test.
+
+All of these tests are JVM tests or loopback tests. The 2026-11-06 host run
+recorded in `docs/COMPLETION_TASKS.md` passed 929 JVM tests. That run opened no
+screen, created no route, and used no device.
+
 `PairingResponderTest` also covers the status-only HELLO gate directly: known
 re-pair, known Forget, unknown pairing, unknown status, and the unchanged full
 mode behavior. The existing `PairingServerTest` and pairing parity tests
@@ -277,8 +311,14 @@ Follow-up tests that are still needed:
 - emulator test: background the app, attempt a known re-pair and Forget, and
   confirm both are rejected with no trust change;
 - emulator test: stop the proxy and confirm the status listener is gone;
-- real phone test: foreground service through screen lock and a real hotspot
-  loss, including OEM background limits.
+- emulator test: return to the foreground and confirm the visible listener
+  binds port 18090 with no failed bind;
+- real phone test: screen lock while the proxy runs, and confirm the target
+  still gets authenticated status answers;
+- real phone test: OEM background limits, including a vendor ROM that stops or
+  freezes the foreground service;
+- real phone test: a real hotspot, including hotspot loss and return, with the
+  app in the background.
 
 The emulator and JVM tests do not prove carrier, hotspot, or real OEM behavior.
 
@@ -293,7 +333,8 @@ the visible listener.
   that.
 - The trust store still requires in-process confirmation after a process
   restart. A stored key is not active until the person confirms it in the
-  current process. The background listener does not bypass that rule.
+  current process. The background listener does not bypass that rule, so a
+  target saved before a restart gets no background status until it pairs again.
 - The token epoch is process-local and only moves when the code uses
   `SourceTokenGuard`. A write that bypasses the guard is not fenced.
 - The run identity is process-local. It is not a device attestation and it does
@@ -304,19 +345,23 @@ the visible listener.
 - Android may stop the foreground service under memory pressure or OEM policy.
   The target then stops after its normal silence limit. Do not add an
   auto-restart or a keep-alive workaround in this change.
-- The process-importance check is a heuristic. An explicit lifecycle callback
-  is clearer if a service or UI owner can provide one.
+- The process-importance check is a heuristic and stays as a fallback. The
+  activity callbacks now drive the handoff: `activityStarted` and
+  `releasePortNow` on return, `activityStopped` on leave. A missed callback
+  still costs at most one 500 ms tick.
 - A JVM loopback pass does not prove the phone network stack, a real hotspot,
   carrier behavior, or OEM background limits.
 
 ## Rollout and open decisions
 
-- The service integration stays behind
-  `SourceProxyServiceLifecycle.BACKGROUND_STATUS_ENABLED`. The service owner
-  gates it after review. Until then the target still sees the old behavior
-  after `onStop`.
+- The service integration is enabled:
+  `SourceProxyServiceLifecycle.BACKGROUND_STATUS_ENABLED` is `true` since
+  2026-11-06. The host answers authenticated status after `onStop`. Keep the
+  constant as the one switch so a later problem can turn the host off.
+- Real phone evidence is open: screen lock, OEM background limits, and a real
+  hotspot. JVM and loopback tests are the only evidence so far.
 - `PairingServer.kt` and `PairingCoordinator.kt` are owned by another active
   change. The background host consumes their interfaces and does not edit them.
-- The service owner may pass an explicit lifecycle callback instead of the
-  process-importance check. That changes the visibility source only, not the
+- The activity callbacks are the primary visibility signal. A different signal
+  would change only how the host learns that the activity is visible, not the
   status-only policy or the run and token fences.

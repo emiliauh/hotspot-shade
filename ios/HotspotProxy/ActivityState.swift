@@ -39,6 +39,11 @@ enum PlainMessage {
     /// The interface table or the hotspot address could not be read. This is
     /// not the same as a missing hotspot, so Start must not claim one.
     static let hotspotUnreadable = "The app cannot read the network interfaces. Check Personal Hotspot, then tap Start."
+    /// More than one link could be the hotspot. The app will not guess.
+    static let hotspotAmbiguous = "The app found two possible hotspot links and cannot tell which one is the hotspot. Check Personal Hotspot, then tap Start."
+    /// A refused Start on an unsupported link. Nothing was running, so this
+    /// must not say that the proxy stopped.
+    static let hotspotUnsupportedStart = "The hotspot address is on an unsupported link. Check Personal Hotspot, then tap Start."
     static let portInUse = "Something else on this source device uses the proxy port. Change it in Settings, Advanced."
     static let startFailed = "The proxy could not start. Try again."
     static let tokenUnavailable = "The proxy token is not available. Unlock the device and try again."
@@ -64,6 +69,10 @@ enum PlainMessage {
 /// The confirmation and note texts for the Settings actions that change trust
 /// or credentials. Each text says what stays on the other side.
 enum ConfirmationText {
+    static let forgetTargetTitle = "Forget this target device?"
+    static func forgetTargetMessage(label: String) -> String {
+        "\(label) must be approved to pair again. If it has the saved token, it can still connect with it. Forgetting it does not revoke that token."
+    }
     static let forgetAllTitle = "Forget all target devices?"
     static let forgetAllMessage = "Target devices can still connect with their saved token. Forgetting them does not revoke that token. A forgotten target device must be approved to pair again."
     static let rotateTokenTitle = "Rotate the source token?"
@@ -94,13 +103,17 @@ enum DisplayState {
 /// The messages hold no address and no port.
 enum HotspotStartMessage {
     enum Observation: Equatable {
-        case present, unsupported, absent, unreadable
+        case present, unsupported, absent, ambiguous, unreadable
     }
 
     static func message(for observation: Observation) -> String {
         switch observation {
-        case .present, .absent: return PlainMessage.noHotspot
-        case .unsupported: return StopReason.hotspotUnsupported.message
+        case .absent: return PlainMessage.noHotspot
+        // A present hotspot never refuses Start for this reason. If a caller
+        // asks anyway, do not tell the person to turn on a hotspot that is on.
+        case .present: return PlainMessage.startFailed
+        case .unsupported: return PlainMessage.hotspotUnsupportedStart
+        case .ambiguous: return PlainMessage.hotspotAmbiguous
         case .unreadable: return PlainMessage.hotspotUnreadable
         }
     }

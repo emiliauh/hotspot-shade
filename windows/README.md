@@ -284,7 +284,10 @@ The UWP project packages `windows/out/payload` (`Broker\`, `Elevate\`,
 `Engine\hotspotshade.exe`, `Engine\wintun.dll`) and fails the build with a
 clear error when the broker, the starter, or the engine is missing. The
 repository does not bundle `wintun.dll`; `stage_payload.ps1 -Wintun PATH`
-checks its WireGuard signature and x64 machine type before it copies it.
+checks its WireGuard signature and x64 machine type before it copies it. CI
+compiles the app with `HotspotShadeSkipPayloadCheck=true` because it does not
+stage the payload; the PC build stages and checks the payload. The check stays
+on by default.
 
 The older `Engine/EngineBrokerService.cs`, `EngineBoundary`, `EngineSession`,
 and `Engine/Service/` code is the earlier version 1 broker contract and the
@@ -380,7 +383,8 @@ no adapter or route, and uses no credential.
 
 The shared parser, policy, and report writer are in
 `src/HotspotShade.WinUI2.Core/Engine/Release/`. The core test runner covers them.
-The console tool is not in the solution, the app package, or CI.
+The console tool is not in the solution or the app package. CI compiles it in
+Release, but publishes no Windows binary.
 
 Run it from the repository root on the Windows test PC:
 

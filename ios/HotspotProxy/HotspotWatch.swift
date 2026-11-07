@@ -256,6 +256,10 @@ enum HotspotInterface {
         case unsupported(Identity)
         /// The interface list was read, and the hotspot address is not in it.
         case absent
+        /// More than one complete up link could be the hotspot, so the pass
+        /// cannot tell which one it is. A caller treats it like an unreadable
+        /// list for decisions, and uses its own words for the person.
+        case ambiguous
         /// The interface list or a hotspot address could not be read.
         case unreadable
     }
@@ -347,7 +351,8 @@ enum HotspotInterface {
         case .found(let identity): return .present(identity)
         case .unsupported(let identity): return .unsupported(identity)
         case .absent: return .absent
-        case .ambiguous, .unreadable: return .unreadable
+        case .ambiguous: return .ambiguous
+        case .unreadable: return .unreadable
         }
     }
 
@@ -399,7 +404,7 @@ enum HotspotInterface {
         switch observeLink() {
         case .present(let identity): return .present(identity.address)
         case .unsupported, .absent: return .absent
-        case .unreadable: return .unreadable
+        case .ambiguous, .unreadable: return .unreadable
         }
     }
 
@@ -519,7 +524,7 @@ struct HotspotLossDetector {
             return .keepRunning
         }
         switch observation {
-        case .unreadable:
+        case .unreadable, .ambiguous:
             reset()
             return .keepRunning
         case .present(let identity) where identity == boundIdentity:

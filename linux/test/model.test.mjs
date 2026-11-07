@@ -106,7 +106,14 @@ test('recovery offers a stop attempt only with a fresh running indication', () =
     assert.equal(fresh.secondary.label, 'Try to turn off');
     for (const running of [false, undefined]) {
       const view = derive({ status: status({ ...recovery, running }) });
-      assert.equal(view.secondary, null);
+      /* Only a pending cleanup mark is cleared by a stop attempt, so only it
+       * offers one without a running indication. */
+      if (recovery.cleanup_blocked === true) {
+        assert.equal(view.secondary.id, 'turnOff');
+        assert.equal(view.secondary.label, 'Try to turn off');
+      } else {
+        assert.equal(view.secondary, null);
+      }
     }
     const stale = derive({ status: status({ ...recovery, running: true }), freshness: 'stale' });
     assert.equal(stale.secondary, null);
@@ -322,7 +329,8 @@ test('a cleanup-blocked stopped status does not offer restart or Forget', () => 
   assert.equal(view.unavailable, true);
   assert.match(view.subtitle, /cleanup did not finish/i);
   assert.equal(view.primary.id, 'checkNow');
-  assert.equal(view.secondary, null);
+  /* No restart or Forget, but the stop attempt that clears the mark stays. */
+  assert.equal(view.secondary.id, 'turnOff');
   assert.equal(view.modeLocked, true);
 });
 

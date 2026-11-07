@@ -34,14 +34,21 @@ class MainActivity : ComponentActivity() {
         pairingViewModel.start()
         proxyViewModel.setVisible(true)
         manualConnectionViewModel.refresh()
+        // The token was hidden in onStop. End the hold and clear FLAG_SECURE now
+        // that the visible state shows no token.
+        secureWindow.onForeground(manualConnectionViewModel.state.tokenVisible)
     }
 
     override fun onStop() {
+        // Hold FLAG_SECURE first. The system takes the recents snapshot after
+        // onStop returns, and the last drawn frame can still show the token.
+        // The flag stays set until onStart, so no recomposition after this
+        // point can clear it early.
+        secureWindow.onBackground()
         manualConnectionViewModel.onBackground()
         pairingViewModel.setVisible(false)
         pairingViewModel.stop()
         proxyViewModel.setVisible(false)
-        secureWindow.onBackground()
         super.onStop()
     }
 

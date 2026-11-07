@@ -414,11 +414,11 @@ level 3  runs after its needs
 | `lint` | Lint | macOS | policy | - | - | clippy with `-D warnings` and `cargo fmt --check`. |
 | `release-audit` | Release audit and CI graph check | Ubuntu | policy | - | - | Scripts parse, release metadata and workflow policy pass, the graph is valid, and the audit and portable reader fixture tests pass. The readers are not integrated into the release gate. |
 | `rust-macos` | Rust (macOS) type check, test, build | macOS | build | - | `hotspotshade-macos-arm64` | Engine and relay tests, the source snapshot fixture suite on macOS, release build, GUI smoke test. |
-| `rust-windows` | Rust (Windows) type check and test | Windows | test | - | - | Windows code compiles and its hermetic tests pass. It does not prove a live Windows tunnel. |
+| `rust-windows` | Rust (Windows) type check and test | Windows | test | - | - | Windows code compiles for x86_64 and i686, and its hermetic tests pass. It does not prove a live Windows tunnel. |
 | `rust-linux` | Rust (Linux) foundation checks | Ubuntu | test | - | - | Linux engine and privileged helper tests and Clippy, the source snapshot fixture suite on GNU Linux, VM cleanup test, real demo engine contract through the Linux Electron Node tests, sandboxed webview smoke test. It does not create a TUN device. |
 | `desktop-demo` | Shared desktop demo checks | macOS | test | - | - | Demo bridge, page model, browser failure report, webview smoke test, lint, format. |
 | `desktop-windows` | Shared desktop demo checks (Windows) | Windows | test | - | - | The shared demo builds and tests on Windows. |
-| `winui-demo` | WinUI demo model and build checks | Windows | test | - | - | WinUI state model, hermetic service foundation checks, and unsigned UWP build. No deployment or live tunnel. |
+| `winui-demo` | WinUI demo model and build checks | Windows | test | - | - | WinUI state model, hermetic service foundation checks, Release builds of the console test launcher and release probe, and an unsigned UWP compile check. It stages no payload and does not deploy or run the app or service. No live tunnel. |
 | `android-demo` | Android demo tests and build | Ubuntu | test | - | - | Android JVM tests, lint, debug app and instrumented-test APK builds. No emulator, no networking. |
 | `ios` | iOS tests, simulator build, unsigned IPA | macOS | build | - | `HotspotShade-iOS-unsigned-ipa` | Swift logic tests, simulator build, unsigned IPA. |
 | `macos-app` | macOS app tests and unsigned app | macOS | build | - | `HotspotShade-macos-unsigned` | App and installer Swift tests, preview preparation fixtures, and the unsigned app bundle. The signed preview and live installation are not tested in CI. |
@@ -431,6 +431,26 @@ level 3  runs after its needs
 The `release` job runs only for a `v*` tag. On a branch or pull request it is
 skipped, so the artifact and integrity jobs still produce evidence without a
 publish step.
+
+The `rust-windows` job also installs the `i686-pc-windows-msvc` target and runs
+the type check and Clippy against it, so the 32-bit Windows FFI layout
+assertions are compiled in CI. The job still runs no 32-bit binary.
+
+## WinUI compile check and the payload
+
+CI compiles the app; the PC build stages and checks the payload. The UWP
+project fails its build unless `windows/out/payload` holds the broker, the
+elevated starter, and the engine, and `windows/tools/stage_payload.ps1` builds
+that folder with cargo, `dotnet publish`, and NativeAOT. The `winui-demo` job
+does not need those artifacts to prove that the app compiles, so its msbuild
+step passes `/p:HotspotShadeSkipPayloadCheck=true`. The property defaults to
+false in `HotspotShade.WinUI2.csproj`, so the PC build keeps the check. Do not
+pass the property for a package that you install.
+
+The console test launcher and the release probe are not in the solution. The
+job builds both explicitly in Release with `-warnaserror` so a change in either
+project cannot break the Windows build unnoticed. Neither build publishes an
+artifact or runs on Windows hardware.
 
 ## Deliberate non-edges
 

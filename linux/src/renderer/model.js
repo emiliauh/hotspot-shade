@@ -615,7 +615,9 @@
     }
 
     if (recoveryBlocked) {
-      secondary = running && freshness === 'fresh'
+      /* A pending cleanup mark is cleared only by a stop attempt, so the
+       * attempt is offered even when the engine answers running false. */
+      secondary = (cleanupBlocked || running) && freshness === 'fresh'
         ? { id: 'turnOff', label: 'Try to turn off' }
         : null;
     } else if (forgetBlocked) {

@@ -48,6 +48,7 @@ run DiagnosticsReportTests "$SRC/DiagnosticsReport.swift" "$SRC/ConnectWatch.swi
 # The source capability model and the diagnostics lines that report it.
 run SourceDeviceCapabilityTests "$SRC/SourceDeviceCapabilities.swift" "$SRC/DiagnosticsReport.swift" "$SRC/ConnectWatch.swift" "$SRC/ConnectSummary.swift" "$SRC/ConnectRetryPolicy.swift" "$SRC/SessionCapacity.swift" "$SRC/ActivityState.swift"
 run TrustActivityTests "$SRC/ActivityState.swift" "$SRC/TrustActivity.swift" "$SRC/Pairing.swift"
+run TrustedTargetListTests "$SRC/ActivityState.swift" "$SRC/TrustActivity.swift" "$SRC/Pairing.swift"
 run TokenStorageSafetyTests "$SRC/TokenLifecycle.swift" "$SRC/SecureTokenStore.swift" "$SRC/ActivityState.swift" "$TESTS/TokenStoreFakes.swift"
 echo "== TokenStorageSafetyTests (dormant failure paths)"
 xcrun swiftc -DTOKEN_LIFECYCLE_TESTING -parse-as-library -o "$OUT/TokenStorageSafetyFailureTests" \

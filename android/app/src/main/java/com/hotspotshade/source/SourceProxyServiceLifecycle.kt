@@ -509,7 +509,11 @@ internal object SourceProxyServiceLifecycle {
      * prompt, or trust mutation, binds only the controller's live hotspot
      * address, and fences one run and one token epoch. It answers only a
      * target key that was confirmed in this process, so it never weakens the
-     * in-process trust rule. Those rules have JVM and loopback tests only. A
+     * in-process trust rule. The host and the visible pairing listener share
+     * port 18090: the activity claims it through a port-owner fence that the
+     * host re-checks under its lock before it publishes a listener, so a tick
+     * that decided the port was free cannot bind it after the activity took it.
+     * Those rules have JVM and loopback tests only. A
      * real-device background test (screen lock, OEM background limits, a real
      * hotspot) is still open. Do not describe this as proven on a phone.
      */

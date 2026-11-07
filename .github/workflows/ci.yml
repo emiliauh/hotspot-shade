@@ -126,6 +126,17 @@ jobs:
         shell: bash
         working-directory: rust
         run: cargo test --locked
+      - name: Add the 32-bit Windows target
+        shell: bash
+        run: rustup target add i686-pc-windows-msvc
+      - name: Type check (32-bit Windows target)
+        shell: bash
+        working-directory: rust
+        run: cargo check --target i686-pc-windows-msvc --all-targets --locked
+      - name: Clippy (32-bit Windows code)
+        shell: bash
+        working-directory: rust
+        run: cargo clippy --target i686-pc-windows-msvc --all-targets --locked -- -D warnings
       - name: Clippy (Windows code)
         shell: bash
         working-directory: rust
@@ -233,14 +244,19 @@ jobs:
         run: dotnet run --project windows/tests/HotspotShade.WinUI2.Core.Tests/HotspotShade.WinUI2.Core.Tests.csproj --configuration Release
       - name: Test Windows service foundations (hermetic)
         run: dotnet run --project windows/tests/HotspotShade.WinUI2.ServiceHost.Tests/HotspotShade.WinUI2.ServiceHost.Tests.csproj --configuration Release
+      - name: Build console test launcher (Release)
+        run: dotnet build windows/src/HotspotShade.WinUI2.TestLauncher/HotspotShade.WinUI2.TestLauncher.csproj --configuration Release -warnaserror
+      - name: Build release probe (Release)
+        run: dotnet build windows/src/HotspotShade.WinUI2.ReleaseProbe/HotspotShade.WinUI2.ReleaseProbe.csproj --configuration Release -warnaserror
       - uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
-      - name: Build WinUI demo (unsigned, no deployment)
+      - name: Compile WinUI app (unsigned, no deployment; payload check skipped)
         run: >-
           msbuild windows/HotspotShade.WinUI2.sln /restore
           /p:Configuration=Debug /p:Platform=x64
           /p:HotspotShadeSdkVersion=10.0.26100.0
           /p:GenerateAppxPackageOnBuild=false /p:AppxBundle=Never
-          /p:AppxPackageSigningEnabled=false /m
+          /p:AppxPackageSigningEnabled=false
+          /p:HotspotShadeSkipPayloadCheck=true /m
 
   # ci-stage: test
   android-demo:

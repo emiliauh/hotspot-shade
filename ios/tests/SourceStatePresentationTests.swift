@@ -27,8 +27,23 @@ struct SourceStatePresentationTests {
         // an unreadable list must not claim that the hotspot is off.
         check(HotspotStartMessage.message(for: .absent) == PlainMessage.noHotspot,
               "a missing hotspot keeps the turn-on line")
-        check(HotspotStartMessage.message(for: .unsupported) == StopReason.hotspotUnsupported.message,
+        check(HotspotStartMessage.message(for: .unsupported) == PlainMessage.hotspotUnsupportedStart,
               "an unsupported link names the unsupported link")
+        check(!HotspotStartMessage.message(for: .unsupported).contains("stopped"),
+              "a refused Start does not say that the proxy stopped")
+        check(HotspotStartMessage.message(for: .unsupported) != StopReason.hotspotUnsupported.message,
+              "a refused Start has its own sentence")
+        check(HotspotStartMessage.message(for: .ambiguous) == PlainMessage.hotspotAmbiguous,
+              "an ambiguous pass has its own line")
+        check(!HotspotStartMessage.message(for: .ambiguous).contains("cannot read")
+              && PlainMessage.hotspotAmbiguous.contains("two possible hotspot links"),
+              "an ambiguous pass is not a read failure")
+        check(PlainMessage.hotspotAmbiguous != PlainMessage.hotspotUnreadable,
+              "ambiguous and unreadable differ")
+        check(!HotspotStartMessage.message(for: .present).contains("Turn on Personal Hotspot"),
+              "a present hotspot is never told to turn on")
+        check(HotspotStartMessage.message(for: .present) == PlainMessage.startFailed,
+              "the present fallback is the plain start failure")
         check(HotspotStartMessage.message(for: .unreadable) == PlainMessage.hotspotUnreadable,
               "an unreadable list names the read failure")
         check(!HotspotStartMessage.message(for: .unreadable).contains("172.20.10.1"),
@@ -105,7 +120,7 @@ struct SourceStatePresentationTests {
         // S3: an unavailable listener shows one plain line in both places. A
         // real session in use still wins, because that use is current.
         check(PairingDisplay.pairingUnavailableText ==
-              "Pairing is not available. Another app may be using the pairing port. Close it and reopen HotspotShade.",
+              "Pairing is not available. Another app may be using the pairing port. HotspotShade tries again while it is open.",
               "the unavailable line is plain")
         let unavailable = display(trusted: 2, unavailable: true)
         check(unavailable.activity == .unavailable, "an unavailable listener has its own state")
@@ -115,6 +130,24 @@ struct SourceStatePresentationTests {
               "the Settings row shows the bind failure")
         check(unavailable.settingsSymbol == "exclamationmark.triangle",
               "the Settings row uses the warning mark")
+        check(!PairingDisplay.pairingUnavailableText.contains("reopen"),
+              "the unavailable line does not ask for a reopen")
+        // The empty list help names every listener requirement, and hides
+        // them while the unavailable line already explains the state.
+        let notPaired = display()
+        check(notPaired.emptyListHelp.hasPrefix(PairingDisplay.emptyListText),
+              "the empty list help starts with the pairing instruction")
+        check(notPaired.emptyListHelp.contains("Personal Hotspot")
+              && notPaired.emptyListHelp.contains("saved token")
+              && notPaired.emptyListHelp.contains("this app is open"),
+              "the empty list help names the app, the hotspot, and the token")
+        check(unavailable.emptyListHelp == PairingDisplay.emptyListText,
+              "an unavailable listener does not repeat the requirements")
+        // The per-target Forget text says the token only matters if the target has it.
+        let forgetOne = ConfirmationText.forgetTargetMessage(label: "Target ABCD")
+        check(forgetOne.contains("If it has the saved token") && forgetOne.contains("does not revoke"),
+              "the per-target forget text is conditional on the saved token")
+        check(!forgetOne.contains("Its saved token still works"), "the old unconditional claim is gone")
         let useWins = display(sessions: 1, age: 2, unavailable: true)
         check(useWins.activity == .inUse, "a current session wins over the unavailable line")
 

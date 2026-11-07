@@ -195,7 +195,8 @@ namespace HotspotShade.WinUI2.Core.App
         AdapterDllMissing = 6,
         // The engine process could not be created.
         Failed = 7,
-        // The package is not installed under Program Files\WindowsApps.
+        // The install is not in a protected WindowsApps package store: its
+        // final path, owner, or DACL failed the starter's check.
         InstallUntrusted = 8
     }
 

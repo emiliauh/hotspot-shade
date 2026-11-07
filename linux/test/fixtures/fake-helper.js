@@ -35,6 +35,9 @@ const exitCode = Number.isInteger(Number(process.env.HS_FAKE_HELPER_EXIT_CODE))
 const exitBeforeReady = Number.isInteger(Number(process.env.HS_FAKE_HELPER_EXIT_BEFORE_READY))
   ? Number(process.env.HS_FAKE_HELPER_EXIT_BEFORE_READY)
   : 0;
+const exitAfterReady = Number.isInteger(Number(process.env.HS_FAKE_HELPER_EXIT_AFTER_READY))
+  ? Number(process.env.HS_FAKE_HELPER_EXIT_AFTER_READY)
+  : 0;
 const exitSignal = typeof process.env.HS_FAKE_HELPER_SIGNAL === 'string'
   ? process.env.HS_FAKE_HELPER_SIGNAL.trim()
   : '';
@@ -198,6 +201,17 @@ async function main() {
     process.exit(7);
   }
   process.stdout.write('HS_READY\n');
+  if (exitAfterReady) {
+    /* The real helper prints HS_READY and then fails its last preparation step
+     * (the start record), or the engine exits before it names a port. */
+    let text = '';
+    if (typeof process.env.HS_FAKE_HELPER_REASON === 'string') {
+      text += process.env.HS_FAKE_HELPER_REASON + '\n';
+    }
+    text += 'fake helper: failing after readiness\n';
+    reasonStream.write(text, () => process.stdout.write('', () => process.exit(exitAfterReady)));
+    return;
+  }
 
   const server = http.createServer(function (request, response) {
     const url = new URL(request.url, 'http://127.0.0.1');
@@ -211,6 +225,11 @@ async function main() {
     }
     if (request.method === 'GET' && url.pathname === '/api/phone/pair') {
       json(response, 200, { state: state.paired ? 'paired' : 'idle', code: null, error: null });
+      return;
+    }
+    if (request.method === 'POST' && (url.pathname === '/api/start' || url.pathname === '/api/stop')) {
+      state.running = url.pathname === '/api/start';
+      json(response, 200, status());
       return;
     }
     json(response, 404, { ok: false, error: 'not found' });

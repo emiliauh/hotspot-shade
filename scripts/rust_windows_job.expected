@@ -15,6 +15,17 @@
         shell: bash
         working-directory: rust
         run: cargo test --locked
+      - name: Add the 32-bit Windows target
+        shell: bash
+        run: rustup target add i686-pc-windows-msvc
+      - name: Type check (32-bit Windows target)
+        shell: bash
+        working-directory: rust
+        run: cargo check --target i686-pc-windows-msvc --all-targets --locked
+      - name: Clippy (32-bit Windows code)
+        shell: bash
+        working-directory: rust
+        run: cargo clippy --target i686-pc-windows-msvc --all-targets --locked -- -D warnings
       - name: Clippy (Windows code)
         shell: bash
         working-directory: rust

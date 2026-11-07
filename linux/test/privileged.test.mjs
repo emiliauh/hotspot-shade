@@ -659,7 +659,14 @@ test('every helper reason slug has a message and the parser takes the last known
 
 test('the reason slugs the app maps are the slugs the helper source can print', () => {
   const source = read('helper/src/main.rs');
-  const printed = [...source.matchAll(/^const REASON_[A-Z_]+: &str = "([a-z_]+)";$/gm)].map((match) => match[1]).sort();
+  const helperReasons = [...source.matchAll(/^const REASON_[A-Z_]+: &str = "([a-z_]+)";$/gm)].map((match) => match[1]);
+  /* The helper also forwards the engine's fixed start-failure codes. */
+  const list = source.match(/^const ENGINE_START_FAILURE_CODES: \[&str; (\d+)\] = \[\n([^\]]*)\];$/m);
+  assert.ok(list, 'the helper lists the engine start-failure codes');
+  const engineCodes = [...list[2].matchAll(/"([a-z_]+)"/g)].map((match) => match[1]);
+  assert.equal(engineCodes.length, Number(list[1]));
+  for (const code of engineCodes) assert.ok(code.length <= 32, code);
+  const printed = helperReasons.concat(engineCodes).sort();
   assert.deepEqual(printed, Object.keys(HELPER_REASON_MESSAGES).sort());
 });
 

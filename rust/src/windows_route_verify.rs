@@ -2803,14 +2803,30 @@ mod win32 {
 
     fn sockaddr(address: IpAddr, scope_id: u32) -> RawSockaddrInet {
         match address {
-            IpAddr::V4(address) => RawSockaddrInet {
-                v4: RawSockaddrIn {
+            IpAddr::V4(address) => {
+                // Initialize the whole union, not only the 16-byte IPv4 member.
+                // The union is 28 bytes because of `SOCKADDR_IN6`, and the
+                // pointer is passed to `GetBestRoute2` and `GetBestInterfaceEx`
+                // as `*const SOCKADDR_INET`. Starting from an initialized IPv6
+                // member and then assigning the IPv4 member leaves no
+                // uninitialized tail bytes for the FFI call to observe.
+                let mut raw = RawSockaddrInet {
+                    v6: RawSockaddrIn6 {
+                        family: AF_INET,
+                        port: 0,
+                        flow_info: 0,
+                        address: [0; 16],
+                        scope_id: 0,
+                    },
+                };
+                raw.v4 = RawSockaddrIn {
                     family: AF_INET,
                     port: 0,
                     address: address.octets(),
                     zero: [0; 8],
-                },
-            },
+                };
+                raw
+            }
             IpAddr::V6(address) => RawSockaddrInet {
                 v6: RawSockaddrIn6 {
                     family: AF_INET6,

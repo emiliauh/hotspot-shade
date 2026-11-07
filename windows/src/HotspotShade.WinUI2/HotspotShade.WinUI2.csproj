@@ -138,7 +138,14 @@
       <Link>Engine\wintun.dll</Link>
     </Content>
   </ItemGroup>
-  <Target Name="HotspotShadeCheckPayload" BeforeTargets="BeforeBuild">
+  <!-- The payload check is on by default. A compile-only build can set
+       HotspotShadeSkipPayloadCheck=true to skip it. CI uses that to compile
+       the app without the payload; the PC build stages and checks the
+       payload. -->
+  <PropertyGroup>
+    <HotspotShadeSkipPayloadCheck Condition="'$(HotspotShadeSkipPayloadCheck)' == ''">false</HotspotShadeSkipPayloadCheck>
+  </PropertyGroup>
+  <Target Name="HotspotShadeCheckPayload" BeforeTargets="BeforeBuild" Condition="'$(HotspotShadeSkipPayloadCheck)' != 'true'">
     <Error Condition="!Exists('$(HotspotShadePayloadDir)Broker\HotspotShade.WinUI2.Broker.exe')" Text="The broker is missing from $(HotspotShadePayloadDir)Broker. Run windows\tools\stage_payload.ps1 first." />
     <Error Condition="!Exists('$(HotspotShadePayloadDir)Elevate\HotspotShade.WinUI2.Elevate.exe')" Text="The elevated starter is missing from $(HotspotShadePayloadDir)Elevate. Run windows\tools\stage_payload.ps1 first." />
     <Error Condition="!Exists('$(HotspotShadePayloadDir)Engine\hotspotshade.exe')" Text="The engine is missing from $(HotspotShadePayloadDir)Engine. Run windows\tools\stage_payload.ps1 first." />

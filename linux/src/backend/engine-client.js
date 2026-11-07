@@ -79,11 +79,13 @@ const PORT_POLL_MS = 50;
 const STDOUT_DRAIN_MS = 500;
 
 /* Stable helper exit codes. Every non-zero code is a failed stop, not a clean
- * one, except 126, 127, and 7 before an engine exists (see stop()). The
+ * one, except 126, 127, and 7 before an engine exists and code 1, which only
+ * the helper's pre-spawn `fail_reason` path returns (see stop()). The
  * current helper reports a stop timeout with the HS_STOP_TIMEOUT line and
  * stays alive; exit code 3 is reserved for that case in a later helper. Code 9
  * is a cleanup failure: the engine status may be clean, but a state file or a
  * private directory could not be removed. */
+const HELPER_PREPARATION_FAILED = 1;
 const HELPER_ENGINE_SIGNALED = 4;
 const HELPER_ENGINE_FAILED = 5;
 const HELPER_ALREADY_RUNNING = 6;
@@ -111,7 +113,17 @@ const HELPER_REASON_MESSAGES = Object.freeze({
   identity_unavailable: 'The privileged helper could not read the boot and process-namespace identity from /proc. Check that /proc is mounted, then try again.',
   pipes_failed: 'The privileged helper could not set up its private pipes. Close other programs and try again.',
   temp_directory_failed: 'The privileged helper could not create its private directory under /tmp. Check the disk and the /tmp permissions, then try again.',
-  state_write_failed: 'The privileged helper could not write its start record in /var/lib/hotspotshade, so it started no engine. Check the disk, then try again.'
+  state_write_failed: 'The privileged helper could not write its start record in /var/lib/hotspotshade, so it started no engine. Check the disk, then try again.',
+  /* The fixed start-failure codes that the packaged engine prints. The helper
+   * forwards only a code from its own list, never engine text. */
+  arguments_invalid: 'The packaged engine refused the arguments that the helper gave it. Update HotspotShade so the app, the helper, and the engine match, then try again.',
+  control_descriptor_invalid: 'The packaged engine could not use the private channels that the helper gave it. Try again; if it keeps failing, reinstall the HotspotShade package.',
+  credentials_descriptor_invalid: 'The packaged engine did not accept the pairing channel from the app. Turn the tunnel on again; if it keeps failing, start HotspotShade again.',
+  token_invalid: 'The packaged engine did not accept the private start information from the helper. Turn the tunnel on again; if it keeps failing, reinstall the HotspotShade package.',
+  credentials_handoff_invalid: 'The packaged engine could not read the pairing from the app. Start HotspotShade again, pair if asked, and turn the tunnel on again.',
+  listener_failed: 'The packaged engine could not open its local listener. Close other programs that might block local ports, then try again.',
+  port_file_failed: 'The packaged engine could not report its port to the helper. Check the disk and the /tmp permissions, then try again.',
+  credentials_import_failed: 'The packaged engine could not import the pairing from the app. Start HotspotShade again, pair if asked, and turn the tunnel on again.'
 });
 
 /* Return the plain-English message for the last known reason line in a helper
@@ -696,7 +708,8 @@ function startupMessage(privileged, exit, engineKnown, reasonMessage) {
       return 'The packaged engine exited on a signal. Inspect the routes and start the app again.';
     }
     if (exit.code === HELPER_ENGINE_FAILED) {
-      return 'The packaged engine failed to start. Inspect the routes and check the package.';
+      return reasonMessage
+        || 'The packaged engine failed to start. Inspect the routes and check the package.';
     }
     if (exit.code === HELPER_CLEANUP_FAILED) {
       return 'The privileged helper could not confirm cleanup. Inspect the routes before starting again.';
@@ -1291,7 +1304,9 @@ function createEngineClient(options) {
         && (exit.code === HELPER_ABANDONED || exit.code === 126 || exit.code === 127)) {
         return 'The privileged helper exited before the app could confirm whether it started an engine. Inspect the routes and start the app again.';
       }
-      if (exit && !exit.signal && exit.code === 1) await waitForStderr(stdoutDrainMs);
+      if (exit && !exit.signal && (exit.code === 1 || exit.code === HELPER_ENGINE_FAILED)) {
+        await waitForStderr(stdoutDrainMs);
+      }
       return startupMessage(true, exit, enginePortSeen || !!httpClient, currentReasonMessage());
     }
 
@@ -1418,7 +1433,42 @@ function createEngineClient(options) {
   async function stop() {
     if (stopPromise) return stopPromise;
     stopping = true;
-    stopPromise = (async function () {
+    stopPromise = runStop();
+    return stopPromise;
+  }
+
+  /* Ask for the stop again after an attempt that did not end clean. The first
+   * result is cached and never changes, so a later Turn off could not learn
+   * that the helper has since exited. This closes the request pipe again,
+   * waits for the helper if it is still alive, and classifies its state now.
+   * A helper that already reported its stop timeout is not waited for again,
+   * because it prints that line once; the answer is then immediate. A stop
+   * that already ended clean, or one still running, is not repeated. */
+  let retryFlight = null;
+  async function retryStop() {
+    if (!stopPromise) return stop();
+    let previous = null;
+    try {
+      previous = await stopPromise;
+    } catch (error) {
+      previous = null;
+    }
+    if (previous && previous.stopped === true && previous.failed !== true) return previous;
+    if (retryFlight) return retryFlight;
+    const flight = (async function () {
+      try {
+        stopPromise = runStop();
+        return await stopPromise;
+      } finally {
+        retryFlight = null;
+      }
+    })();
+    retryFlight = flight;
+    return flight;
+  }
+
+  function runStop() {
+    return (async function () {
       const processHandle = child;
       let timedOut = false;
       let failed = false;
@@ -1512,6 +1562,13 @@ function createEngineClient(options) {
         const everReady = helperReady || engineObserved;
         const abandoned = !exit.signal && exit.code === HELPER_ABANDONED;
         const notAuthorized = !exit.signal && (exit.code === 126 || exit.code === 127);
+        let preparationFailed = false;
+        if (!exit.signal && !exit.error && exit.code === HELPER_PREPARATION_FAILED
+          && stdoutSettled && !engineObserved) {
+          /* The reason line can arrive after the exit event. */
+          await waitForStderr(stdoutDrainMs);
+          preparationFailed = !helperReady || currentReasonMessage() !== '';
+        }
         if (abandoned && stdoutSettled && !engineObserved) {
           /* Exit 7 before any port announcement proves that the helper
            * started no engine. */
@@ -1536,6 +1593,16 @@ function createEngineClient(options) {
           reason = 'helper_signaled';
           stopIncomplete = true;
           stopTimedOut = true;
+        } else if (preparationFailed) {
+          /* Every helper `fail_reason` exit (code 1) happens before the
+           * helper spawns the engine, so exit 1 proves that no engine ran.
+           * The proof needs a settled stdout with no port line. The helper
+           * prints HS_READY just before its last preparation step (the start
+           * record), so a ready helper also needs one of its fixed reason
+           * lines, which only `fail_reason` prints. A failed Turn on then
+           * returns to the user engine with no cleanup mark. */
+          neverStarted = true;
+          reason = 'helper_preparation_failed';
         } else if (notAuthorized && !everReady) {
           if (stdoutSettled) {
             neverStarted = true;
@@ -1590,7 +1657,6 @@ function createEngineClient(options) {
       }
       return result;
     })();
-    return stopPromise;
   }
 
   function describe() {
@@ -1608,6 +1674,7 @@ function createEngineClient(options) {
     call: call,
     start: function () { return ensureStarted(); },
     stop: stop,
+    retryStop: retryStop,
     dispose: stop,
     describe: describe,
     isRunning: function () { return !!child && !exit && !stopping; },

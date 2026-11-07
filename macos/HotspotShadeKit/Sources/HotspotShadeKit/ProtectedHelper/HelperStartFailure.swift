@@ -112,6 +112,9 @@ public final class RootEngineStderrCapture: @unchecked Sendable {
     private let condition = NSCondition()
     private var buffer: [UInt8] = []
     private var finished = false
+    // True once older bytes were dropped. The first kept line may then be
+    // the tail of a longer line, so it is not read.
+    private var truncated = false
     private let descriptor: Int32
 
     // Takes ownership of the read end and starts the reader thread.
@@ -132,6 +135,7 @@ public final class RootEngineStderrCapture: @unchecked Sendable {
             buffer.append(contentsOf: chunk[0..<count])
             if buffer.count > Self.limit {
                 buffer.removeFirst(buffer.count - Self.limit)
+                truncated = true
             }
             condition.unlock()
         }
@@ -150,8 +154,13 @@ public final class RootEngineStderrCapture: @unchecked Sendable {
         let deadline = Date().addingTimeInterval(seconds)
         condition.lock()
         while !finished && seconds > 0 && condition.wait(until: deadline) {}
-        let bytes = buffer
+        var bytes = buffer
+        let partial = truncated
         condition.unlock()
+        if partial {
+            guard let newline = bytes.firstIndex(of: UInt8(ascii: "\n")) else { return nil }
+            bytes.removeSubrange(...newline)
+        }
         return EngineStartFailureReason.parse(engineOutput: bytes)
     }
 }

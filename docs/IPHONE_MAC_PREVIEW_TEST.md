@@ -43,8 +43,10 @@ authorization forms, or personal traffic.
    then stop the iPhone proxy. Check the Mac's route and interface state against
    a read-only snapshot taken immediately before starting. If cleanup is
    uncertain or the network does not recover, stop testing and preserve the
-   diagnostic message; do not delete routes or state files by guesswork. This
-   preview has no approved way to clear a durable cleanup block. Review any
+   diagnostic message; do not delete routes or state files by guesswork. To
+   clear a durable cleanup block on this preview, follow the recovery section
+   of `macos/Helper/README.md`: check the routes first, then run the placed
+   coordinator's `preview-clear-cleanup-block` as root. Review any
    diagnostic report before sharing it because it may contain destinations.
 
 Record the OS versions, build identifiers, hotspot transport, observed app

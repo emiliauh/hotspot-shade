@@ -485,9 +485,9 @@ test('opening the packaged session starts only an unprivileged engine and calls 
 
     // A phone start while unpaired is refused by the user engine before pkexec.
     await assert.rejects(backend.start({ mode: 'phone', ping: true }), (error) => {
-      // The macOS engine build does not route the handoff request to its
-      // backend yet (see the Linux report); the Linux build answers not_paired.
-      assert.equal(error.code, process.platform === 'linux' ? 'not_paired' : 'handoff_failed');
+      // Both the macOS and the Linux engine builds answer an unpaired handoff
+      // request with not_paired.
+      assert.equal(error.code, 'not_paired');
       return true;
     });
     assert.equal(pkexecSpawns.length, 0, 'an unpaired phone start never calls pkexec');

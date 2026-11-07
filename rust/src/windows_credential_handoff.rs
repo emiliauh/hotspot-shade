@@ -17,11 +17,15 @@
 //! the identity bytes live in zeroizing buffers. No status answer, log line,
 //! error text, or Debug output holds them.
 //!
-//! The handle numbers are not secrets. Each handle must be an anonymous pipe,
-//! must not name the same kernel object as the token or parent handle, and has
-//! its inherit flag cleared before any child process starts. A pipe write
-//! blocks when the pipe buffer is full, so the launcher must read the frame or
-//! close its end. The default anonymous pipe buffer holds several frames.
+//! The handle numbers are not secrets. Each handle must be a pipe, must not
+//! name the same kernel object as the token or parent handle, and has its
+//! inherit flag cleared before any child process starts. The check proves that
+//! the handle names a pipe object rather than a socket, file, or console, and
+//! that the credentials end can read. It does not prove that the pipe is
+//! anonymous, private, or the end that the launcher meant to pass, so the
+//! launcher still owns that part. A pipe write blocks when the pipe buffer is
+//! full, so the launcher must read the frame or close its end. The default pipe
+//! buffer holds several frames.
 
 use crate::pairing::{Identity, PhoneCredentials, PAIRING_PORT};
 use zeroize::Zeroizing;
@@ -210,8 +214,8 @@ impl Drop for HandoffHandle {
 impl HandoffHandle {
     /// Validate and seal one inherited handoff handle.
     ///
-    /// The value must be a nonzero, four-byte aligned handle number of an
-    /// anonymous pipe. It must not name the same kernel object as any handle
+    /// The value must be a nonzero, four-byte aligned handle number of a pipe.
+    /// It must not name the same kernel object as any handle
     /// in `others` (the GUI token and parent pipes). Its inherit flag is
     /// cleared, so no `netsh` child inherits it. `readable` selects the read
     /// end check for the credentials handle; the write end cannot be peeked.
@@ -220,6 +224,14 @@ impl HandoffHandle {
             return Err("invalid pairing handoff handle".into());
         }
         let handle = value as usize as win32::Handle;
+        // `GetNamedPipeInfo` must succeed, and it is what tells a pipe from a
+        // socket: `GetFileType` reports `FILE_TYPE_PIPE` for both. The query
+        // needs FILE_READ_ATTRIBUTES access, which a `CreatePipe` write end
+        // carries, so the write end is accepted even though `readable` is
+        // false. The GetNamedPipeInfo documentation states that a write-only
+        // pipe handle needs GENERIC_WRITE and FILE_READ_ATTRIBUTES; a write end
+        // opened with CreateFileW(GENERIC_WRITE) alone would lack
+        // FILE_READ_ATTRIBUTES and would be refused here rather than accepted.
         let named = unsafe {
             win32::GetNamedPipeInfo(
                 handle,
@@ -426,6 +438,67 @@ mod tests {
         let mut bad = frame.to_vec();
         bad.extend_from_slice(b"HSC1");
         assert!(decode_latest(&bad).is_err());
+    }
+
+    /// A `CreatePipe` channel is the shape the launcher passes: a write end to
+    /// the user engine and a read end to the elevated engine. A socket must be
+    /// refused even though `GetFileType` calls it a pipe.
+    #[cfg(windows)]
+    #[test]
+    // `RawSocket` is `u64` on 64-bit Windows and `u32` on 32-bit Windows, so
+    // the widening conversion is needed on one target and is a no-op on the
+    // other, where clippy reports it as useless.
+    #[allow(clippy::useless_conversion)]
+    fn a_pipe_write_end_is_claimed_and_a_socket_is_refused() {
+        use std::ffi::c_void;
+        use std::os::windows::io::AsRawSocket;
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CreatePipe(
+                read_pipe: *mut *mut c_void,
+                write_pipe: *mut *mut c_void,
+                attributes: *mut c_void,
+                size: u32,
+            ) -> i32;
+        }
+
+        // The claimed handles close themselves, so the guard owns the raw ends
+        // and the successful claims are forgotten to avoid a second close.
+        struct PipeEnds(*mut c_void, *mut c_void);
+        impl Drop for PipeEnds {
+            fn drop(&mut self) {
+                // SAFETY: The test owns both ends and closes each one once.
+                unsafe {
+                    win32::CloseHandle(self.0);
+                    win32::CloseHandle(self.1);
+                }
+            }
+        }
+
+        let mut read_end: *mut c_void = std::ptr::null_mut();
+        let mut write_end: *mut c_void = std::ptr::null_mut();
+        // SAFETY: Both out pointers are valid, and a null security attribute
+        // asks for a non-inheritable anonymous pipe.
+        let created = unsafe { CreatePipe(&mut read_end, &mut write_end, std::ptr::null_mut(), 0) };
+        assert_ne!(created, 0, "CreatePipe failed: {}", unsafe {
+            win32::GetLastError()
+        });
+        let ends = PipeEnds(read_end, write_end);
+
+        let write_handle = HandoffHandle::claim(ends.1 as usize as u64, false, &[])
+            .expect("a CreatePipe write end is a handoff channel");
+        std::mem::forget(write_handle);
+        let read_handle = HandoffHandle::claim(ends.0 as usize as u64, true, &[])
+            .expect("a CreatePipe read end is a credentials channel");
+        std::mem::forget(read_handle);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback socket");
+        let socket = u64::from(listener.as_raw_socket());
+        assert!(
+            HandoffHandle::claim(socket, false, &[]).is_err(),
+            "a socket handle is not a pipe"
+        );
     }
 
     #[test]

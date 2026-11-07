@@ -64,17 +64,20 @@ Linux and Android, with parallel hermetic work on all of them.
 - [x] I1. Swift logic tests (34 suites, ALL SWIFT TESTS PASSED), simulator build, `scripts/ios_source_proxy_flow_test.sh` (IOS_SIM_SILENT_CLOSED, IOS_SIM_PROXY_OK audit=(7, 0)), 2026-11-06.
 - [x] I2. Simulator UI check through the device tools on a dedicated Simulator (iOS 27.2): Start without a hotspot shows "Needs attention" with guidance; Settings shows real empty states. Notes: a switch exposes the accessibility label "1"; the floating tab bar covers the "Refresh address" row until scrolled. Simulator only, no hotspot.
 - [x] I2b. iOS pairing responder brought to Rust/Kotlin parity (2026-11-06): credential validation and strict parsing, status host check, per-session nonce guard, 2056-byte read bound, typed frame errors; 7 new tests; ALL SWIFT TESTS PASSED, IOS_SIM_PROXY_OK audit=(7, 0), Simulator build OK. Existing 32-hex tokens stay valid.
+- [x] I2d. iOS review fixes (2026-11-06): stale pairing-unavailable line cleared on hotspot loss; accurate start, ambiguous-link, and Forget texts; one confirmation dialog; Keychain load left on main (no safe change). All iOS checks pass.
 - [ ] I2c. iOS real-test UX fixes in progress (review 2026-11-06): unsupported hotspot message, stale Manual connection address, visible pairing-unavailable and Keychain-conflict states, pairing prompt needs a ready listener, expired-pairing status, diagnostics state matches the screen. Test with a Release build; do not use Debug hotspot override keys on the phone.
 - [x] I3. Owner-approved install of the signed Release RC 0.1.0 (1) on Em's iPhone (in-place upgrade from 1.0 (1)); launch verified; evidence build/ios-rc-20261106/EVIDENCE.md. Profile expires 2026-11-10: rebuild and reinstall before then.
-- [ ] I4. Live test approved 2026-11-06 (full). Attempt 1 at 18:03: Turn on showed no administrator prompt; the root engine exited before authorization; the helper wrote a durable cleanup block ("launch stop was not clean"). Verified afterwards: no HotspotShade routes, no blackhole, default route normal, no root engine. Fix in progress (root cause, no durable block for a pre-grant exit, helper exit reason, reviewed clear command). Test paused.
+- [x] I3b. Owner-approved update install of the iPhone RC with today's fixes (2026-11-06 evening); evidence build/ios-rc-20261107/EVIDENCE.md.
+- [x] I4. Live test approved 2026-11-06 (full). Attempt 1 at 18:03: Turn on showed no administrator prompt; the root engine exited before authorization; the helper wrote a durable cleanup block ("launch stop was not clean"). Verified afterwards: no HotspotShade routes, no blackhole, default route normal, no root engine. Fix in progress (root cause, no durable block for a pre-grant exit, helper exit reason, reviewed clear command). Test paused. ROOT CAUSE (fixed, reviewed): helper placed the token pipe over the pairing socket (descriptor order in RootEngineLauncher); engine exited before its port. Helper now treats a pre-grant exit as a failed start with a reason; reviewed preview-clear-cleanup-block added. Rust 1555, Kit 682, Installer 350 pass. 0.1.2 installed 2026-11-06 evening after clearing the block with the reviewed command; evidence build/mac-rc-20261107-delivery/INSTALL_EVIDENCE.md. RETRY PASSED 2026-11-06 ~19:28: Turn on works, IPv4 and IPv6 through utun10, HTTPS 200, Mac shows On with 40 source connections, off/on cycle without error; evidence build/mac-rc-20261107-delivery/LIVE_TEST_2026-11-06.md. Final Turn off verified clean (no routes, no utun10, no root engine, no mark). Open: TTL audit readout and carrier-side TTL.
 
 ## Windows target (background)
 
 - [x] W0. First Windows pass (2026-11-06): console TestLauncher (real engine, no demo), exclusive loopback listener, reviewed; Windows Rust cross-check and clippy pass; not built on Windows. Verdict: not ready (gates closed, no pairing, WinUI simulated).
 - Owner decisions 2026-11-06: enable gated proxy token use (physical adapter + gateway check); owner builds on own PC; real WinUI app + Windows pairing, remove DemoSession.
 - [x] W6. Windows engine (2026-11-06, reviewed): token gate = default gateway on a physical adapter, re-checked every 2 s, first refusal stops; pairing, cancel, forget, handoff with the macOS/Linux API; Rust 1551 passed; Windows x86_64/i686 check+clippy clean; not run on Windows.
-- [x] W7. WinUI wired to the real engine via broker + NativeAOT elevated starter (one UAC prompt at Turn on), DemoSession removed, unsupported features listed (2026-11-06, reviewed; Core 244, ServiceHost 281 checks pass; static contract and delimiter checks pass; not built on Windows). First PC checkpoint: GetNamedPipeInfo on the user engine handoff write end (rust/src/windows_credential_handoff.rs ~224).
+- [x] W7. WinUI wired to the real engine via broker + NativeAOT elevated starter (one UAC prompt at Turn on), DemoSession removed, unsupported features listed (2026-11-06, reviewed; Core 244, ServiceHost 281 checks pass; static contract and delimiter checks pass; not built on Windows). GetNamedPipeInfo on the handoff write end confirmed correct by the FFI audit.
 - [x] W8. (fixed 2026-11-06: Broker builds 0 warnings in both configs; Core 250, ServiceHost 281 checks pass; static contract passes; Windows-only I/O paths not run) Broker compile review (real .NET 8 SDK at ~/.dotnet8/dotnet builds it clean): HARD BREAK RendezvousPipe manual-reset event makes every Turn on fail; also close-timeout handle loss, OpenAsync not retried, IPv6-disabled listener check, shutdown race, manifest EntryPoint, reply size. Fix in progress.
+- [ ] W9. Elevate + Core review (2026-11-06): HIGH SECURITY text-only WindowsApps trust lets a standard user get a payload run elevated via the signed starter; HIGH BUILD stage_payload.ps1 global PublishAot breaks publish; Activity silent after Turn on; test-data status wedges Starting; Turn off unavailable when status unavailable. Fix in progress (Opus, reviewed).
 - [ ] W1. Readiness assessment from current code and the linked Windows host:
   what is real, what is simulated, what is blocked by a product decision.
 - [ ] W2. Real app, service, and engine integration needed for a first test.
@@ -91,6 +94,7 @@ Linux and Android, with parallel hermetic work on all of them.
 - [ ] L4. Still open: real Rust helper with pkexec and polkit, TUN and route cleanup on a live hotspot, a Linux run of the new test.
 - [x] L5. (done 2026-11-06, reviewed; npm test 317, 313 pass, 0 fail, 4 skipped; not run on Linux) Packaging fixes: prerm/postrm, build-host and Depends, helper EPIPE panic, opaque exit 1, README root-process claim.
 - [x] L6. (done 2026-11-06, reviewed; npm test 341, 337 pass, 0 fail; not run on Linux; HS2 handoff via helper fd 2 because pkexec closes fds above 2; old root identity unused, pair once again; packaged app has no demo) Was: the packaged app runs pkexec at window open (violates invariant 14 and needs a polkit agent). Move the dashboard, pairing, and settings to an unprivileged user engine and ask only at tunnel start, as on macOS.
+- [ ] L7. Linux review (2026-11-06): HIGH helper exit 1 before spawn locks the session as an unconfirmed stop (same class as the Mac Turn-on bug); confirmed stop reported failed when the user engine is gone; recovery actions unreachable while cleanup pending; stale status poll; engine start reason discarded; HS2 untested. Fix in progress.
 
 ## Source app parity (from the 2026-11-06 review)
 
@@ -100,13 +104,13 @@ Linux and Android, with parallel hermetic work on all of them.
   stops the tunnel after 90 s of source silence.
 - [ ] P-iOS3. Owner decision: GOAL says one button on the target, but both
   phone apps still need a Start tap on the phone.
-- [ ] P-iOS4. iOS has Forget all only, no per-target list; token rotation is
+- [x] P-iOS4. (trust list with per-device Forget and Forget all done 2026-11-06; token rotation still disabled pending review) iOS has Forget all only, no per-target list; token rotation is
   disabled, so there is no revocation path.
 - [x] P-DOC. (done 2026-11-06) README claims stronger than code: ios/README.md:304 ("stays
   awake"), ios/README.md:298 toggle name, android/README.md:331 key storage,
   android/README.md:321,376 port range fallback, android/README.md missing the
   disabled background status consequence.
-- [ ] P-AND. Android: trust reconfirmed after each process start; background
+- [x] P-AND. (2026-11-06: background status enabled; token created at first Start; real Activity tab; Copy connection details; per-process trust reconfirmation kept by design and documented; 929 JVM tests pass; no real phone yet) Android: trust reconfirmed after each process start; background
   status host compiled off; no real port edit, activity log, copy connection
   details, or token before first pairing; unbounded UDP write path.
 
@@ -130,13 +134,13 @@ Linux and Android, with parallel hermetic work on all of them.
 - [x] C1. (resolved: npm test 0 failures after L5) `cd linux && npm test` failed assets.test.mjs (regex flags
   RegExp.exec in engine-client.js); expected to be fixed by the Linux
   packaging task. Re-run before any push.
-- [ ] C2. (2026-11-06 recount: 489 untracked + 27 uncommitted deletions; every job depends on them; commit with git add -A only on owner go-ahead) About 250 untracked files are required by CI jobs (Rust modules and
+- [x] C2. (owner approved committing; checkpoint f7ade3e on branch completion-2026-11-06, noref/ excluded, not pushed) (2026-11-06 recount: 489 untracked + 27 uncommitted deletions; every job depends on them; commit with git add -A only on owner go-ahead) About 250 untracked files are required by CI jobs (Rust modules and
   tests, macOS helper/installer, iOS sources and tests, Android tests, Windows
   ServiceHost/Broker/Service, scripts and *.expected blocks, docs/CI_PIPELINE.md).
   Commit only with the owner's go-ahead; exclude noref/, experiments/ unless
   wanted, and never build/.
 - [x] C3. android/.kotlin/ added to android/.gitignore.
-- [ ] C4. winui-demo: csproj payload check needs stage_payload.ps1 output that CI never makes; TestLauncher and ReleaseProbe never compiled by CI (fix in progress).
+- [x] C4. (fixed: CI compile step passes /p:HotspotShadeSkipPayloadCheck=true; PC build keeps the check; TestLauncher and ReleaseProbe built in CI; release audit 58 passed) winui-demo: csproj payload check needs stage_payload.ps1 output that CI never makes; TestLauncher and ReleaseProbe never compiled by CI (fix in progress).
 
 ## Release candidate rule (owner, 2026-11-06)
 
@@ -147,7 +151,8 @@ smoke-test seam that no app offers.
 
 - [x] RC-mac. macOS demo mode removed (2026-11-06): app always runs the real engine; an engine answering with test data is an error; binary has no demo UI text; swift test 653, 0 failures (twice); installer 340, 0 failures; app builds.
 - [x] RC-and. Android Preview mode removed (2026-11-06); Activity sheet and editable port removed (no real implementation); 899 JVM tests pass, lint 0 errors. Package id com.hotspotshade.demo kept to preserve installs.
-- [ ] RC-win. Windows app must be the real engine path, not the simulated
+- [x] RC-and-ui. Emulator check (Pixel 8 API 36, 2026-11-06): current debug APK shows Dashboard (Off, Start, waiting, background), real Activity empty state, Settings; no preview banner or badge. Emulator only.
+- [x] RC-win. (W7 and W8 done; WinUI uses the real engine; not built on Windows) Windows app must be the real engine path, not the simulated
   preview (Windows agent).
 - [ ] RC-lin. Packaged Linux app offers no engine demo option.
 - [ ] RC-list. List hidden or unbuilt features for the owner.
@@ -164,9 +169,9 @@ smoke-test seam that no app offers.
 - [x] D4. (done 2026-11-06) windows/README.md counts (391, 396, 757, 767-769, 820, 826-828),
   layout omits Service and TestLauncher, "no launcher" wording.
 - [x] D5. (done) android/README.md:764 five instrumented test classes, not three.
-- [ ] D6. AGENTS.md:237 echo limits: 30 s idle and 16 sessions are the iOS and
+- [x] D6. (done) AGENTS.md:237 echo limits: 30 s idle and 16 sessions are the iOS and
   Android source values, not rust/src/relay.rs (8 active, 8 s, 5 s, 300 s).
-- [ ] D7. AGENTS.md:152 probe prints uid and root flag on macOS.
+- [x] D7. (done) AGENTS.md:152 probe prints uid and root flag on macOS.
 - [ ] D8. Earlier items in P-DOC.
 
 ## Invariant audit follow-ups (2026-11-06: no violations found)
@@ -174,3 +179,18 @@ smoke-test seam that no app offers.
 - [x] V1. probe_listener now takes iface: u32; Windows x86_64/i686 check+clippy clean; 345 windows lib tests pass.
 - [ ] V2. Linux pair_handoff write (gui_backend.rs ~1561) has no deadline; bound it like Windows HANDOFF_WRITE_LIMIT (after the Mac fix agent finishes gui_backend.rs).
 - [ ] V3. Windows proxy start does not run windows_route_verify::verify_live on the installed /1 and 2000::/3 plan (known open; needs Windows host evidence).
+- [x] V4. (all done incl. i686 check and clippy in rust-windows CI; release audit and pipeline tests pass) FFI audit (2026-11-06): all layouts and signatures correct for x64 and i686; GetNamedPipeInfo on a CreatePipe write end succeeds (W7 checkpoint resolved). Fixing: handoff claim test, zeroed IPv4 sockaddr, doc wording. Queued: add i686 check to the rust-windows CI job (after the CI WinUI fix).
+
+## Linux evidence (needs owner approval)
+
+- [ ] LE1. docs/LINUX_EVIDENCE_PROPOSAL.md recommends a git archive of the
+  committed branch, SHA-256 pinned, extracted with tar --no-same-owner as an
+  unprivileged user on a disposable Boat Ubuntu 24.04 amd64 sandbox, for the
+  Rust/helper tests, npm test, Xvfb checks, and a .deb build. Needs the owner's
+  approval to send source to a sandbox. Live tunnel in a VM is separate.
+
+## Android review follow-ups (2026-11-06)
+
+- [ ] A1. FLAG_SECURE cleared before the recents snapshot; background tick port
+  race; host registry leak on failed start; copied saved port while stopped
+  (fix in progress).

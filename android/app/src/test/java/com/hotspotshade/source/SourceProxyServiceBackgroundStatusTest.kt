@@ -15,12 +15,13 @@ import org.junit.Test
 /**
  * Tests the background status lifecycle that the source proxy service owns.
  *
- * The service preserves the integration but keeps it gated off until the
- * pairing responder enforces status-only behavior and the listener fences a
- * run and token epoch. These tests cover the host contract that the service
- * will use once that review passes: stop the host at every run terminal, start
- * a fresh host for every new run, and never open a listener for a late token
- * load after stop. They use a fake listener and touch no hotspot.
+ * The service starts the host for every run and stops it at every run
+ * terminal. The gate is on (`BACKGROUND_STATUS_ENABLED`) after the status-only
+ * responder policy, the run identity fence, and the token epoch fence were
+ * reviewed. These tests cover the host contract that the service uses: stop
+ * the host at every run terminal, start a fresh host for every new run, and
+ * never open a listener for a late token load after stop. They use a fake
+ * listener and touch no hotspot.
  */
 class SourceProxyServiceBackgroundStatusTest {
     @Test

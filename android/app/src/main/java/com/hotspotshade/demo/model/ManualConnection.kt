@@ -46,6 +46,11 @@ data class ManualConnectionState(
     /** The API 36 tethering callback has not delivered its first reading. */
     val addressPending: Boolean = false,
     val port: Int = 0,
+    /**
+     * True while the source proxy is running, so [port] is the port that
+     * listens. When false, [port] is the saved port and nothing listens on it.
+     */
+    val proxyRunning: Boolean = true,
     val tokenAvailable: Boolean = false,
     /** A stored token exists but the app cannot read it. It is not absent. */
     val tokenUnreadable: Boolean = false,
@@ -59,7 +64,7 @@ data class ManualConnectionState(
      * can write them. It never depends on the token.
      */
     val connectionDetailsAvailable: Boolean
-        get() = ManualConnectionPolicy.connectionDetailsText(address, port) != null
+        get() = ManualConnectionPolicy.connectionDetailsText(address, port, proxyRunning) != null
 
     /** A short confirmation or refusal for Copy connection details. */
     val connectionCopyMessage: String?
@@ -159,8 +164,11 @@ object ManualConnectionPolicy {
      * The text that Copy connection details writes, or null when the address
      * or the port is not real. It names the token field but never holds a
      * token or any other secret. The wording follows the iOS app.
+     *
+     * When [proxyRunning] is false the port is only the saved one and nothing
+     * listens on it, so the text says that in a plain note.
      */
-    fun connectionDetailsText(address: String?, port: Int): String? {
+    fun connectionDetailsText(address: String?, port: Int, proxyRunning: Boolean = true): String? {
         val host = address?.trim().orEmpty()
         if (host.isEmpty() || host.any { it.isWhitespace() }) return null
         if (port !in ManualConnectionState.MINIMUM_PORT..ManualConnectionState.MAXIMUM_PORT) {
@@ -171,8 +179,14 @@ object ManualConnectionPolicy {
             "Username: $SOCKS_USERNAME\n" +
             "Password: the source token. Show it in HotspotShade Settings, Manual connection.\n" +
             "Use remote DNS, for example a socks5h proxy URL, so names resolve on the " +
-            "source device.\n"
+            "source device.\n" +
+            if (proxyRunning) "" else NOT_RUNNING_NOTE
     }
+
+    /** Added to the copied details while the source proxy is stopped. */
+    const val NOT_RUNNING_NOTE =
+        "Note: The source proxy is not running now. This port is the saved port, " +
+            "and nothing listens on it yet. Turn the proxy on in HotspotShade first.\n"
 
     const val USERNAME_NOTE =
         "The other app must support SOCKS5 username and password authentication."
@@ -402,6 +416,11 @@ class ManualConnectionSession(
         state = state.copy(port = port)
     }
 
+    /** Record whether the source proxy is running, for the copied details. */
+    fun setProxyRunning(running: Boolean) {
+        state = state.copy(proxyRunning = running)
+    }
+
     /**
      * Replace the stored token.
      *
@@ -496,7 +515,7 @@ class ManualConnectionSession(
      * for the token label and the token text, so it leaves this clip alone.
      */
     fun copyConnectionDetails(): ConnectionCopyResult {
-        val text = ManualConnectionPolicy.connectionDetailsText(state.address, state.port)
+        val text = ManualConnectionPolicy.connectionDetailsText(state.address, state.port, state.proxyRunning)
         val result = when {
             text == null -> ConnectionCopyResult.UNAVAILABLE
             connectionClipboard == null -> ConnectionCopyResult.FAILED

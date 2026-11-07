@@ -77,6 +77,7 @@ can change.
 | Service journal | `ServiceJournal.swift` | Durable launchd and authorization-right journal with a bounded previous-right backup. |
 | Service transaction | `PrivilegedServiceTransaction.swift` | Apply and recover state machine with rollback, crash injection, and exact ambiguity refusals. |
 | First-install cleanup | `PreviewFirstInstallCleanup.swift` | Checks the fixed files, launch daemon job, and start right against the publisher and layout before removal. It holds the exclusion lease; these checks do not prove which transaction created an object. |
+| Cleanup block clear | `PreviewCleanupBlockClear.swift` | `preview-clear-cleanup-block`: refuses while the helper or a root engine runs, a HotspotShade route shape is in `netstat -rn`, a journal is present, or the exclusive lease is busy; otherwise removes `cleanup-blocked` and `engine-session` with digest, mode, and read-back checks. Never changes a route. |
 | Command | `hotspotshade-installer-coordinator` | `sandbox-init`, `verify`, `install`, `recover`, `status`, and the disabled preview system commands. Every sandbox command refuses to run as root. |
 | Tests | `Tests/HotspotShadeInstallerCoreTests` | Lock validation, cross-process contention, crash injection at every install step, recovery idempotence, journal and payload refusals, start journal compatibility, service command and service transaction fault tests, and source-name guards. |
 
@@ -152,6 +153,40 @@ cleanup block, a launch intent, or a start journal is present, and when an
 installed object, stored right, or loaded job is foreign. The exclusion lease
 is the guard against an active tunnel: a participating helper or engine holds a
 shared lock. An old binary that takes no lock is not excluded.
+
+## Clearing a cleanup block (`preview-clear-cleanup-block`)
+
+`preview-uninstall` refuses while `cleanup-blocked` or `engine-session` is
+present, and the helper never removes either record. On a preview host the
+root command `preview-clear-cleanup-block` is the reviewed way to clear them.
+It uses the same approval gate, the root requirement, and the coordinator's
+own signing identity as the other preview commands.
+
+It refuses, with nothing removed, when:
+
+- a process whose kernel command name starts with `dev.hotspotshade` (the
+  protected helper) runs; a running helper holds the block in memory and may
+  hold a session or a retained shared lock, so stop it first with
+  `sudo launchctl bootout system/dev.hotspotshade.mac.helper`;
+- a root process named `hotspotshade` runs (a helper or direct engine);
+- `netstat -rn -f inet` shows `0/1` or `128.0/1` through a utun, or
+  `netstat -rn -f inet6` shows any `2000::/3` route (the engine's lo0
+  blackhole or a utun route); another VPN with the same shapes is refused too;
+- `install-journal.json`, `service-journal.json`, or `start-journal` is present;
+- the exclusive lease on every start-exclusion lock is busy, which means a
+  participant is starting, running, or stopping a session, or retained its
+  lock after an unclean stop;
+- any of these reads cannot complete, or a record is not a safe 0600 file.
+
+Under the lease it repeats the process and journal checks, removes
+`cleanup-blocked` and `engine-session` with the tree's digest- and
+mode-guarded removal, reads both names back, and prints every check and every
+removal. It never removes a route, an interface, a lock file, a journal, or
+`last-start-failure`, and never signals a process. Afterwards
+`preview-uninstall` and a fresh `preview-install` work again; the hermetic
+test covers that sequence. The command proves only what it reads at that
+moment; it is not a substitute for the route and interface inspection in
+`macos/Helper/README.md`.
 
 The assumption is "first install only". `preview-install` refuses an existing
 file, an existing right, and an existing job, and there is no live upgrade
@@ -452,6 +487,16 @@ TUN device, launchd job, or authorization entry. They cover:
   interruption after every cleanup step followed by a retry, a retry with a
   partly removed set, a non-empty install root that is kept, and the closed
   system gate.
+- Cleanup block clear: a quiet host removes `cleanup-blocked` and
+  `engine-session` and keeps `last-start-failure` and the lock files; a second
+  run removes nothing; a running helper, a root `hotspotshade` process, an
+  unreadable or empty process list, each owned route shape (`0/1` or `128.0/1`
+  through a utun, `2000::/3` through lo0 or a utun), an unreadable or
+  headerless route table, each journal, a held shared start lock, and a
+  record with a loose mode each refuse with both records kept; a `0/1` route
+  off a physical interface is not counted; after a clear the first-install
+  cleanup and a fresh first install succeed; the real process and netstat
+  readers work without root and change nothing.
 - A source guard that reads the helper and Rust lock-name constants.
 - A guard that `installationApproved` stays false.
 

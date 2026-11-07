@@ -43,15 +43,67 @@ class SecureWindowControllerTest {
     }
 
     @Test
-    fun theBackgroundPathClearsAnOpenReveal() {
+    fun theBackgroundPathKeepsTheBlockUntilTheNextForeground() {
         val window = FakeSecureWindow()
         val controller = SecureWindowController(window)
         controller.update(tokenRevealed = true)
 
         controller.onBackground()
 
+        assertTrue("The last drawn frame still shows the token.", controller.isSecure)
+        assertEquals(listOf(true), window.calls)
+
+        controller.onForeground(tokenRevealed = false)
+
         assertFalse(controller.isSecure)
         assertEquals(listOf(true, false), window.calls)
+    }
+
+    @Test
+    fun aHiddenTokenReportedAfterTheBackgroundDoesNotClearTheBlock() {
+        val window = FakeSecureWindow()
+        val controller = SecureWindowController(window)
+        controller.update(tokenRevealed = true)
+
+        // onStop holds the block, then hides the token. A recomposition that
+        // runs afterward reports the token hidden before the snapshot.
+        controller.onBackground()
+        controller.update(tokenRevealed = false)
+        controller.update(tokenRevealed = false)
+
+        assertTrue(controller.isSecure)
+        assertEquals(listOf(true), window.calls)
+
+        controller.onForeground(tokenRevealed = false)
+
+        assertFalse(controller.isSecure)
+        assertEquals(listOf(true, false), window.calls)
+    }
+
+    @Test
+    fun theForegroundEndsTheHoldSoALaterHideClearsTheBlock() {
+        val window = FakeSecureWindow()
+        val controller = SecureWindowController(window)
+        controller.onBackground()
+        controller.onForeground(tokenRevealed = false)
+        controller.update(tokenRevealed = true)
+        assertTrue(controller.isSecure)
+
+        controller.update(tokenRevealed = false)
+
+        assertFalse(controller.isSecure)
+        assertEquals(listOf(true, false), window.calls)
+    }
+
+    @Test
+    fun aBackgroundWithNoRevealNeverTouchesTheWindow() {
+        val window = FakeSecureWindow()
+        val controller = SecureWindowController(window)
+
+        controller.onBackground()
+        controller.onForeground(tokenRevealed = false)
+
+        assertEquals(emptyList<Boolean>(), window.calls)
     }
 
     @Test

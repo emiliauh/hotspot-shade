@@ -355,16 +355,20 @@ protocol PairingTrustStore: AnyObject {
     func remove(_ key: Data)
     func removeAll()
     var count: Int { get }
+    /// Every stored key, oldest first. A stored entry that is not valid base64 can
+    /// never match a key, so it is not listed. `removeAll` still clears it.
+    var keys: [Data] { get }
 }
 
 final class MemoryTrustStore: PairingTrustStore {
-    private var keys: Set<Data> = []
+    private var stored: [Data] = []
     private let lock = NSLock()
-    func contains(_ key: Data) -> Bool { lock.lock(); defer { lock.unlock() }; return keys.contains(key) }
-    func add(_ key: Data) { lock.lock(); keys.insert(key); lock.unlock() }
-    func remove(_ key: Data) { lock.lock(); keys.remove(key); lock.unlock() }
-    func removeAll() { lock.lock(); keys.removeAll(); lock.unlock() }
-    var count: Int { lock.lock(); defer { lock.unlock() }; return keys.count }
+    func contains(_ key: Data) -> Bool { lock.lock(); defer { lock.unlock() }; return stored.contains(key) }
+    func add(_ key: Data) { lock.lock(); if !stored.contains(key) { stored.append(key) }; lock.unlock() }
+    func remove(_ key: Data) { lock.lock(); stored.removeAll { $0 == key }; lock.unlock() }
+    func removeAll() { lock.lock(); stored.removeAll(); lock.unlock() }
+    var count: Int { lock.lock(); defer { lock.unlock() }; return stored.count }
+    var keys: [Data] { lock.lock(); defer { lock.unlock() }; return stored }
 }
 
 /// Store public keys only, base64, in UserDefaults.
@@ -405,6 +409,11 @@ final class UserDefaultsTrustStore: PairingTrustStore {
     }
 
     var count: Int { lock.lock(); defer { lock.unlock() }; return load().count }
+
+    var keys: [Data] {
+        lock.lock(); defer { lock.unlock() }
+        return load().compactMap { Data(base64Encoded: $0) }
+    }
 }
 
 /// One atomic snapshot for the host to display and later approve or deny.

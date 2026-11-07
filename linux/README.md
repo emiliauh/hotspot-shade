@@ -143,7 +143,10 @@ finish after the warning appears.
 
 If a fresh status reports interrupted service state or blocked cleanup while
 the tunnel may still be running, the dashboard and tray offer "Try to turn
-off". This requests a stop and does not prove that cleanup succeeded. The
+off". A blocked-cleanup status offers it even when the engine answers
+`running: false`, because only a stop attempt (or a helper exit that proves the
+state) clears that mark. This requests a stop and does not prove that cleanup
+succeeded. The
 engine can still report that cleanup is uncertain; inspect the routes and
 devices before another start. In some interrupted states the stop request
 reports uncertainty without retrying cleanup. The dashboard does not offer the
@@ -226,10 +229,29 @@ The packaged app follows AGENTS.md invariant 14. The code is in
    source. The app marks every status answer as uncertain (`state: unknown`,
    `cleanup_blocked: true`) with a route warning, so the Dashboard never shows
    Off for it, and a `running: false` answer does not clear the mark. Start,
-   pairing, and forget are refused. A later Turn off, Turn on, pairing, forget,
-   or Quit clears the mark only when the helper has since exited in a way that
-   proves the state: exit 0 after a stop timeout, or exit 126, 127, or 7 after
-   a stop during the authorization prompt with no engine port ever announced.
+   pairing, and forget are refused. The mark clears only when the helper has
+   since exited in a way that proves the state: exit 0 after a stop timeout, or
+   exit 126, 127, or 7 after a stop during the authorization prompt with no
+   engine port ever announced. Every status read checks for such an exit, so
+   the mark clears on the next poll with no user action; a later Turn off,
+   Turn on, pairing, forget, or Quit checks it too. The Dashboard and tray
+   offer "Try to turn off" while the mark is pending, even when the status says
+   `running: false`. A later Turn off also asks the helper client to close its
+   request pipe again and classify the helper's state at that moment; the first
+   attempt's result is not replayed. A confirmed stop returns a fixed
+   confirmation and does not read the user engine, so a user engine that died
+   meanwhile does not turn a confirmed stop into a failed one; the next status
+   poll reports the engine loss. A status read that began before the session
+   changed hands (Turn on, a stop, a late confirmation) is dropped and read
+   again from the current source, so a stale `running: false` from the user
+   engine is never published once the root tunnel is live. A read that keeps
+   changing hands fails with `status_changed` instead of publishing a stale
+   answer. A status read of the root engine that fails for a reason other than
+   a lost engine (a timeout, for example) proves nothing, so pairing, forget,
+   and a start are refused with "The tunnel status could not be read" and never
+   stop a tunnel that may still run. While a mark is pending and the stopped
+   root engine cannot answer, the status itself is the uncertain answer, so the
+   page keeps "Try to turn off".
    A mark that remains is reported in the quit notice. A start is refused
    while a pairing or a forget is still running, so a handoff never carries a
    pairing that is changing.
@@ -248,6 +270,15 @@ user engine, which never reads it: pkexec messages such as "Not authorized" or
 the frames that the root engine reads, which travel the other way. The app then
 shows its fixed message for the exit code (126 or 127 for a refused or
 dismissed prompt, the generic preparation message for exit 1).
+
+A failed Turn on that ends in helper exit 1 returns to the user engine with no
+cleanup mark. Every helper `fail_reason` exit (code 1) happens before the
+helper spawns the engine, and an engine exit never maps to 1, so exit 1 proves
+that no engine ran. The app treats it as "never started" when stdout ended
+normally with no `HS_PORT` line, and either no `HS_READY` line was seen or a
+fixed `HS_REASON` line was (`state_write_failed` comes after `HS_READY`). The
+person sees the plain reason text and can turn the tunnel on again. Exits after
+the spawn (5, 9, signals, timeouts) stay failed and keep the mark.
 
 ### Migration from the root identity
 
@@ -439,7 +470,10 @@ Untested on a real Linux desktop: the polkit prompt at Turn on, the `HS2`
 handoff through real pkexec and the real helper, the root engine import from
 that socket, a live tunnel, and the confirmed and unconfirmed stop paths with
 real routes. The helper changes were type-checked on macOS only, with the
-Linux-only `prctl` call stubbed; the helper tests need Linux. The real-engine
+Linux-only `prctl` call stubbed; the helper tests need Linux. The descriptor
+handoff unit tests (`take_handoff_descriptor`, `close_handoff`) are gated with
+`cfg(target_os = "linux")` and compile and run only on Linux; their logic was
+also run once on macOS in a temporary stubbed copy that has since been deleted. The real-engine
 backend test drives the session against the real engine through the labeled
 JavaScript helper stand-in as a normal user.
 
@@ -455,6 +489,17 @@ for example, unsafe permissions on `/opt/hotspotshade` produce a message that
 names the install directory and says to reinstall the package. An unknown slug, a
 malformed line, or no line at all keeps the generic message. The exit codes are
 unchanged.
+
+When the engine itself fails before it serves requests, it prints one fixed
+line on its stderr, `hotspotshade-start-failure: <code>`. The helper keeps a
+bounded tail (4 KiB) of the engine's stderr, drains it so the engine never
+blocks, and forwards only a code from its fixed list (`arguments_invalid`,
+`control_descriptor_invalid`, `credentials_descriptor_invalid`,
+`token_invalid`, `credentials_handoff_invalid`, `listener_failed`,
+`port_file_failed`, `credentials_import_failed`) as `HS_REASON <code>`. It
+forwards no other engine text. The helper exits 5 in that case, because the
+engine had started, and the app shows the mapped plain message but keeps the
+failed-stop handling.
 
 ### Closed output pipe
 

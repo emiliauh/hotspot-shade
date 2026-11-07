@@ -1,7 +1,9 @@
 import Foundation
+import CryptoKit
 
-// One change to the trusted target device list. This file uses Foundation
-// only. The activity line holds no name, address, port, code, or token.
+// One change to the trusted target device list, and the list that Settings
+// shows. This file uses Foundation and CryptoKit only. The activity line holds
+// no name, address, port, code, or token.
 
 /// A change to the trusted list. The app records one plain activity line.
 enum TrustChange: Equatable {
@@ -75,11 +77,43 @@ final class ObservableTrustStore: PairingTrustStore {
     }
 
     var count: Int { base.count }
+    var keys: [Data] { base.keys }
 
     private func notify(_ change: TrustChange) {
         lock.lock()
         let handler = self.handler
         lock.unlock()
         handler?(change)
+    }
+}
+
+/// One trusted target device in Settings. It carries the public key, which is
+/// the only thing the app stores about a target device, and a short label. The
+/// label does not show the key. It matches the Android label for the same key.
+struct TrustedTarget: Equatable, Identifiable {
+    let key: Data
+    var id: Data { key }
+    var label: String { TrustFingerprint.label(for: key) }
+
+    /// The text for assistive technology on the per-row Forget button.
+    var forgetAccessibilityLabel: String { "Forget \(label)" }
+
+    /// Build the Settings list from the stored keys, in stored order. A repeated
+    /// key is listed once.
+    static func list(_ keys: [Data]) -> [TrustedTarget] {
+        var seen = Set<Data>()
+        return keys.filter { seen.insert($0).inserted }.map { TrustedTarget(key: $0) }
+    }
+}
+
+enum TrustFingerprint {
+    /// "Target device " and the first four bytes of the SHA-256 digest of the
+    /// public key, as eight lowercase hex digits. Two keys can share a label
+    /// with a low probability. The Forget action uses the full key, never the
+    /// label.
+    static func label(for key: Data) -> String {
+        let digest = SHA256.hash(data: key)
+        let hex = digest.prefix(4).map { String(format: "%02x", $0) }.joined()
+        return "Target device \(hex)"
     }
 }

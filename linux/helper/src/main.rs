@@ -28,9 +28,9 @@ use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::mpsc;
+use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -53,6 +53,10 @@ const TERM_RETRY: Duration = Duration::from_secs(30);
  * separate from code 5 on purpose: an engine that exited cleanly can still
  * leave a state file or a private directory behind, and the person needs the
  * route-cleanup warning rather than an engine error. */
+/* Exit 1 is returned only by `fail_reason`, and every call of it happens
+ * before the engine is spawned. The app relies on that: exit 1 proves that no
+ * engine ran. A new exit-1 path after `command.spawn()` would break that proof;
+ * use another code for it. An engine exit never maps to 1. */
 const EXIT_REQUEST_INVALID: i32 = 1;
 const EXIT_ENGINE_SIGNALED: i32 = 4;
 const EXIT_ENGINE_FAILED: i32 = 5;
@@ -112,6 +116,118 @@ const ALL_REASONS: [&str; 13] = [
 
 fn reason_line(reason: &str) -> String {
     format!("HS_REASON {reason}")
+}
+
+/* The engine prints one fixed line on stderr when its startup fails:
+ * `hotspotshade-start-failure: <code>` (see StartupStage in rust/src/main.rs).
+ * The helper keeps a bounded tail of the engine's stderr and forwards only a
+ * code from this fixed list, as an `HS_REASON <code>` line. It never forwards
+ * any other engine text. The codes are lowercase ASCII slugs of at most 32
+ * characters, and the app maps each one to a plain message. */
+const ENGINE_STDERR_TAIL: usize = 4096;
+const ENGINE_START_FAILURE_PREFIX: &[u8] = b"hotspotshade-start-failure: ";
+const ENGINE_START_FAILURE_CODES: [&str; 8] = [
+    "arguments_invalid",
+    "control_descriptor_invalid",
+    "credentials_descriptor_invalid",
+    "token_invalid",
+    "credentials_handoff_invalid",
+    "listener_failed",
+    "port_file_failed",
+    "credentials_import_failed",
+];
+
+/* The last known start-failure code in a stderr tail, or None. A line must be
+ * exactly the prefix and one listed code; anything else is ignored. */
+fn engine_start_failure_code(tail: &[u8]) -> Option<&'static str> {
+    let mut found = None;
+    for line in tail.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(code) = line.strip_prefix(ENGINE_START_FAILURE_PREFIX) else {
+            continue;
+        };
+        if let Some(known) = ENGINE_START_FAILURE_CODES
+            .iter()
+            .find(|known| known.as_bytes() == code)
+        {
+            found = Some(*known);
+        }
+    }
+    found
+}
+
+/* A bounded tail of the engine's stderr. A thread drains the pipe until the
+ * engine and every process that inherited it close it, so a chatty engine never
+ * blocks on a full pipe. The helper reads the tail once, at a startup failure,
+ * and never joins the thread. */
+struct EngineStderr {
+    tail: Mutex<Vec<u8>>,
+    done: AtomicBool,
+}
+
+impl EngineStderr {
+    fn push(&self, bytes: &[u8]) {
+        let mut tail = match self.tail.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        tail.extend_from_slice(bytes);
+        if tail.len() > ENGINE_STDERR_TAIL {
+            let excess = tail.len() - ENGINE_STDERR_TAIL;
+            tail.drain(..excess);
+        }
+    }
+
+    /* The tail so far. The engine was already reaped, so its pipe data is in
+     * the kernel buffer; wait briefly for the thread to drain it. */
+    fn snapshot(&self, wait: Duration) -> Vec<u8> {
+        let deadline = Instant::now() + wait;
+        while !self.done.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        match self.tail.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
+
+fn capture_engine_stderr<R: Read + Send + 'static>(stream: Option<R>) -> Arc<EngineStderr> {
+    let capture = Arc::new(EngineStderr {
+        tail: Mutex::new(Vec::new()),
+        done: AtomicBool::new(false),
+    });
+    let Some(mut stream) = stream else {
+        capture.done.store(true, Ordering::Release);
+        return capture;
+    };
+    let worker = Arc::clone(&capture);
+    let spawned = thread::Builder::new()
+        .name("engine-stderr".to_string())
+        .spawn(move || {
+            let mut buffer = [0u8; 1024];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => worker.push(&buffer[..count]),
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            worker.done.store(true, Ordering::Release);
+        });
+    if spawned.is_err() {
+        capture.done.store(true, Ordering::Release);
+    }
+    capture
+}
+
+/* Forward the engine's fixed start-failure code, if it printed one. */
+fn report_engine_start_failure(capture: &EngineStderr) {
+    let tail = capture.snapshot(Duration::from_millis(500));
+    if let Some(code) = engine_start_failure_code(&tail) {
+        let _ = writeln!(io::stderr(), "{}", reason_line(code));
+    }
 }
 
 /* A closed stderr must not turn a reported failure into a panic. */
@@ -1779,7 +1895,7 @@ fn run() -> i32 {
         .arg("4")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     if handoff_fd.is_some() {
         command
             .arg("--credentials-fd")
@@ -1833,6 +1949,7 @@ fn run() -> i32 {
             };
         }
     };
+    let engine_stderr = capture_engine_stderr::<ChildStderr>(child.stderr.take());
     drop(token_writer);
     unsafe {
         libc::close(token_fd);
@@ -1924,7 +2041,9 @@ fn run() -> i32 {
         PortWait::Ready(port) => port,
         PortWait::Exited(status) => {
             /* wait_for_port reaped this child. Do not signal its old process
-             * id: the system may already have reused it. */
+             * id: the system may already have reused it. The engine's fixed
+             * start-failure code, if any, becomes the reason line. */
+            report_engine_start_failure(&engine_stderr);
             return complete_engine_exit(Path::new(STATE_PATH), &directory, 0, 0, status);
         }
         PortWait::TimedOut | PortWait::Canceled => {
@@ -1961,6 +2080,201 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_listed_engine_start_failure_code_is_forwarded() {
+        for code in ENGINE_START_FAILURE_CODES {
+            assert!(
+                code.len() <= 32 && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "{code} is not a short lowercase slug"
+            );
+            let line = format!("error: x\nhotspotshade-start-failure: {code}\n");
+            assert_eq!(engine_start_failure_code(line.as_bytes()), Some(code));
+            let crlf = format!("hotspotshade-start-failure: {code}\r\n");
+            assert_eq!(engine_start_failure_code(crlf.as_bytes()), Some(code));
+            let bare = format!("hotspotshade-start-failure: {code}");
+            assert_eq!(engine_start_failure_code(bare.as_bytes()), Some(code));
+        }
+        let last = b"hotspotshade-start-failure: token_invalid\nhotspotshade-start-failure: listener_failed\n";
+        assert_eq!(engine_start_failure_code(last), Some("listener_failed"));
+        for hostile in [
+            "",
+            "hotspotshade-start-failure: unknown_code\n",
+            "hotspotshade-start-failure: token_invalid secret=abc\n",
+            "hotspotshade-start-failure:  token_invalid\n",
+            "x hotspotshade-start-failure: token_invalid\n",
+            "hotspotshade-start-failure: ../../etc/passwd\n",
+            "hotspotshade-start-failure: \n",
+            "error: the token abc123 was rejected\n",
+        ] {
+            assert_eq!(
+                engine_start_failure_code(hostile.as_bytes()),
+                None,
+                "{hostile:?}"
+            );
+        }
+        /* A known code that is followed by other text on the same line is not
+         * forwarded, and the earlier known line still is. */
+        let mixed = b"hotspotshade-start-failure: token_invalid\nhotspotshade-start-failure: listener_failed extra\n";
+        assert_eq!(engine_start_failure_code(mixed), Some("token_invalid"));
+        /* Non-UTF-8 bytes in the tail are harmless. */
+        assert_eq!(
+            engine_start_failure_code(b"\xff\xfe\nhotspotshade-start-failure: port_file_failed\n"),
+            Some("port_file_failed")
+        );
+    }
+
+    #[test]
+    fn the_engine_stderr_tail_is_bounded_and_keeps_the_last_bytes() {
+        let mut data = vec![b'x'; 1024 * 1024];
+        data.extend_from_slice(b"\nhotspotshade-start-failure: credentials_import_failed\n");
+        let capture = capture_engine_stderr(Some(io::Cursor::new(data)));
+        let tail = capture.snapshot(Duration::from_secs(5));
+        assert!(
+            capture.done.load(Ordering::Acquire),
+            "the thread drained the stream"
+        );
+        assert!(tail.len() <= ENGINE_STDERR_TAIL);
+        assert_eq!(
+            engine_start_failure_code(&tail),
+            Some("credentials_import_failed")
+        );
+    }
+
+    #[test]
+    fn a_missing_engine_stderr_has_an_empty_tail() {
+        let capture = capture_engine_stderr::<io::Empty>(None);
+        assert!(capture.snapshot(Duration::from_millis(50)).is_empty());
+    }
+
+    #[test]
+    fn a_failing_child_reports_only_its_fixed_start_failure_code() {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                "echo 'error: the token deadbeef was rejected' >&2; \
+                 echo 'hotspotshade-start-failure: listener_failed' >&2; exit 3",
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start /bin/sh");
+        let capture = capture_engine_stderr::<ChildStderr>(child.stderr.take());
+        let status = child.wait().expect("wait for the child");
+        assert_eq!(status.code(), Some(3));
+        let tail = capture.snapshot(Duration::from_secs(5));
+        assert_eq!(engine_start_failure_code(&tail), Some("listener_failed"));
+        assert_eq!(reason_line("listener_failed"), "HS_REASON listener_failed");
+    }
+
+    /* The handoff tests move descriptors 1 and 2, so each runs in a child
+     * process. They compile only on Linux: the helper itself is Linux-only. */
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_handoff_descriptor_is_moved_checked_and_closed() {
+        use std::os::fd::OwnedFd;
+        const MARKER: &str = "HS_HELPER_HANDOFF_MOVE_TEST";
+        if env::var_os(MARKER).is_some() {
+            /* Descriptor 2 is a socket and descriptor 1 is a pipe. */
+            let fd = take_handoff_descriptor().expect("take the handoff descriptor");
+            assert!(fd >= 10, "the copy is lifted above the engine descriptors");
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(
+                flags >= 0 && flags & libc::FD_CLOEXEC != 0,
+                "the copy is close-on-exec"
+            );
+            let mut copy: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(fd, &mut copy) }, 0);
+            assert_eq!(
+                copy.st_mode & libc::S_IFMT,
+                libc::S_IFSOCK,
+                "the copy is the socket"
+            );
+            let mut one: libc::stat = unsafe { std::mem::zeroed() };
+            let mut two: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(1, &mut one) }, 0);
+            assert_eq!(unsafe { libc::fstat(2, &mut two) }, 0);
+            assert_eq!(
+                two.st_mode & libc::S_IFMT,
+                libc::S_IFIFO,
+                "descriptor 2 is now the stdout pipe"
+            );
+            assert_eq!((one.st_dev, one.st_ino), (two.st_dev, two.st_ino));
+            /* A reason line now reaches the app on stdout. */
+            writeln!(io::stderr(), "HS_REASON engine_missing").expect("write the reason line");
+            close_handoff(None);
+            close_handoff(Some(fd));
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_GETFD) },
+                -1,
+                "close_handoff closed the copy"
+            );
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+            return;
+        }
+        let (child_end, parent_end) = UnixStream::pair().expect("create the handoff socket pair");
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::the_handoff_descriptor_is_moved_checked_and_closed",
+            ])
+            .env(MARKER, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(OwnedFd::from(child_end)))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "child failed: {stdout}");
+        assert!(stdout.contains("HS_REASON engine_missing"), "{stdout}");
+        /* The helper never wrote to the handoff socket. */
+        /* Every other end is closed once the child exits, so this read ends. */
+        let mut peer = parent_end;
+        let mut leftover = Vec::new();
+        let _ = peer.read_to_end(&mut leftover);
+        assert!(
+            leftover.is_empty(),
+            "nothing reached the user engine socket"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_handoff_descriptor_that_is_not_a_socket_is_refused_and_not_leaked() {
+        const MARKER: &str = "HS_HELPER_HANDOFF_REFUSE_TEST";
+        if env::var_os(MARKER).is_some() {
+            /* Descriptor 2 is a pipe. Find the number the next lifted copy
+             * would take, then check that a refusal gives it back. */
+            let probe = unsafe { libc::fcntl(2, libc::F_DUPFD_CLOEXEC, 10) };
+            assert!(probe >= 10);
+            unsafe {
+                libc::close(probe);
+            }
+            let error = take_handoff_descriptor().expect_err("a pipe is not a handoff socket");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            let again = unsafe { libc::fcntl(2, libc::F_DUPFD_CLOEXEC, 10) };
+            assert_eq!(again, probe, "the refused copy was closed");
+            unsafe {
+                libc::close(again);
+            }
+            return;
+        }
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::a_handoff_descriptor_that_is_not_a_socket_is_refused_and_not_leaked",
+            ])
+            .env(MARKER, "1")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn a_closed_stderr_does_not_panic_when_reporting_engine_failure() {

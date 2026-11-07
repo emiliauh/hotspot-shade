@@ -78,6 +78,15 @@ public enum PreviewSystemInstaller {
         return try PreviewFirstInstallCleanup.systemPreview().run()
     }
 
+    // Clear the durable cleanup block and the launch intent after the host
+    // shows no helper, no root engine, no HotspotShade route, no journal,
+    // and no start-exclusion holder. It never changes a route.
+    public static func clearCleanupBlock() throws -> PreviewClearReport {
+        guard previewGateIsOpen else { throw PreviewClearError.notApproved }
+        guard geteuid() == 0 else { throw PreviewClearError.requiresRoot }
+        return try PreviewCleanupBlockClear.systemPreview().run()
+    }
+
     private static var previewGateIsOpen: Bool {
         HelperRequirement.isLocalPreview && CoordinatorPolicy.localPreviewInstallationApproved
     }

@@ -252,11 +252,16 @@ class PairingViewModel internal constructor(
         if (value) {
             cancelNotification()
             // Take port 18090 from the background status host before this
-            // activity's listener binds. Both calls run on the one worker, so
-            // the release comes before the coordinator's first bind.
+            // activity's listener binds. activityStarted() bumps the port-owner
+            // fence at once, so a host tick that read "not visible" earlier
+            // cannot publish a listener afterward. releasePortNow() runs on the
+            // one worker before the coordinator's first bind and closes any
+            // listener the host already holds.
             BackgroundStatusHost.activityStarted()
-            runOnIo { BackgroundStatusHost.releasePortNow() }
-            runOnIo { coordinator?.activate() }
+            runOnIo {
+                BackgroundStatusHost.releasePortNow()
+                coordinator?.activate()
+            }
         } else {
             BackgroundStatusHost.activityStopped()
             runOnIo { coordinator?.deactivate() }

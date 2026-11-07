@@ -221,6 +221,36 @@ class ManualConnectionTest {
     }
 
     @Test
+    fun copyConnectionDetailsSaysWhenTheProxyIsNotRunning() {
+        val fixture = Fixture()
+        val connection = FakeConnectionClipboard()
+        val session = detailsSession(fixture, connection, token = token)
+        session.setProxyRunning(false)
+
+        assertEquals(ConnectionCopyResult.COPIED, session.copyConnectionDetails())
+
+        val text = connection.text!!
+        assertTrue(text.contains("Server: 192.168.43.1:41234"))
+        assertTrue(text.contains(ManualConnectionPolicy.NOT_RUNNING_NOTE))
+        assertTrue(text.contains("not running"))
+        assertFalse("The copy never holds the token.", text.contains(token))
+
+        session.setProxyRunning(true)
+        assertEquals(ConnectionCopyResult.COPIED, session.copyConnectionDetails())
+        assertFalse(connection.text!!.contains("not running"))
+    }
+
+    @Test
+    fun theCopyTextHasNoNoteWhileTheProxyRuns() {
+        val running = ManualConnectionPolicy.connectionDetailsText("192.168.43.1", 41_234, proxyRunning = true)!!
+        val stopped = ManualConnectionPolicy.connectionDetailsText("192.168.43.1", 41_234, proxyRunning = false)!!
+
+        assertFalse(running.contains("Note:"))
+        assertTrue(stopped.startsWith(running))
+        assertTrue(stopped.endsWith(ManualConnectionPolicy.NOT_RUNNING_NOTE))
+    }
+
+    @Test
     fun theCopyTextNamesTheTokenFieldButNeverHoldsAToken() {
         val text = ManualConnectionPolicy.connectionDetailsText("192.168.43.1", 41_234)!!
         assertTrue(text.startsWith("HotspotShade SOCKS5 proxy\n"))

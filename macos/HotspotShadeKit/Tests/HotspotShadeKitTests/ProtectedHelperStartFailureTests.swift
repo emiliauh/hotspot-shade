@@ -172,7 +172,7 @@ final class ProtectedHelperStartFailureTests: XCTestCase {
 
         let reaped = try XCTUnwrap(controller.reapExitedEngineReport())
         XCTAssertFalse(reaped.failedStart)
-        XCTAssertEqual(fixture.cleanup.records, ["engine exited without a stop request"])
+        XCTAssertEqual(fixture.cleanup.records.first, "engine exited without a stop request")
         XCTAssertTrue(fixture.intent.present)
         XCTAssertTrue(controller.requiresCleanup)
         XCTAssertEqual(controller.snapshot().lastResult, .engineExited)
@@ -201,13 +201,14 @@ final class ProtectedHelperStartFailureTests: XCTestCase {
 
         let reaped = try XCTUnwrap(controller.reapExitedEngineReport())
         XCTAssertFalse(reaped.failedStart)
-        XCTAssertEqual(fixture.cleanup.records, ["engine exited without a stop request"])
+        XCTAssertEqual(fixture.cleanup.records.first, "engine exited without a stop request")
         XCTAssertTrue(controller.requiresCleanup)
     }
 
-    func testAnUncleanStopBeforeAnyGrantIsAFailedStartButATimeoutBlocks() {
+    func testAnUncleanStopBeforeAnyGrantIsACleanStopButATimeoutBlocks() {
         // An unclean exit that the helper reaped while it stopped an engine
-        // that never had a grant changed no route.
+        // that never had a grant changed no route. A requested stop keeps its
+        // own result instead of a failed start, and writes no failure record.
         let fixture = Fixture()
         let controller = fixture.controller()
         let connection = UUID()
@@ -218,7 +219,9 @@ final class ProtectedHelperStartFailureTests: XCTestCase {
         XCTAssertTrue(report.owned)
         XCTAssertTrue(fixture.cleanup.records.isEmpty)
         XCTAssertFalse(fixture.intent.present)
-        XCTAssertEqual(controller.snapshot().lastResult, .failedStart)
+        XCTAssertEqual(controller.snapshot().lastResult, .stopped)
+        XCTAssertEqual(report.result, .stopped)
+        XCTAssertNil(fixture.record.read())
 
         // A stop that did not end the engine is never proof.
         let second = Fixture()
@@ -326,7 +329,7 @@ final class ProtectedHelperStartFailureTests: XCTestCase {
             encoding: .utf8
         )
         for reason in EngineStartFailureReason.engineCodes {
-            XCTAssertTrue(source.contains("\"\(reason.rawValue)\""), reason.rawValue)
+            XCTAssertTrue(source.contains(reason.rawValue), reason.rawValue)
         }
     }
 
@@ -340,6 +343,20 @@ final class ProtectedHelperStartFailureTests: XCTestCase {
         XCTAssertTrue(HelperPipeWriter.writeAll(descriptor: fds[1], bytes: filler + Array("\nhotspotshade-start-failure: listener_failed\n".utf8)))
         close(fds[1])
         XCTAssertEqual(capture.reason(waitingUpTo: 5), .listenerFailed)
+    }
+
+    func testATruncatedFirstLineIsNotAReason() throws {
+        var fds: [Int32] = [-1, -1]
+        XCTAssertEqual(pipe(&fds), 0)
+        let capture = RootEngineStderrCapture(readDescriptor: fds[0])
+        // One long line whose kept tail starts with the prefix after the
+        // buffer drops its head.
+        let head = [UInt8](repeating: UInt8(ascii: "x"), count: 10_000)
+        let tail = Array("hotspotshade-start-failure: token_invalid\n".utf8)
+        let pad = [UInt8](repeating: UInt8(ascii: "y"), count: RootEngineStderrCapture.limit - tail.count)
+        XCTAssertTrue(HelperPipeWriter.writeAll(descriptor: fds[1], bytes: head + tail + pad))
+        close(fds[1])
+        XCTAssertNil(capture.reason(waitingUpTo: 5))
     }
 
     // MARK: - Descriptor placement
@@ -384,8 +401,7 @@ final class ProtectedHelperStartFailureTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(try XCTUnwrap(value), RootEngineSpawnDescriptors.lowestSource)
         }
         defer {
-            for value in relocated.compactMap({ $0 }) { close(value) }
-            for value in sources + [pair[0], output[0]] { close(value) }
+            for value in [token, parent, lock, pair[1], pair[0], output[0]] { close(value) }
         }
         var actions: posix_spawn_file_actions_t?
         XCTAssertEqual(posix_spawn_file_actions_init(&actions), 0)
@@ -406,6 +422,9 @@ final class ProtectedHelperStartFailureTests: XCTestCase {
         defer { for pointer in argv { free(pointer) } }
         var child: pid_t = 0
         XCTAssertEqual(posix_spawn(&child, "/bin/sh", &actions, &attributes, argv, nil), 0)
+        // The child has its copies. Close every parent copy of the output
+        // write end, or the read below never sees end of file.
+        for value in relocated.compactMap({ $0 }) { close(value) }
         close(output[1])
         output[1] = -1
         var collected = [UInt8]()

@@ -733,7 +733,9 @@ public final class HelperSessionController: @unchecked Sendable {
                 engine,
                 sessionID: sessionID,
                 reason: lateReason,
-                exclusion: lease
+                exclusion: lease,
+                // A late engine never had a session, so no grant was written.
+                grantAttempted: false
             )
             condition.lock()
             stoppingCount -= 1
@@ -1061,7 +1063,7 @@ public final class HelperSessionController: @unchecked Sendable {
         sessionID: UUID,
         reason: EngineStopReason,
         exclusion lease: HelperStartExclusionLease,
-        grantAttempted: Bool = false
+        grantAttempted: Bool
     ) -> EngineStopResult {
         let (result, failedStart) = finish(
             engine,
@@ -1110,9 +1112,17 @@ public final class HelperSessionController: @unchecked Sendable {
             // child, so it is gone. Clear the intent and release the lock like
             // a clean stop, and record the fixed reason. A failed clear keeps
             // the record on disk and blocks later starts.
-            let failure = engine.startFailureReason ?? .exitedWithoutReason
             _ = clearIntentAfterVerifiedCleanStop()
             lease.releaseAfterCleanStop()
+            guard reason == .engineExited else {
+                // A requested stop (a person, a cancel, a lost connection, or
+                // the authorization deadline) of an engine that never reached
+                // a grant. Its exit status is not route evidence, so this is a
+                // clean stop with the reason the caller gave, not a failed
+                // start and not a block.
+                return (.stopped, nil)
+            }
+            let failure = engine.startFailureReason ?? .exitedWithoutReason
             failureRecord.record(failure)
             return (result, failure)
         } else if result == .failed {

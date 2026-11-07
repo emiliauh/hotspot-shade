@@ -171,7 +171,18 @@ cannot write, and signed with a Developer ID that the helper checks.
    grant is a refused start. A manually started root GUI has no grant file and
    keeps the root command line as its authority.
 10. The per-launch secret goes to the engine on descriptor 3. The engine sees
-    descriptor 4 as its liveness channel. The helper returns the loopback port
+    descriptor 4 as its liveness channel. The start-exclusion lock goes to
+    descriptor 5 and the pairing handoff socket to descriptor 6. The launcher
+    first duplicates every inherited source to a close-on-exec descriptor at
+    or above 10, then adds one `dup2` per target, so no file action can
+    replace a source that a later action still needs. The 2026-11-06 release
+    candidate skipped this step: the XPC handoff descriptor arrived before the
+    pipes existed and had a low number, `dup2(token, 3)` replaced it, and the
+    engine received the token pipe on descriptor 6. Every start then failed
+    before the port was published. The engine now refuses a credentials
+    descriptor that is not a socket on macOS. Standard error is a capture
+    pipe that the helper drains for the life of the engine and bounds to the
+    last 4 KiB in memory. The helper returns the loopback port
     and secret only in the authenticated XPC reply. The secret is never written
     to disk, a command line, a log, or a status answer.
 11. The engine's port file lives in a private directory under
@@ -196,10 +207,19 @@ cannot write, and signed with a Developer ID that the helper checks.
     intent stores no process id and no secret.
 14. A stop closes descriptor 4 first, sends SIGTERM, and waits up to 60
     seconds. It does not send SIGKILL. A timed-out stop, a signaled exit, a
-    non-zero exit, an exit before the port was ready, or a wait status the
-    helper cannot read is not a clean stop. Each one sets a durable cleanup
-    block, and every later start is refused until a person inspects the host.
-    There is no automatic restart and no automatic clear.
+    non-zero exit, or a wait status the helper cannot read is not a clean stop.
+    Each one sets a durable cleanup block, and every later start is refused
+    until a person inspects the host. There is no automatic restart and no
+    automatic clear. One case is different: an engine that the helper reaped
+    (so its exit is known) before the helper ever began a grant write for its
+    session cannot have changed a route, because the engine changes a route
+    only after it consumes a grant. That exit, including an exit before the
+    port was ready, is a failed start: the helper clears the launch intent,
+    releases its shared lock, sets no block, and records one fixed reason. A
+    grant write that was attempted, even one that failed, keeps the block path.
+    A requested stop (Turn off, cancel, lost connection, or the authorization
+    deadline) of such an engine is a clean stop even when its exit status is
+    not zero, and writes no failure record.
 15. The launch intent is removed only after a verified clean engine stop. A
     failed spawn clears it only when the launcher can prove that no child was
     created, and a spawned engine that exits cleanly clears it through the same
@@ -215,12 +235,16 @@ cannot write, and signed with a Developer ID that the helper checks.
     file and the containing directory, and never removes it. The marker
     survives a helper restart. A symlink, a non-root owner, a group or other
     permission, or an unreadable state is treated as blocked, never as clean.
-    No helper path removes the marker. A person must follow the inspection and
-    escalation in the recovery section below.
+    No helper path removes the marker. A person must follow the inspection in
+    the recovery section below; on a preview host the coordinator command
+    `preview-clear-cleanup-block` then removes it after its own checks.
 17. An engine that exits on its own is not a clean stop. The liveness watch
     frees the session slot, records the durable block, keeps the launch intent,
     and tells the owning connection. The app shows the cleanup message, not a
-    normal stop.
+    normal stop. The exception in item 14 applies: a reaped exit before any
+    grant write is a failed start. The `engine_exited` notice then carries
+    `failed_start` and the fixed reason, and the app says that the tunnel did
+    not start and why.
 18. An app-side start timeout is ambiguous. The app cancels and closes the XPC
     connection, so the helper's connection-loss path stops any engine that was
     already started. It never leaves a root engine serving a request that the
@@ -350,9 +374,11 @@ fail rather than display cleanup uncertainty. An abort or process exit releases
 the lock. The record and lock are cooperative fences, not protection against an
 uncooperative root process.
 
-A helper-launched engine that exits before reporting its port is treated as an
-unclean exit, even if it refused before creating a route. The helper retains
-the exclusion and requires inspection rather than assuming cleanup succeeded.
+A helper-launched engine that exits before reporting its port is a failed start
+with a fixed reason, not an unclean exit: no session existed, so the helper
+never wrote a grant and the engine cannot have changed a route. The helper
+releases the exclusion and clears the launch intent. A launch whose child the
+helper could not stop or reap keeps the exclusion and requires inspection.
 
 The installer coordinator is still not approved or enabled. Its transition set
 includes `start-exclusion`, but older binaries and incomplete coordination of
@@ -364,10 +390,11 @@ unchanged.
 
 ## Recovery after a cleanup block or leftover intent
 
-This section is an inspection and containment procedure. It does not approve
-removal of `cleanup-blocked` or `engine-session`, and it does not clear a
-refusal record. A reviewed recovery for direct and helper engines is still
-required.
+This section is an inspection and containment procedure. On a local preview
+host, step 6 clears the two records with the coordinator command
+`preview-clear-cleanup-block` after the checks below. Outside the preview there
+is still no approved removal; a reviewed recovery for direct and helper engines
+is still required.
 
 The cleanup marker and the launch intent are helper refusal records. They are
 not proof that an engine is gone. The helper cannot inspect the routing table. A
@@ -398,13 +425,58 @@ either installer journal by hand.
    engine also owns an `engine-session` record. Removing it while that engine
    is active can defeat the single-start slot. Do not remove the record or the
    cleanup marker by hand based on this procedure. A reviewed recovery procedure
-   for direct and helper engines is still required.
+. On a local preview host only, after steps 1 to 4 found no engine, no
+   HotspotShade route, and no utun that HotspotShade owns, run the placed
+   preview coordinator as root:
+   `sudo "/Library/Application Support/HotspotShade/local-preview/coordinator/hotspotshade-installer-coordinator" preview-clear-cleanup-block`.
+   It is gated like the other preview commands (root, the system preview
+   build, and the coordinator's own signing team). It refuses when the
+   protected helper process runs (stop it with
+   `sudo launchctl bootout system/dev.hotspotshade.mac.helper`), when a root
+   process named `hotspotshade` runs, when `netstat -rn` shows a `0/1` or
+   `128.0/1` route through a utun or any `2000::/3` route (a lo0 blackhole or a
+   utun route), when a file, service, or start journal is present, or when it
+   cannot take the exclusive start-exclusion lease, which a starting, running,
+   or stopping session holds shared. It refuses when any check cannot
+   complete. Otherwise it removes `cleanup-blocked` and `engine-session`, each
+   guarded by its digest and mode, reads both names back, and prints every
+   check and every removal. It never deletes a route, an interface, or a lock
+   file, and never signals a process. It also refuses when another VPN uses
+   the same route shapes, because it cannot tell them apart. Load the helper
+   again with `sudo launchctl bootstrap system
+   /Library/LaunchDaemons/dev.hotspotshade.mac.helper.plist`, or use
+   `preview-uninstall` and a fresh `preview-install`.
 
 Do not use a route flush, a default-route delete, a broad `route delete`, or an
 interface teardown as part of this recovery. Those commands can remove another
 VPN's route, a required local route, or the network that the person needs to
 recover. If any route or device check is uncertain, or if an engine remains,
 stop and escalate. Do not clear the marker or the intent to make a start pass.
+
+## Start failure diagnostics
+
+A root engine that fails before it serves a request prints one fixed line on
+standard error: `hotspotshade-start-failure: <code>`. The codes are
+`arguments_invalid`, `control_descriptor_invalid`,
+`credentials_descriptor_invalid`, `token_invalid`,
+`credentials_handoff_invalid`, `listener_failed`, `port_file_failed`,
+`credentials_import_failed`, and `start_exclusion_descriptor_invalid`
+(`StartupStage` in `rust/src/main.rs`). The helper drains the engine's
+standard error for the engine's whole life, keeps at most the last 4 KiB in
+memory, and accepts only a line that is exactly the prefix and one of these
+codes. It never stores, logs, or sends any other engine output. When the
+engine printed no known line the helper uses `exited_without_reason`,
+`no_port_in_time`, or `secret_not_delivered`.
+
+On a failed start the helper writes the code to
+`/var/db/hotspotshade/last-start-failure` (root-owned, mode 0600, one line,
+at most 4 KiB, replaced on each failed start). It is diagnostics only: no
+start, stop, or cleanup decision reads it, and `preview-uninstall` and
+`preview-clear-cleanup-block` keep it. The helper also returns the code to the
+app: in the `engine_start` start error as `reason`, in the `engine_exited`
+notice with `failed_start`, and in the status reply as `last_reason` with
+`last_result` `failed_start`. The app then shows "The tunnel did not start."
+with one plain sentence for the code, never the cleanup block text.
 
 ## Files
 
@@ -415,6 +487,7 @@ stop and escalate. Do not clear the marker or the intent to make a start pass.
 | `.../ProtectedHelper/HelperLifecycle.swift` | One-session ownership, cancellation, parent loss, durable cleanup block. |
 | `.../ProtectedHelper/HelperCleanupBlock.swift` | Root-owned durable cleanup marker; fails closed on an unsafe or unreadable state. |
 | `.../ProtectedHelper/HelperLaunchIntent.swift` | Root-owned write-ahead launch intent; created before spawn and cleared only after a verified clean stop. |
+| `.../ProtectedHelper/HelperStartFailure.swift` | Fixed engine start failure reasons, the bounded stderr capture, and the root-only last-start-failure record. |
 | `.../ProtectedHelper/HelperStartExclusion.swift` | `start-exclusion` shared lock, descriptor handoff, and install journal presence gate. |
 | `.../ProtectedHelper/RootStateDirectory.swift` | Root-owned state directory and durable file create, read, sync, and remove. |
 | `.../ProtectedHelper/HelperHandshake.swift` | Fresh one-use connection handshake and nonce gate. |
@@ -427,6 +500,8 @@ stop and escalate. Do not clear the marker or the intent to make a start pass.
 | `macos/Helper/dev.hotspotshade.tunnel.start.plist` | Required administrator-right definition for the start right. |
 | `macos/HotspotShadeKit/Tests/HotspotShadeKitTests/ProtectedHelperTests.swift` | Hermetic trust, lifecycle, exclusion ordering, and journal-state tests. |
 | `macos/HotspotShadeKit/Tests/HotspotShadeKitTests/ProtectedHelperExclusionTests.swift` | Real Darwin flock, cross-process contention, lock safety, and install journal gate tests in a temporary directory. |
+| `macos/HotspotShadeKit/Tests/HotspotShadeKitTests/ProtectedHelperStartFailureTests.swift` | Failed start before a grant, descriptor placement in a real child, stderr reason parsing, and the record. |
+| `rust/tests/macos_root_launch_shape.rs` | Runs the real engine in the helper launch shape (descriptors 3 to 6, environment, argv) as the test user, including the old descriptor order that failed on 2026-11-06. |
 
 ## What is tested
 
@@ -462,9 +537,25 @@ the trust and lifecycle tests. The tests cover:
 - a non-zero or signaled stop blocks the next start;
 - a launcher that cannot stop an engine it just spawned blocks every later
   start;
-- an engine that exits before it reports its port blocks every later start;
-- an engine that exits on its own records the durable block and refuses a
-  later start;
+- an engine that exits before it reports its port is a failed start with its
+  fixed reason: no block, the launch intent cleared, the shared lock released,
+  and a later start allowed; a failed intent clear still blocks;
+- an engine that exits on its own after a grant attempt (even a failed grant
+  write), or whose exit the helper could not read, records the durable block
+  and refuses a later start, while a reaped exit before any grant attempt is a
+  failed start whose session record is `failed_start` with its reason;
+- an unclean stop before any grant is a failed start, and a timed-out stop
+  still blocks;
+- the launcher duplicates every inherited descriptor above the target numbers
+  first, and a real child receives the token, liveness, lock, and pairing
+  channels on 3, 4, 5, and 6; a mapping whose source could be a target is
+  refused;
+- the engine stderr capture drains to end of file, keeps at most 4 KiB, and
+  yields only a fixed engine reason code; a near match or extra text is no
+  reason; the engine codes match the Rust startup stages;
+- the last-start-failure record is one fixed code in a 0600 file;
+- the app says "The tunnel did not start" with the reason, never the cleanup
+  block text, and a `failed_start` record confirms the stop;
 - a durable marker is read by a new controller and is never cleared
   automatically;
 - an unreadable durable marker fails closed, and a marker write failure keeps
@@ -617,9 +708,10 @@ The following work is required before this can be called secure or shipped.
    routing table. Route cleanup remains the engine's job. The documented
    authorized human step is: verify that no engine remains, inspect the IPv4 and
    IPv6 routes and utun devices, stop the helper, keep `start-exclusion` in
-   place, and then stop and escalate. Removing `cleanup-blocked` or
-   `engine-session` by hand is not approved. A reviewed recovery for direct and
-   helper engines is still required. If an install journal is present, stop and
+   place, and on a preview host run `preview-clear-cleanup-block`, which repeats
+   those checks and removes only the two records; otherwise stop and escalate.
+   Removing `cleanup-blocked` or `engine-session` by hand is not approved. A
+   reviewed recovery outside the preview is still required. If an install journal is present, stop and
    use the installer coordinator recovery instead. A running helper keeps its
    in-memory block and its shared lock, so removing the helper files under it
    does not re-open starts or release the lock. Do not delete routes or

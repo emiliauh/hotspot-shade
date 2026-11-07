@@ -133,6 +133,10 @@ msbuild windows\src\HotspotShade.WinUI2\HotspotShade.WinUI2.csproj /restore /p:C
 - The build stops with a clear error when the broker, the starter, or the
   engine is missing from `windows\out\payload`. It warns when `wintun.dll` is
   missing; that package shows Turn on as unavailable.
+- CI compiles the app; the PC build stages and checks the payload. The CI
+  compile-check step passes `/p:HotspotShadeSkipPayloadCheck=true` because it
+  does not stage `windows\out\payload`. Do not pass that property for a
+  package that you install. The check stays on by default.
 - The password goes only on this command line. Do not put it in a file in the
   repository.
 

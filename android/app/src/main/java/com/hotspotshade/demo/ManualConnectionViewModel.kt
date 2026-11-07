@@ -250,7 +250,7 @@ class ManualConnectionViewModel(application: Application) : AndroidViewModel(app
             MainThreadClipboardClearScheduler(),
         ),
         connectionClipboard = AndroidConnectionClipboard(application),
-    )
+    ).also { it.setProxyRunning(false) }
 
     var state by mutableStateOf(session.state)
         private set
@@ -313,6 +313,7 @@ class ManualConnectionViewModel(application: Application) : AndroidViewModel(app
     fun setRunningPort(port: Int) {
         runningPort = if (port in 1..65_535) port else 0
         session.setPort(resolvedPort())
+        session.setProxyRunning(runningPort in 1..65_535)
         sync()
     }
 

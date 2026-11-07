@@ -89,7 +89,9 @@ impl ShapedEngine {
             }
             if let Ok(Some(status)) = self.child.try_wait() {
                 let stderr = std::fs::read_to_string(&self.stderr).unwrap_or_default();
-                return Err(format!("exited before the port: {status}; stderr: {stderr}"));
+                return Err(format!(
+                    "exited before the port: {status}; stderr: {stderr}"
+                ));
             }
             if Instant::now() > deadline {
                 return Err("no port before the deadline".into());
@@ -173,7 +175,10 @@ fn spawn_root_shape_with(label: &str, frame: Frame, layout: Layout) -> ShapedEng
         .custom_flags(libc::O_CLOEXEC)
         .open(directory.join("start-exclusion"))
         .unwrap();
-    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) }, 0);
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+        0
+    );
     let lock_meta = lock.metadata().unwrap();
 
     // Descriptor 6: the app's end of the user engine's handoff socket pair.
@@ -214,8 +219,14 @@ fn spawn_root_shape_with(label: &str, frame: Frame, layout: Layout) -> ShapedEng
         .env("LC_ALL", "C")
         .env("HOTSPOTSHADE_START_EXCLUSION_FD", "5")
         .env("HOTSPOTSHADE_START_EXCLUSION_VERSION", "1")
-        .env("HOTSPOTSHADE_START_EXCLUSION_DEVICE", lock_meta.dev().to_string())
-        .env("HOTSPOTSHADE_START_EXCLUSION_INODE", lock_meta.ino().to_string())
+        .env(
+            "HOTSPOTSHADE_START_EXCLUSION_DEVICE",
+            lock_meta.dev().to_string(),
+        )
+        .env(
+            "HOTSPOTSHADE_START_EXCLUSION_INODE",
+            lock_meta.ino().to_string(),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(error_handle));
@@ -245,7 +256,10 @@ fn spawn_root_shape_with(label: &str, frame: Frame, layout: Layout) -> ShapedEng
             // Move every source above the targets first, so no dup2 lands
             // on a source that a later dup2 still needs.
             let mut moved = [0; 4];
-            for (index, fd) in [token_read, parent_read, lock_fd, app_fd].iter().enumerate() {
+            for (index, fd) in [token_read, parent_read, lock_fd, app_fd]
+                .iter()
+                .enumerate()
+            {
                 moved[index] = libc::fcntl(*fd, libc::F_DUPFD, 20);
                 if moved[index] < 0 {
                     return Err(std::io::Error::last_os_error());
@@ -280,7 +294,9 @@ fn spawn_root_shape_with(label: &str, frame: Frame, layout: Layout) -> ShapedEng
 
 fn request(port: u16, method: &str, path: &str, body: &str) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     stream
         .write_all(
             format!(
@@ -316,7 +332,11 @@ fn a_helper_shaped_engine_imports_the_pairing_publishes_its_port_and_stops_clean
     // The engine is still alive after the app's status check, which is when
     // the app asks for the administrator authorization.
     std::thread::sleep(Duration::from_millis(500));
-    assert!(engine.child.try_wait().unwrap().is_none(), "{}", engine.stderr_text());
+    assert!(
+        engine.child.try_wait().unwrap().is_none(),
+        "{}",
+        engine.stderr_text()
+    );
     assert!(!engine.grant_file.exists());
     let status = engine.stop();
     assert!(status.success(), "a clean stop exits zero: {status}");
@@ -329,12 +349,13 @@ fn an_empty_handoff_fails_with_one_fixed_reason_line() {
         .wait_for_port(Duration::from_secs(10))
         .expect_err("an empty handoff must fail the launch");
     assert!(
-        engine.stderr_text().contains("hotspotshade-start-failure: credentials_handoff_invalid"),
+        engine
+            .stderr_text()
+            .contains("hotspotshade-start-failure: credentials_handoff_invalid"),
         "{error}"
     );
     let _ = engine.stop();
 }
-
 
 #[test]
 fn the_old_descriptor_order_put_the_token_pipe_on_the_credentials_number() {

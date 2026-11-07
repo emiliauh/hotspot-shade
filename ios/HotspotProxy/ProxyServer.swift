@@ -1270,6 +1270,7 @@ final class ProxyServer {
         // stays down until `configurePairing` supplies both.
         guard pairingConfigured else {
             if pairingListener != nil { stopPairingListener() }
+            clearPairingUnavailable()
             return
         }
         let observation: PairingListenerPolicy.Observation
@@ -1279,7 +1280,12 @@ final class ProxyServer {
         case .unreadable: observation = .unreadable
         }
         let interval = listener != nil ? HotspotPoll.runningSeconds : HotspotPoll.stoppedSeconds
-        switch pairingPolicy.observe(observation, listening: pairingListener != nil, pollInterval: interval) {
+        let action = pairingPolicy.observe(observation, listening: pairingListener != nil, pollInterval: interval)
+        // A failed bind leaves no listener, so the policy sends no stop when
+        // the hotspot goes away. The failure line names the pairing port, so it
+        // must not outlive the hotspot that it described.
+        if pairingPolicy.takeHotspotLoss() { clearPairingUnavailable() }
+        switch action {
         case .start(let address):
             // The pairing credentials need a usable IPv4 hotspot address. Any
             // other address is a failed start, not a listener with no result.
@@ -1292,6 +1298,13 @@ final class ProxyServer {
         case .stop: stopPairingListener()
         case .none: break
         }
+    }
+
+    /// Run on `queue`. Drop the unavailable line when its cause is gone.
+    private func clearPairingUnavailable() {
+        guard snapshot.pairingUnavailable else { return }
+        snapshot.pairingUnavailable = false
+        publish()
     }
 
     private func pairingFailed() {

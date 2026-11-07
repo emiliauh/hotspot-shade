@@ -228,14 +228,16 @@ public final class RootEngineLauncher: HelperEngineLaunching, @unchecked Sendabl
             throw HelperTrustError.engineStartFailed
         }
         actionsInitialized = true
-        // Standard input and output stay the helper's own. Standard error is
-        // the capture pipe, so the helper can read the engine's one fixed
-        // startup failure line.
-        for descriptor in Int32(0)..<2 where fcntl(descriptor, F_GETFD) != -1 {
-            guard posix_spawn_file_actions_addinherit_np(&actions, descriptor) == 0 else {
-                cleanupSpawnSetup()
-                throw HelperTrustError.engineStartFailed
-            }
+        // Standard input and output are /dev/null, never an inherited helper
+        // descriptor: a helper started with 0 or 1 closed would otherwise hand
+        // the engine one of its own pipes there. Standard error is the capture
+        // pipe, so the helper can read the engine's one fixed startup failure
+        // line.
+        guard posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0) == 0,
+              posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0) == 0
+        else {
+            cleanupSpawnSetup()
+            throw HelperTrustError.engineStartFailed
         }
         // The token goes to 3, the liveness pipe to 4, the start-exclusion
         // lock to 5, and the pairing handoff to 6. The helper never reads the

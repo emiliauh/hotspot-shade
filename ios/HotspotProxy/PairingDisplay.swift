@@ -36,7 +36,12 @@ struct PairingDisplay: Equatable {
     static let noTargetDevicesText = "No target devices are paired."
     /// The pairing listener could not bind or become ready. Another app can
     /// hold the pairing port, so the line names that local cause only.
-    static let pairingUnavailableText = "Pairing is not available. Another app may be using the pairing port. Close it and reopen HotspotShade."
+    static let pairingUnavailableText = "Pairing is not available. Another app may be using the pairing port. HotspotShade tries again while it is open."
+    /// The Settings help under an empty list of target devices.
+    static let emptyListText = "No target devices are saved. Open HotspotShade on a target device to pair."
+    /// What the pairing listener needs. The app starts it only when all three
+    /// hold, so the line must not promise it while the app is open alone.
+    static let listenerNeedsText = "The pairing listener runs only while this app is open, Personal Hotspot is on, and the app has a saved token."
 
     /// Build the one state from the snapshot values. Count authenticated
     /// sessions only, and only while one had traffic in the last 60 seconds.
@@ -94,6 +99,12 @@ struct PairingDisplay: Equatable {
         case .paired, .inUse: return pairedLine ?? Self.noTargetDevicesText
         case .unavailable: return Self.pairingUnavailableText
         }
+    }
+
+    /// The empty-list line. It adds the listener requirements unless the
+    /// listener is unavailable, because the status row above already says that.
+    var emptyListHelp: String {
+        activity == .unavailable ? Self.emptyListText : Self.emptyListText + " " + Self.listenerNeedsText
     }
 
     /// The Settings symbol. A paired target device uses a seal. A first
@@ -248,6 +259,8 @@ struct DashboardStatus: Equatable {
             PlainMessage.invalidPort,
             PlainMessage.noHotspot,
             PlainMessage.hotspotUnreadable,
+            PlainMessage.hotspotAmbiguous,
+            PlainMessage.hotspotUnsupportedStart,
             ListenerDisplayText.cancelled,
             ListenerDisplayText.waiting,
             ListenerDisplayText.waitExpired
