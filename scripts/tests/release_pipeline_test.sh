@@ -3742,7 +3742,7 @@ PLIST
     expect_status 1 "$status" "a strict artifact audit with a readable binary plist still fails on the standalone binary"
     expect_text "standalone binary carries no readable version" \
       "the audit must keep the standalone binary blocker"
-    expect_no_text "HotspotShade-iOS-unsigned.ipa: the artifact version cannot be verified" \
+    expect_no_text "HotspotShade-iOS-unsigned.ipa: CFBundleShortVersionString: the artifact version cannot be verified" \
       "plutil must let the audit verify the binary app plist version"
   else
     printf 'bplist00\000\000\000\000\000\000\000\000' \
@@ -3751,7 +3751,7 @@ PLIST
     sh "$tree/scripts/release_manifest.sh" "$artifacts" >/dev/null
     audit_status --artifacts "$artifacts" --require-aligned-versions
     expect_status 1 "$status" "a strict artifact audit must fail closed on an unreadable binary plist"
-    expect_text "HotspotShade-iOS-unsigned.ipa: the artifact version cannot be verified" \
+    expect_text "HotspotShade-iOS-unsigned.ipa: CFBundleShortVersionString: the artifact version cannot be verified" \
       "the audit must name the unverified binary plist version"
   fi
   cp "$work/ipa-plist.xml" "$work/ipa/Payload/HotspotProxy.app/Info.plist"

@@ -148,6 +148,15 @@ die() {
   exit 1
 }
 
+# Refuse to report success when stdout is closed. The success message is written
+# by an external cat, and a writer built on a runtime that reopens a closed
+# standard descriptor as /dev/null (uutils coreutils, the default on newer
+# Ubuntu) reports success for a write nobody can read. The probe runs in a
+# subshell so a failed dup cannot end this shell in dash.
+require_open_stdout() {
+  ( exec 3>&1 ) 2>/dev/null || die "Standard output is closed; the final result could not be reported."
+}
+
 # Print the lower-case SHA-256 of a regular file. Return non-zero for an
 # unreadable path or an empty/malformed digest. The caller must not treat an
 # empty string as a digest.
@@ -2023,6 +2032,7 @@ if [ "$mode" = verify ]; then
     printf 'Verified %s files (corruption check only; supply --expect-sha256 for an independent digest). Archive SHA-256 %s.\n' \
       "$file_count" "$actual_sum" > "$work/success"
   fi
+  require_open_stdout
   cat "$work/success"
   exit 0
 fi
@@ -2455,4 +2465,5 @@ build_outputs_pending=1
 
 printf 'Wrote %s with %s files. Archive SHA-256 %s.\n' \
   "$output" "$file_count" "$archive_sum" > "$work/success"
+require_open_stdout
 cat "$work/success"

@@ -70,7 +70,6 @@ if ($sdkVersion.Major -ne 8 -or $sdkVersion -lt $minimumSdk) {
     throw ("The .NET SDK in use is $sdkText. This build needs .NET SDK 8.0.427 or a later 8.0.x SDK. " +
         "Install it from https://dotnet.microsoft.com/download/dotnet/8.0 and run this script again.")
 }
-$1
 # Run dotnet from the windows folder so it reads windows\global.json.
 function Invoke-WindowsDotnet([string]$Failure, [string[]]$Arguments) {
     Push-Location -LiteralPath $windows

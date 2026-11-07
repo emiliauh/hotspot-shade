@@ -418,7 +418,8 @@ final class ProtectedHelperStartFailureTests: XCTestCase {
         defer { posix_spawnattr_destroy(&attributes) }
         XCTAssertEqual(posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT)), 0)
         let script = "for fd in 3 4 5 6; do /bin/dd bs=1 count=1 <&$fd 2>/dev/null; done"
-        let argv: [UnsafeMutablePointer<CChar>?] = ["/bin/sh", "-c", script].map { strdup($0) } + [nil]
+        let words: [String] = ["/bin/sh", "-c", script]
+        let argv: [UnsafeMutablePointer<CChar>?] = words.map { strdup($0) } + [nil]
         defer { for pointer in argv { free(pointer) } }
         var child: pid_t = 0
         XCTAssertEqual(posix_spawn(&child, "/bin/sh", &actions, &attributes, argv, nil), 0)

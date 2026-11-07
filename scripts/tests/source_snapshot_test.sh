@@ -655,6 +655,10 @@ pass
 mkdir -p "$tmp/closedout" "$tmp/closedout-bin"
 cat > "$tmp/closedout-bin/cat" <<EOF
 #!/bin/sh
+# A closed descriptor fails the write under GNU and BSD cat, but a Rust cat
+# reopens it as /dev/null and reports success. Fail the write with ENOSPC
+# where /dev/full exists, and fall back to a closed descriptor elsewhere.
+if [ -w /dev/full ]; then exec "$real_cat" "\$@" > /dev/full; fi
 exec "$real_cat" "\$@" >&-
 EOF
 chmod +x "$tmp/closedout-bin/cat"
@@ -939,6 +943,10 @@ pass
 mkdir -p "$tmp/claimout" "$tmp/claimout-bin"
 cat > "$tmp/claimout-bin/cat" <<EOF
 #!/bin/sh
+# A closed descriptor fails the write under GNU and BSD cat, but a Rust cat
+# reopens it as /dev/null and reports success. Fail the write with ENOSPC
+# where /dev/full exists, and fall back to a closed descriptor elsewhere.
+if [ -w /dev/full ]; then exec "$real_cat" "\$@" > /dev/full; fi
 exec "$real_cat" "\$@" >&-
 EOF
 chmod +x "$tmp/claimout-bin/cat"
