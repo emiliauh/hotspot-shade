@@ -463,7 +463,10 @@ namespace HotspotShade.WinUI2.Core.Tests
                 string starterProject = File.ReadAllText(Path.Combine(root, "src", "HotspotShade.WinUI2.Elevate", "HotspotShade.WinUI2.Elevate.csproj"));
                 AssertEx.Contains(starterProject, "<PublishAot>true</PublishAot>", "the elevated starter has no .NET host");
                 string stage = File.ReadAllText(Path.Combine(root, "tools", "stage_payload.ps1"));
-                AssertEx.Contains(stage, "-p:PublishAot=true", "the payload publishes the starter with NativeAOT");
+                // PublishAot comes from the starter project. A global -p property
+                // would also reach the netstandard2.0 Core reference (NETSDK1207).
+                AssertEx.DoesNotContain(stage, "-p:PublishAot", "no global PublishAot property");
+                AssertEx.Contains(stage, "the NativeAOT publish did not produce a single native program", "the payload checks the starter is native");
                 string pipe = File.ReadAllText(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", "RendezvousPipe.cs"));
                 AssertEx.Contains(pipe, "(A;;RC;;;OW)", "the pipe owner cannot take WRITE_DAC");
                 AssertEx.Contains(launcher, "SetApartmentState(System.Threading.ApartmentState.STA)", "ShellExecuteEx runs on an STA thread");

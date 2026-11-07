@@ -85,9 +85,11 @@ Turn on is the only operation that asks Windows for administrator approval
 (`ElevationPolicy`). The broker:
 
 1. Checks that the user engine is paired and has no tunnel, that the starter,
-   the engine, and `wintun.dll` are in the package, and that the package is
-   installed in a WindowsApps package store (`Program Files\WindowsApps` or
-   `X:\WindowsApps` on another volume).
+   the engine, and `wintun.dll` are in the package, and that the package path
+   names a WindowsApps package store (`Program Files\WindowsApps` or
+   `X:\WindowsApps` on another volume). This text check is only a quick
+   pre-filter that shows Turn on as unavailable early; the starter makes the
+   trust decision (below).
 2. Creates the token pipe and the parent-liveness pipe (not inheritable) and a
    one-instance named pipe with a random 128-bit name, `PIPE_REJECT_REMOTE_CLIENTS`,
    and an access list that admits only elevated Administrators and SYSTEM and
@@ -108,13 +110,31 @@ The starter is published with NativeAOT. It has no .NET host, so no
 process writes into the user environment can load code into the elevated
 process. It checks elevation with the token's `TokenElevation` value,
 refuses to run unelevated, opens the pipe with
-identification-level impersonation only, checks that the pipe server is the
-packaged broker by image path, duplicates the three handles into itself,
-checks that each one is a pipe, and starts the packaged engine with a fixed
+identification-level impersonation only, finds the package root from the final
+path of its own image, and checks that the pipe server is the packaged broker
+by process id and the final path of its image before it reads the request.
+Before it duplicates any handle or creates any process it verifies the install
+location: it opens the package root, the `Engine` folder, the engine, and
+`wintun.dll` (`FILE_READ_ATTRIBUTES | READ_CONTROL`, backup semantics), resolves
+each final path (`GetFinalPathNameByHandleW`), requires the root to be in a
+WindowsApps package store and every other path to be where the package puts it
+inside that root (so no link leads out), and reads each owner and DACL
+(`GetSecurityInfo`). The owner must be TrustedInstaller or SYSTEM, a DACL must be
+present, and no allow entry may give a change right (write, add file, add
+subfolder, delete, delete child, write attributes, `WRITE_DAC`, `WRITE_OWNER`,
+generic write or all) to any account other than TrustedInstaller, SYSTEM, or
+Administrators, which rejects Users, Authenticated Users, Everyone, and the
+creator SIDs. Its own image must pass the same check. The rule is pure Core code
+(`InstallSecurity`) with tests. The starter keeps these handles open without
+delete sharing until the engine process exists. It then duplicates the three
+handles into itself, checks that each one is a pipe and that no two name the
+same object (`CompareObjectHandles`), and starts the packaged engine with a fixed
 argument list, `--credentials-fd`, an explicit inherited-handle list, and a
 fixed environment block (`SystemRoot`, `windir`, `PATH`, `TEMP`, and a few
 system values from `GetWindowsDirectoryW`), never the user environment. It
-answers with the engine process id and exits. It never reads the secret or
+answers with the engine process id and exits. If its watchdog fires or an
+unexpected error occurs, it first sends a best-effort failure reply on the
+rendezvous pipe, and it treats a reply that it could not write as a failure. It never reads the secret or
 the pairing frame. The broker opens the engine process, checks its image path,
 waits for its listener, writes a new bearer secret, keeps the parent-liveness
 write end, and sends `POST /api/start` with `mode` `phone` and the Let ping

@@ -158,6 +158,28 @@ The install folder is under `C:\Program Files\WindowsApps\` (or
 `X:\WindowsApps\` when new apps go to another drive), which only Windows can
 change. The elevated engine loads `wintun.dll` from there.
 
+At Turn on the elevated starter checks the install itself before it starts
+anything: it opens the package folder, the `Engine` folder, the engine, and
+`wintun.dll`, follows each to its final path, and requires that path to be in a
+WindowsApps package store, the owner to be TrustedInstaller or SYSTEM, and no
+access entry to let an account other than TrustedInstaller, SYSTEM, or
+Administrators change it. The folder name alone is not enough. To see what it
+checks, run in PowerShell:
+
+```powershell
+ = (Get-AppxPackage HotspotShade.Windows).InstallLocation
+foreach ( in @(, "\Engine", "\Engine\hotspotshade.exe", "\Engine\wintun.dll", "\Elevate\HotspotShade.WinUI2.Elevate.exe")) {
+    (Get-Item -LiteralPath ).Target   # empty: not a link
+    icacls 
+    (Get-Acl -LiteralPath ).Owner
+}
+```
+
+Expected: owner `NT SERVICE\TrustedInstaller` (or `NT AUTHORITY\SYSTEM`),
+and `BUILTIN\Users` with `(RX)` only. If Turn on reports "not installed from a
+package in a protected Windows apps folder" on an installed package, send this
+output with the report.
+
 ## 6. First launch, no hotspot yet
 
 1. Start **HotspotShade** from the Start menu. **No UAC prompt may appear.** If
@@ -173,8 +195,10 @@ change. The elevated engine loads `wintun.dll` from there.
      the staged engine refused `--handoff-fd`. Rebuild the engine from the
      current source (see section 10).
    - "wintun.dll is missing": restage with `-Wintun` and rebuild.
-   - "not installed from a package": you started a Visual Studio loose-file
-     deployment. Install the signed package instead.
+   - "not installed from a package in a protected Windows apps folder": you
+     started a Visual Studio loose-file deployment, or the install folder
+     failed the starter's owner and access check (see section 5). Install the
+     signed package instead.
 
 ## 7. First real test with an iPhone hotspot
 
@@ -294,6 +318,13 @@ above before anything else.
   mode. See README.md.
 - The package can live in `C:\Program Files\WindowsApps` or in
   `X:\WindowsApps` when Windows installs apps on another volume. Any other
-  folder refuses Turn on.
+  folder refuses Turn on. The folder name is only a pre-filter: the elevated
+  starter also requires the final path (after links), a TrustedInstaller or
+  SYSTEM owner, and a DACL that gives no change right to Users, Authenticated
+  Users, Everyone, the creator SIDs, or any account other than
+  TrustedInstaller, SYSTEM, and Administrators. A `WindowsApps` folder that a
+  user created on another drive fails that check. This check has not run on
+  Windows yet; if real package folders carry an extra entry, Turn on reports
+  the install as untrusted.
 - A Visual Studio F5 deployment is for UI work only. Turn on is refused there
   because its folder is user-writable.

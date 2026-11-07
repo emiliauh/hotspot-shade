@@ -65,9 +65,11 @@ if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed for the broker with exit
 # The elevated starter runs with administrator rights. NativeAOT removes the
 # .NET host, so no startup hook, profiler, or DOTNET_ROOT value from the user
 # environment can load code into it. This needs the MSVC linker from the
-# Visual Studio "Desktop development with C++" workload.
+# Visual Studio "Desktop development with C++" workload. PublishAot comes from
+# Elevate.csproj. Do not pass PublishAot as a global -p property here: it also
+# reaches the netstandard2.0 Core reference and fails with NETSDK1207.
 Write-Host "Publishing the elevated starter (NativeAOT)."
-& dotnet publish (Join-Path $windows "src\HotspotShade.WinUI2.Elevate\HotspotShade.WinUI2.Elevate.csproj") -c Release -r win-x64 -p:PublishAot=true -o (Join-Path $payload "Elevate")
+& dotnet publish (Join-Path $windows "src\HotspotShade.WinUI2.Elevate\HotspotShade.WinUI2.Elevate.csproj") -c Release -r win-x64 -o (Join-Path $payload "Elevate")
 if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed for the elevated starter with exit code $LASTEXITCODE." }
 $managed = Get-ChildItem -LiteralPath (Join-Path $payload "Elevate") -Filter "*.dll" -ErrorAction SilentlyContinue
 if ($managed) { throw "The elevated starter folder holds DLLs; the NativeAOT publish did not produce a single native program." }

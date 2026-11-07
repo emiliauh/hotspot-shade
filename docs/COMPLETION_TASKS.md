@@ -94,7 +94,7 @@ Linux and Android, with parallel hermetic work on all of them.
 - [ ] L4. Still open: real Rust helper with pkexec and polkit, TUN and route cleanup on a live hotspot, a Linux run of the new test.
 - [x] L5. (done 2026-11-06, reviewed; npm test 317, 313 pass, 0 fail, 4 skipped; not run on Linux) Packaging fixes: prerm/postrm, build-host and Depends, helper EPIPE panic, opaque exit 1, README root-process claim.
 - [x] L6. (done 2026-11-06, reviewed; npm test 341, 337 pass, 0 fail; not run on Linux; HS2 handoff via helper fd 2 because pkexec closes fds above 2; old root identity unused, pair once again; packaged app has no demo) Was: the packaged app runs pkexec at window open (violates invariant 14 and needs a polkit agent). Move the dashboard, pairing, and settings to an unprivileged user engine and ask only at tunnel start, as on macOS.
-- [ ] L7. Linux review (2026-11-06): HIGH helper exit 1 before spawn locks the session as an unconfirmed stop (same class as the Mac Turn-on bug); confirmed stop reported failed when the user engine is gone; recovery actions unreachable while cleanup pending; stale status poll; engine start reason discarded; HS2 untested. Fix in progress.
+- [x] L7. (fixed 2026-11-06, reviewed; npm test 349/338 pass 0 fail; with engine 363/359 0 fail) Linux review (2026-11-06): HIGH helper exit 1 before spawn locks the session as an unconfirmed stop (same class as the Mac Turn-on bug); confirmed stop reported failed when the user engine is gone; recovery actions unreachable while cleanup pending; stale status poll; engine start reason discarded; HS2 untested. Fix in progress.
 
 ## Source app parity (from the 2026-11-06 review)
 
@@ -183,7 +183,7 @@ smoke-test seam that no app offers.
 
 ## Linux evidence (needs owner approval)
 
-- [ ] LE1. docs/LINUX_EVIDENCE_PROPOSAL.md recommends a git archive of the
+- [ ] LE1. (OWNER APPROVED 2026-11-06; run after the Linux session fix is committed) docs/LINUX_EVIDENCE_PROPOSAL.md recommends a git archive of the
   committed branch, SHA-256 pinned, extracted with tar --no-same-owner as an
   unprivileged user on a disposable Boat Ubuntu 24.04 amd64 sandbox, for the
   Rust/helper tests, npm test, Xvfb checks, and a .deb build. Needs the owner's
@@ -191,6 +191,6 @@ smoke-test seam that no app offers.
 
 ## Android review follow-ups (2026-11-06)
 
-- [ ] A1. FLAG_SECURE cleared before the recents snapshot; background tick port
+- [x] A1. (fixed 2026-11-06: hold FLAG_SECURE until foreground with token hidden, port-owner fence, registry under lock, copy note when stopped; 940 tests, lint 0 errors) FLAG_SECURE cleared before the recents snapshot; background tick port
   race; host registry leak on failed start; copied saved port while stopped
   (fix in progress).
