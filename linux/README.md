@@ -765,7 +765,8 @@ container network namespace.
 
 The liveness test observes release of the helper's socket, then freezes the
 helper within the source-defined grace period. It checks that the engine is
-still alive after the freeze and exits while the helper remains frozen. Socket
+observed inside the grace window and exits while the helper remains frozen; the
+engine may already have exited on EOF, which is the behavior under test. Socket
 release precedes the freeze; the observations do not establish the exact time
 the engine received EOF or exclude every other exit cause. Timing or identity
 uncertainty fails the test. The grace value comes from the helper source at test

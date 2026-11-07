@@ -364,13 +364,24 @@ impl HelperSession {
      *   3. Freeze the helper with SIGSTOP and require that this happened
      *      inside the grace window. A late freeze fails as inconclusive; it
      *      never passes.
-     *   4. Wait for the engine to exit while the helper is frozen. It has only
-     *      A zombie counts as exited. This does not exclude every exit cause.
-     *   5. Resume the helper so it reaps the engine and reports its status.
+     *   4. Look at the engine once, after the freeze is confirmed, and require
+     *      that this look is also inside the grace window. The engine got
+     *      its EOF when the helper released the socket, so it may already be
+     *      gone: a fast engine exits within milliseconds, before the SIGSTOP
+     *      lands. That is the behavior under test, not a defect. Because the
+     *      helper cannot send SIGTERM before `closed_at + grace`, an engine
+     *      that is gone, or still alive, inside that window left (or is
+     *      leaving) without a helper signal. A zombie counts as exited. This
+     *      does not exclude every exit cause.
+     *   5. Wait for the engine to exit while the helper is frozen if it has not
+     *      yet. A frozen helper cannot signal during this wait.
+     *   6. Resume the helper so it reaps the engine and reports its status.
      *
-     * The only timing bound that can fail a correct run is the freeze deadline,
-     * and it fails closed. The engine wait is long and does not decide the
-     * proof. */
+     * The only timing bound that can fail a correct run is the grace window
+     * for the freeze and the engine look, and it fails closed. The engine wait
+     * is long and does not decide the proof. An engine that exited before the
+     * freeze is not an inconclusive result: nothing in that order can have
+     * sent a signal. */
     fn close_and_prove_liveness_exit(&mut self, engine_pid: u32, engine_start_time: u64) {
         let grace = helper_eof_grace();
         let before = self.liveness_sockets();
@@ -415,10 +426,19 @@ impl HelperSession {
             frozen_after < grace,
             "inconclusive: helper froze {frozen_after:?} after close, past {grace:?}"
         );
+        /* The engine may already have left on the liveness EOF. Record which
+         * order happened, and bound the look by the same grace window as the
+         * freeze: both must precede the earliest possible helper SIGTERM. */
+        let engine_gone_at_freeze = support::process_exited(engine_pid, engine_start_time)
+            .expect("inconclusive: cannot inspect engine");
+        let observed_after = closed_at.elapsed();
         assert!(
-            !support::process_exited(engine_pid, engine_start_time)
-                .expect("inconclusive: cannot inspect engine"),
-            "inconclusive: engine exited before helper was frozen"
+            observed_after < grace,
+            "inconclusive: engine inspected {observed_after:?} after close, past {grace:?}"
+        );
+        assert!(
+            matches!(self.group.wait_leader_frozen(Duration::ZERO), Ok('T' | 't')),
+            "inconclusive: helper was not frozen when the engine was inspected"
         );
         /* A frozen helper cannot send a signal during this wait. */
         wait_for_process_exit(engine_pid, engine_start_time, ENGINE_LIVENESS_EXIT_BUDGET);
@@ -427,7 +447,8 @@ impl HelperSession {
             "inconclusive: helper did not remain frozen"
         );
         eprintln!(
-            "liveness exit proof: helper state {state} {frozen_after:?} after the request closed (SIGTERM grace {grace:?}); the engine left while the helper was frozen"
+            "liveness exit proof: helper state {state} {frozen_after:?} after the request closed (SIGTERM grace {grace:?}); the engine was {} when the helper froze and left with the helper frozen",
+            if engine_gone_at_freeze { "already gone" } else { "still alive" }
         );
         if state != 'Z' {
             self.group

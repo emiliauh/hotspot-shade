@@ -185,7 +185,7 @@ smoke-test seam that no app offers.
 
 ## Linux evidence (needs owner approval)
 
-- [~] LE1. (RUN 1 done on 417c6d43, Boat Ubuntu 24.04: helper 92 + container 26 pass, Xvfb settings + a11y pass, .deb build and install/remove/purge pass; 3 Linux-only failures being fixed: clippy dead_code, dash fd>9 in a test, flock fork in a test; evidence docs/evidence/linux-boat-2026-11-06/; sandbox deleted) docs/LINUX_EVIDENCE_PROPOSAL.md recommends a git archive of the
+- [~] LE1. (RUN 1 done on 417c6d43, Boat Ubuntu 24.04: helper 92 + container 26 pass, Xvfb settings + a11y pass, .deb build and install/remove/purge pass; 3 Linux-only failures fixed in dc2e281c (verified in local Linux containers); run 2 on dc2e281c: all steps pass except an intermittent opt-in helper integration test (real_engine_demo, 2 of 4 runs "engine exited before helper was frozen"; fix in progress); evidence docs/evidence/linux-boat-2026-11-06-run2/; evidence docs/evidence/linux-boat-2026-11-06/; sandbox deleted) docs/LINUX_EVIDENCE_PROPOSAL.md recommends a git archive of the
   committed branch, SHA-256 pinned, extracted with tar --no-same-owner as an
   unprivileged user on a disposable Boat Ubuntu 24.04 amd64 sandbox, for the
   Rust/helper tests, npm test, Xvfb checks, and a .deb build. Needs the owner's

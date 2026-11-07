@@ -1,0 +1,54 @@
+step	exit	log_sha256	note
+apt-update	0	f718cc1a613275d58111256d9c30e5d321f60ec81ca7e2d94c18613d03dcc487	
+apt-deps-install	0	-	log overwritten by a later step of the same name; exit 0 and 39 s observed live; see apt-deps-install-history
+versions	0	184df522cffac8c22edd55ae3d44afbb74e1c9bc54cfe51af451dcbc114027c8	
+rust-fmt-check	0	80bc9915eb17da78cacfbb89e2f647221ed5148261fa3d9de583975c9dcaa438	
+rust-check	0	aae0299f5d1f2d7d3e18c42aa9355983b9c636cfbb5e23baffc4dffaded999eb	
+rust-clippy	0	e395d173b04508124ff7f7b1b4ae388d56e82b61346154705b0340bb04b1f680	
+rust-test	0	dbae6156cef67f45365cf98ef1ad7ea67c4abc044cbd63c182d12fc758115478	
+helper-test	0	80583ee9bbc0ec843d9b1b7dfdf5d3fc99f672f0bab7db726ae4a284a4774be2	
+helper-clippy	0	7f1054b658920ac5fdef6dae9f45b2a5553f9a987d9f283f597681c613993c5c	
+engine-debug-build	0	d887f2c68a4121c1c2658b70d1143e27d5fb58051e58c541b962d6c7958763cd	
+helper-image-pull	0	0bfe3aebbfa5bf55f8d840ad1cb9b5c26d270aad17368f1c4fdd5101b2e8aa83	
+helper-image-inspect	0	e04552d6b3b08c27eda260cd7b7b4cb3ea777f8db90f53e8ddd1bcd7652358c1	
+helper-integration	101	9f8c168991421f0156b004784a2a817992479cdc1a2a23eb18c68f4e8e9b0280	required run: FAIL, real_engine_demo inconclusive (see README)
+helper-integration-cleanup	2	e076533652ca0ee333325f022f955c6f9244381a41ca9170cfa6bdf73fcbed42	exit 2 expected: the failed run keeps its evidence dir
+helper-integration-rerun1	0	aa5ef90aaafb7ee159c22c2eace26b2f190a9d9569a7b057bf05cd594816f0b9	supplementary rerun
+helper-integration-rerun2	101	a5e13ae50bb3702d354d088aa0365561746aebbc9196b34fe46cfb96d848cc3a	supplementary rerun
+helper-integration-rerun3	0	6692f579fbe921f74757dee3a5a5c98f66992e04ca28ecbe842f338db7dfb002	supplementary rerun
+npm-ci	0	d6b344e3968451cfb12b0fe444f602d5f178418464b5249e3be123d01c2ae8b4	
+npm-test	0	ac0877ae29c89765d1bed0bc46056a97e9f5703e613df464802ce5b115866fe5	
+npm-test-real-engine	0	466a691285971e822592309a89f333de2a73c5f05f982fb925bdc59c136fb30d	
+npm-ls	2	09ade0ddd9ce0e7b55f86a60a349e8f76f69a0997011d0e3fd6a3a71e9ad63cb	own check for chrome-sandbox before the electron fetch; not a project test
+electron-fetch	0	34aeb2077838afa2a4db7fec898b467f8bc2e3daee38f4b0a18f488d4a8cd80d	
+electron-dist	0	854a1cac168c33d6d71b5d2699a619423e6351fde320dc0a427ad93e9e71aabe	
+npm-test-with-electron	0	8cf6628b6c2a35e629f14c0e0bc21c6d3a4e14cd15c8fa465ba576eb3a9b2a3a	
+npm-test-real-engine-with-electron	0	a612f1083fcc171ec1690ec70cc1c4f184d8df8d4e92bc77610fe2daa03bfdc3	
+xvfb-version	0	fb49d3cfa9ee20dedb4bd255cc48db612d7bbc61d2c9d1234438ca665c176a3e	
+settings-window	0	0a87ed6a980b27f921b2c6caecaecf26e828f2c6c4d52275625417351f290961	
+a11y	0	3d33a15ed3ce8bb2109db844fa92f95bdbe80b07c581715ed31678a6b8739e08	
+package-deb	0	d128716c216c4863b58181133a3084ce94ada6f16638c94d1bf089e10af38da7	
+package-deb-warning-check	0	c7de65e0cfc664eca4c4f90da98ba15cae183d3fda14e5e2773d1c080fb3add6	
+deb-info	0	52975f26395e2bdc5ce4c5d250d514302a8794d1eec56fb8b8b39fddd5adcbd5	
+deb-contents	0	8563397debe8148b1187c5d29a6db43fced23e2ed27a52b269c334e87af38be1	
+deb-maintainer-scripts	0	5d428fe5547b90ff2a61c99c661aec674319c350ac0e07edc9bd62b1d54191db	
+apt-pre-state-pass1-empty-netsnapshot	0	fccad506b3c7cfa067c4effe14daeb7533982cd50ada613e1f2aeeaf0f2f2077	first pass: network snapshot was empty (shell function not visible in bash -c); superseded by the unsuffixed rows
+apt-install-pass1-empty-netsnapshot	0	adb6bf54707237ff8239f5ba316386069191d87e2981c3f07b92b461a50bfe0e	first pass: network snapshot was empty (shell function not visible in bash -c); superseded by the unsuffixed rows
+apt-installed-state-pass1-empty-netsnapshot	0	b3690be1dca65eae4ec069bff54af8a223169dd81f029ebd88575b2fbb818f50	first pass: network snapshot was empty (shell function not visible in bash -c); superseded by the unsuffixed rows
+apt-remove-pass1-empty-netsnapshot	0	342d57f2b38828ac57d81526b3aaedbdf66008fef44130e39a490e684927be4f	first pass: network snapshot was empty (shell function not visible in bash -c); superseded by the unsuffixed rows
+apt-removed-state-pass1-empty-netsnapshot	0	70f6be1131e3dcbe62e40d71d89f6b8edbb1e52b5e0f4523f0641ebe0602ff79	first pass: network snapshot was empty (shell function not visible in bash -c); superseded by the unsuffixed rows
+apt-purge-pass1-empty-netsnapshot	0	5add3e28e38ffe0c3cd6c560288bc8e9a64386f346130e9f483b47de0f3dd1b5	first pass: network snapshot was empty (shell function not visible in bash -c); superseded by the unsuffixed rows
+apt-purged-state-pass1-empty-netsnapshot	0	346e8b99f76095e33d2f4bd5741a32dbdaa3ddfa90c7fe6d95f9bc016ba69af1	first pass: network snapshot was empty (shell function not visible in bash -c); superseded by the unsuffixed rows
+apt-net-diff-pass1-empty-netsnapshot	0	acaa69e3ca62ecb9b7cfc5e84e8439c8b265aba84e2a4f3cf602d219a6ed48e6	first pass: network snapshot was empty (shell function not visible in bash -c); superseded by the unsuffixed rows
+apt-pre-state	0	e8c1ab3911665ab3256be47832d53aa7873ca60273a22195c9a9f0e620feff9b	
+apt-install	0	5da6da1fc68dfc37df5e4ce6b4b417fd15dcd6175a057b02eeb814f4f4d8823f	
+apt-installed-state	0	0b8161a9a3242d193088049dc166371acf636fafc27a51470a65f4e736b8a318	
+apt-remove	0	de246fb03e6e7ef240e777f8bb2cf6c00080e985bbb46a7761e7a9ac925fa2df	
+apt-removed-state	0	70f6be1131e3dcbe62e40d71d89f6b8edbb1e52b5e0f4523f0641ebe0602ff79	
+apt-purge	0	e316f82df8c35e7edcb361cfd76ac8d4e839ffa6fd510d96fd2830163951d533	
+apt-purged-state	0	be30f6aa87f536b6328be2c3af9f074ede6ee0d483ae4c459c2a263cb8db267c	
+apt-net-diff	0	65e4b03e4c9d8a8b27edc9a4c0a73544ac4dcd825ff3376ca52c171f63a14449	
+apt-deps-install-history	0	7061d5b67c4f5cc60e297c9e918ec63ecb000be944dd4e955a157e8140704d7c	
+final-residue-check	0	0e228b6d0dddd9ce186524a6a2101a083ff64ad890140540923bb0788fb003db	
+test-counts	0	56e436080531c21bf13fdeb28a02baa62310531f1240c7a3fca64becd95a96a5	computed on the Mac from the copied logs
+extract-verify	0	89d2a3a4d4a56244d00ea237d50cbe60af8e44a9bb670c7f6a5e3ee007155d09	sandbox-side archive verification and extraction (stdout of hs-extract.sh)

@@ -1,0 +1,39 @@
+## ip -br link
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP> 
+ens3             UP             52:54:00:aa:01:24 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+enp7s0           UP             52:54:00:aa:02:24 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+docker0          DOWN           6e:3f:e2:1d:f8:7e <NO-CARRIER,BROADCAST,MULTICAST,UP> 
+wg0              UNKNOWN        <POINTOPOINT,NOARP,UP,LOWER_UP> 
+## ip rule
+0:	from all lookup local
+32766:	from all lookup main
+32767:	from all lookup default
+## ip route show table all
+default via 192.168.122.1 dev enp7s0 proto dhcp src 192.168.122.36 metric 100 
+10.77.0.0/16 dev wg0 proto kernel scope link src 10.77.3.115 
+172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1 linkdown 
+192.168.122.0/24 dev enp7s0 proto kernel scope link src 192.168.122.36 metric 100 
+192.168.122.1 dev enp7s0 proto dhcp scope link src 192.168.122.36 metric 100 
+local 10.77.3.115 dev wg0 table local proto kernel scope host src 10.77.3.115 
+broadcast 10.77.255.255 dev wg0 table local proto kernel scope link src 10.77.3.115 
+local 127.0.0.0/8 dev lo table local proto kernel scope host src 127.0.0.1 
+local 127.0.0.1 dev lo table local proto kernel scope host src 127.0.0.1 
+broadcast 127.255.255.255 dev lo table local proto kernel scope link src 127.0.0.1 
+local 172.17.0.1 dev docker0 table local proto kernel scope host src 172.17.0.1 
+broadcast 172.17.255.255 dev docker0 table local proto kernel scope link src 172.17.0.1 linkdown 
+local 192.168.122.36 dev enp7s0 table local proto kernel scope host src 192.168.122.36 
+broadcast 192.168.122.255 dev enp7s0 table local proto kernel scope link src 192.168.122.36 
+2001:41d0:a:440d:100::24 dev ens3 proto kernel metric 256 pref medium
+fe80::/64 dev ens3 proto kernel metric 256 pref medium
+fe80::/64 dev enp7s0 proto kernel metric 256 pref medium
+default via 2001:41d0:a:440d:100::1 dev ens3 proto static metric 1024 onlink pref medium
+local ::1 dev lo table local proto kernel metric 0 pref medium
+local 2001:41d0:a:440d:100::24 dev ens3 table local proto kernel metric 0 pref medium
+local fe80::5054:ff:feaa:124 dev ens3 table local proto kernel metric 0 pref medium
+local fe80::5054:ff:feaa:224 dev enp7s0 table local proto kernel metric 0 pref medium
+multicast ff00::/8 dev ens3 table local proto kernel metric 256 pref medium
+multicast ff00::/8 dev enp7s0 table local proto kernel metric 256 pref medium
+multicast ff00::/8 dev wg0 table local proto kernel metric 256 pref medium
+## ip -6 rule
+0:	from all lookup local
+32766:	from all lookup main
