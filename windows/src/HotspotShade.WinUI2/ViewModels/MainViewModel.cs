@@ -1,5 +1,6 @@
 using System;
 using System.Collections.ObjectModel;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Threading.Tasks;
 using HotspotShade.WinUI2.Core.App;
@@ -27,6 +28,7 @@ namespace HotspotShade.WinUI2.ViewModels
         private bool polling;
         private bool activityVisible;
         private bool started;
+        private LogLine activityNewest;
 
         public MainViewModel(BrokerConnection broker, CoreDispatcher dispatcher)
         {
@@ -189,7 +191,8 @@ namespace HotspotShade.WinUI2.ViewModels
         public async Task LoadActivityAsync(bool reset)
         {
             await session.LoadActivityAsync(reset);
-            RebuildActivity();
+            // A reset reads a new log from the start: rebuild all rows.
+            RebuildActivity(reset);
             Rebuild();
         }
 
@@ -215,8 +218,13 @@ namespace HotspotShade.WinUI2.ViewModels
 
         public void SetActivityDetails(bool enabled)
         {
+            bool changed = ShowActivityDetails != enabled;
             ShowActivityDetails = enabled;
-            RebuildActivity();
+            if (changed)
+            {
+                // Every row carries the details text, so rebuild them all.
+                RebuildActivity(true);
+            }
             Raise("ShowActivityDetails");
         }
 
@@ -278,22 +286,81 @@ namespace HotspotShade.WinUI2.ViewModels
         private void Rebuild()
         {
             State = HotspotShade.WinUI2.Core.App.WindowState.Build(session);
-            AttentionRows.Clear();
-            for (int index = 0; index < State.Attention.Count; index++)
-            {
-                AttentionRows.Add(new AttentionRow(State.Attention[index]));
-            }
+            SyncAttentionRows();
             Raise("State");
             Raise("PingEnabled");
         }
 
-        private void RebuildActivity()
+        // The status poll rebuilds the state every second. Replacing the
+        // attention rows each time would destroy the focused action button,
+        // so the rows change only when a line's text or action changed.
+        private void SyncAttentionRows()
         {
-            ActivityRows.Clear();
-            for (int index = session.Activity.Count - 1; index >= 0; index--)
+            IList<AttentionLine> lines = State.Attention;
+            bool same = lines.Count == AttentionRows.Count;
+            for (int index = 0; same && index < lines.Count; index++)
             {
-                ActivityRows.Add(new ActivityRow(session.Activity[index], ShowActivityDetails));
+                same = lines[index].Action == AttentionRows[index].Action
+                    && string.Equals(lines[index].Text, AttentionRows[index].Text, StringComparison.Ordinal);
             }
+            if (same)
+            {
+                return;
+            }
+            AttentionRows.Clear();
+            for (int index = 0; index < lines.Count; index++)
+            {
+                AttentionRows.Add(new AttentionRow(lines[index]));
+            }
+        }
+
+        // Newest line first. The 2 s activity poll adds only the lines that
+        // arrived since the last pass, so the scroll position and any text
+        // selection stay put. A full rebuild runs when the Details setting
+        // changes or when the lines are no longer a continuation of the
+        // rows shown: the engine run or source changed, the Core session
+        // reset its log cursor, or the sequence went backwards.
+        private void RebuildActivity(bool full)
+        {
+            IList<LogLine> lines = session.Activity;
+            int anchor = -1;
+            if (!full && activityNewest != null)
+            {
+                // The Core session keeps the same LogLine objects until it
+                // clears the list for a new run, so a reference match proves
+                // the shown rows are still the head of the current list.
+                for (int index = lines.Count - 1; index >= 0; index--)
+                {
+                    if (object.ReferenceEquals(lines[index], activityNewest))
+                    {
+                        anchor = index;
+                        break;
+                    }
+                }
+            }
+            if (anchor < 0)
+            {
+                if (ActivityRows.Count > 0 || lines.Count > 0)
+                {
+                    ActivityRows.Clear();
+                    for (int index = lines.Count - 1; index >= 0; index--)
+                    {
+                        ActivityRows.Add(new ActivityRow(lines[index], ShowActivityDetails));
+                    }
+                }
+            }
+            else
+            {
+                for (int index = anchor + 1; index < lines.Count; index++)
+                {
+                    ActivityRows.Insert(0, new ActivityRow(lines[index], ShowActivityDetails));
+                }
+            }
+            while (ActivityRows.Count > AppSession.MaxActivityLines)
+            {
+                ActivityRows.RemoveAt(ActivityRows.Count - 1);
+            }
+            activityNewest = lines.Count > 0 ? lines[lines.Count - 1] : null;
         }
 
         private void RebuildFailures()

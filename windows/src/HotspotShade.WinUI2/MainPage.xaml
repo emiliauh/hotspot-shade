@@ -170,6 +170,13 @@
                                     </StackPanel>
 
                                     <TextBlock
+                                        x:Name="TurnOnReasonText"
+                                        Style="{StaticResource CaptionSecondaryTextBlockStyle}"
+                                        TextWrapping="Wrap"
+                                        Visibility="Collapsed"
+                                        AutomationProperties.LiveSetting="Polite" />
+
+                                    <TextBlock
                                         Text="Windows asks for administrator approval when you turn on the tunnel."
                                         Style="{StaticResource CaptionSecondaryTextBlockStyle}"
                                         TextWrapping="Wrap"

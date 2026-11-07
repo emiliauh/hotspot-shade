@@ -675,25 +675,50 @@ test('a postrm purge that cannot remove the directory warns and still exits 0', 
 const realFlock = realFlockPath();
 const onLinux = process.platform === 'linux';
 
+/* util-linux flock forks the command by default, and that forked child keeps
+ * the lock descriptor after the flock parent dies. `--no-fork` (util-linux >=
+ * 2.27) makes flock exec the command in place, so the process this test
+ * signals is the one that holds the lock. The holder also gets its own process
+ * group, so cleanup can kill anything it may have forked. */
+function lockHolderExited(holder) {
+  return holder.exitCode !== null || holder.signalCode !== null;
+}
+
+async function signalLockHolder(holder, signal) {
+  const exited = lockHolderExited(holder)
+    ? Promise.resolve()
+    : new Promise((resolve) => holder.once('exit', resolve));
+  try {
+    process.kill(-holder.pid, signal);
+  } catch (error) {
+    if (error.code !== 'ESRCH') throw error;
+  }
+  await exited;
+}
+
 test(
   'prerm sees a lock that a real flock process holds',
   { skip: (!realFlock || !onLinux) && 'needs util-linux flock on Linux' },
   async () => {
     const fixture = maintainerFixture();
     fs.writeFileSync(fixture.lock, '');
-    const holder = spawn(realFlock, ['-x', '-n', fixture.lock, 'sleep', '30'], { stdio: 'ignore' });
+    const holder = spawn(
+      realFlock,
+      ['--no-fork', '-x', '-n', fixture.lock, 'sleep', '30'],
+      { stdio: 'ignore', detached: true },
+    );
     try {
       await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.ok(!lockHolderExited(holder), 'the flock holder must still be running');
       const real = { PATH: '/usr/bin:/bin', HOME: fixture.work };
       const held = spawnSync(POSIX_SHELL, [fixture.scripts.prerm, 'remove'], { encoding: 'utf8', env: real });
       assert.equal(held.status, 1, held.stderr);
       assert.match(held.stderr, /the privileged helper is running/);
-      holder.kill('SIGTERM');
-      await new Promise((resolve) => holder.once('exit', resolve));
+      await signalLockHolder(holder, 'SIGTERM');
       const free = spawnSync(POSIX_SHELL, [fixture.scripts.prerm, 'remove'], { encoding: 'utf8', env: real });
       assert.equal(free.status, 0, free.stderr);
     } finally {
-      if (holder.exitCode === null) holder.kill('SIGKILL');
+      await signalLockHolder(holder, 'SIGKILL');
       fixture.remove();
     }
   },

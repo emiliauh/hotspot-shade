@@ -34,4 +34,11 @@
   <ItemGroup>
     <ProjectReference Include="..\HotspotShade.WinUI2.Core\HotspotShade.WinUI2.Core.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- The native image's own imports (bcrypt.dll and others that are not
+         KnownDLLs) load from System32 only, never from the Elevate folder.
+         0x800 is LOAD_LIBRARY_SEARCH_SYSTEM32 (Windows 10 1607 and later).
+         Used by the NativeAOT link step at publish. -->
+    <LinkerArg Include="/DEPENDENTLOADFLAG:0x800" />
+  </ItemGroup>
 </Project>

@@ -350,7 +350,11 @@ namespace HotspotShade.WinUI2.Core.App
             {
                 return null;
             }
-            if (path.IndexOf('/') >= 0 || path.IndexOf('\0') >= 0 || path.IndexOf('~') >= 0 || path.IndexOf("\\\\", StringComparison.Ordinal) >= 0)
+            // A final path holds long names only, so a short-name `~` is not
+            // refused here (package folder names may hold `~`). A `:` after
+            // the drive names an alternate data stream.
+            if (path.IndexOf('/') >= 0 || path.IndexOf('\0') >= 0 || path.IndexOf(':', 2) >= 0
+                || path.IndexOf("\\\\", StringComparison.Ordinal) >= 0)
             {
                 return null;
             }
@@ -358,12 +362,77 @@ namespace HotspotShade.WinUI2.Core.App
             string[] parts = trimmed.Split('\\');
             for (int index = 1; index < parts.Length; index++)
             {
-                if (parts[index] == "." || parts[index] == "..")
+                string part = parts[index];
+                if (part.Length == 0 && trimmed.Length == 3)
+                {
+                    continue;
+                }
+                // Win32 path parsing drops a trailing dot or space, so a
+                // folder verified as "Engine." through \\?\ would start as
+                // "Engine". Such names never appear in a package.
+                if (part.Length == 0 || part == "." || part == ".."
+                    || part[part.Length - 1] == '.' || part[part.Length - 1] == ' ')
                 {
                     return null;
                 }
             }
             return trimmed;
+        }
+
+        // GetDriveTypeW: only a fixed local disk can hold a trusted install.
+        // Removable media can be changed on another computer, and a network
+        // drive is controlled by its server.
+        public const uint DriveFixed = 3;
+
+        public static bool IsTrustedDriveType(uint driveType)
+        {
+            return driveType == DriveFixed;
+        }
+
+        // A package full name as Windows reports it (GetPackageFullName):
+        // letters, digits, and . _ - ~, at most 127 characters.
+        public static bool IsPackageFullName(string name)
+        {
+            if (string.IsNullOrEmpty(name) || name.Length > 127 || name == "." || name == "..")
+            {
+                return false;
+            }
+            for (int index = 0; index < name.Length; index++)
+            {
+                char value = name[index];
+                bool ok = (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') || (value >= '0' && value <= '9')
+                    || value == '.' || value == '_' || value == '-' || value == '~';
+                if (!ok)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // True when the package root is the install folder of the broker's
+        // own package: its folder name is the package full name, and it is
+        // the path that Windows reports for that package
+        // (GetPackagePathByFullName, resolved to its final path). This ties
+        // the root to a package that Windows installed, not to any folder
+        // that only looks like a package store.
+        public static bool MatchesPackage(string rootFinal, string packageFullName, string packagePathFinal)
+        {
+            return RootNamesPackage(rootFinal, packageFullName) && SameFinalPath(packagePathFinal, rootFinal);
+        }
+
+        // The first half of MatchesPackage: the root folder's name is the
+        // package full name. The starter checks it against the pipe server's
+        // package before it reads the request.
+        public static bool RootNamesPackage(string rootFinal, string packageFullName)
+        {
+            string root = NormalizeFinalPath(rootFinal);
+            if (root == null || !IsPackageFullName(packageFullName))
+            {
+                return false;
+            }
+            int slash = root.LastIndexOf('\\');
+            return slash >= 2 && string.Equals(root.Substring(slash + 1), packageFullName, StringComparison.OrdinalIgnoreCase);
         }
 
         // The package root of a starter whose final image path is

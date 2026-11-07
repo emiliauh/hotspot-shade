@@ -167,16 +167,21 @@ Administrators change it. The folder name alone is not enough. To see what it
 checks, run in PowerShell:
 
 ```powershell
- = (Get-AppxPackage HotspotShade.Windows).InstallLocation
-foreach ( in @(, "\Engine", "\Engine\hotspotshade.exe", "\Engine\wintun.dll", "\Elevate\HotspotShade.WinUI2.Elevate.exe")) {
-    (Get-Item -LiteralPath ).Target   # empty: not a link
-    icacls 
-    (Get-Acl -LiteralPath ).Owner
+$root = (Get-AppxPackage HotspotShade.Windows).InstallLocation
+foreach ($p in @($root, "$root\Engine", "$root\Engine\hotspotshade.exe", "$root\Engine\wintun.dll", "$root\Elevate\HotspotShade.WinUI2.Elevate.exe")) {
+    $p
+    (Get-Item -LiteralPath $p).Target   # empty: not a link
+    (Get-Acl -LiteralPath $p).Owner
+    (Get-Acl -LiteralPath $p).Sddl
+    icacls $p
 }
 ```
 
 Expected: owner `NT SERVICE\TrustedInstaller` (or `NT AUTHORITY\SYSTEM`),
-and `BUILTIN\Users` with `(RX)` only. If Turn on reports "not installed from a
+and `BUILTIN\Users` with `(RX)` only. The starter also requires the package
+folder name to be the broker's package full name, the folder to be the path
+that Windows reports for that package, and the volume to be a fixed disk (not
+removable media or a network drive). If Turn on reports "not installed from a
 package in a protected Windows apps folder" on an installed package, send this
 output with the report.
 
@@ -323,7 +328,9 @@ above before anything else.
   SYSTEM owner, and a DACL that gives no change right to Users, Authenticated
   Users, Everyone, the creator SIDs, or any account other than
   TrustedInstaller, SYSTEM, and Administrators. A `WindowsApps` folder that a
-  user created on another drive fails that check. This check has not run on
+  user created on another drive fails that check, and so does any folder that
+  is not the one Windows reports for the broker's package, or that is on
+  removable media or a network drive. This check has not run on
   Windows yet; if real package folders carry an extra entry, Turn on reports
   the install as untrusted.
 - A Visual Studio F5 deployment is for UI work only. Turn on is refused there

@@ -109,36 +109,51 @@ The starter is published with NativeAOT. It has no .NET host, so no
 `DOTNET_STARTUP_HOOKS`, profiler, or `DOTNET_ROOT` value that a medium
 process writes into the user environment can load code into the elevated
 process. It checks elevation with the token's `TokenElevation` value,
-refuses to run unelevated, opens the pipe with
-identification-level impersonation only, finds the package root from the final
-path of its own image, and checks that the pipe server is the packaged broker
-by process id and the final path of its image before it reads the request.
+refuses to run unelevated, opens the pipe with identification-level
+impersonation only, and finds the package root from the final path of its own
+image. Before it reads the request, it checks that the pipe server is the
+packaged broker: by process id, by the final path of its image, and by its
+package full name (`GetPackageFullName`), which must be the root folder's name.
+That rejects another program, but not malware that runs as the same user inside
+the broker; the trust anchor for starting at all is the person's UAC approval,
+so the elevated engine must treat the port, the pipes, and the pairing frame as
+untrusted input.
+
 Before it duplicates any handle or creates any process it verifies the install
-location: it opens the package root, the `Engine` folder, the engine, and
-`wintun.dll` (`FILE_READ_ATTRIBUTES | READ_CONTROL`, backup semantics), resolves
-each final path (`GetFinalPathNameByHandleW`), requires the root to be in a
-WindowsApps package store and every other path to be where the package puts it
-inside that root (so no link leads out), and reads each owner and DACL
+location. The root must be the folder that Windows reports for that package
+(`GetPackagePathByFullName`, resolved to its final path), on a fixed local disk
+(`GetDriveTypeW`; removable media and network drives are refused), below a
+WindowsApps package store. It opens the package root, the `Engine` folder, the
+engine, `wintun.dll`, and its own image (`FILE_READ_ATTRIBUTES | READ_CONTROL`
+plus read data, backup semantics), resolves each final path
+(`GetFinalPathNameByHandleW`), requires every path to be where the package puts
+it inside that root (so no link leads out), and reads each owner and DACL
 (`GetSecurityInfo`). The owner must be TrustedInstaller or SYSTEM, a DACL must be
 present, and no allow entry may give a change right (write, add file, add
 subfolder, delete, delete child, write attributes, `WRITE_DAC`, `WRITE_OWNER`,
 generic write or all) to any account other than TrustedInstaller, SYSTEM, or
 Administrators, which rejects Users, Authenticated Users, Everyone, and the
-creator SIDs. Its own image must pass the same check. The rule is pure Core code
-(`InstallSecurity`) with tests. The starter keeps these handles open without
-delete sharing until the engine process exists. It then duplicates the three
-handles into itself, checks that each one is a pipe and that no two name the
-same object (`CompareObjectHandles`), and starts the packaged engine with a fixed
-argument list, `--credentials-fd`, an explicit inherited-handle list, and a
-fixed environment block (`SystemRoot`, `windir`, `PATH`, `TEMP`, and a few
+creator SIDs. The rule is pure Core code (`InstallSecurity`) with tests. The
+folder-name text rule in the broker is only a pre-filter.
+
+The starter keeps these handles open until the engine process exists. The read
+data right makes Windows apply their share modes (an open for attributes only
+does not), and they share neither write nor delete, so no checked object can be
+renamed, replaced, or written in between. It then duplicates the three handles
+into itself, checks that each one is a pipe and that no two name the same
+object (`CompareObjectHandles`), and starts the packaged engine, while it
+still holds those handles, with a fixed argument list, `--credentials-fd`, an explicit inherited-handle list, and
+a fixed environment block (`SystemRoot`, `windir`, `PATH`, `TEMP`, and a few
 system values from `GetWindowsDirectoryW`), never the user environment. It
-answers with the engine process id and exits. If its watchdog fires or an
-unexpected error occurs, it first sends a best-effort failure reply on the
-rendezvous pipe, and it treats a reply that it could not write as a failure. It never reads the secret or
-the pairing frame. The broker opens the engine process, checks its image path,
-waits for its listener, writes a new bearer secret, keeps the parent-liveness
-write end, and sends `POST /api/start` with `mode` `phone` and the Let ping
-work choice.
+answers with the engine process id and exits. The engine loads `wintun.dll` after the starter exits, so at that point
+only the DACL rule protects it. If the watchdog fires or an unexpected error
+occurs, the starter first sends a best-effort failure reply on the rendezvous
+pipe, and it treats a reply that it could not write as a failure. It never
+reads the secret or the pairing frame. The starter's own imports load from
+System32 only (`/DEPENDENTLOADFLAG:0x800`). The broker opens the engine process,
+checks its image path, waits for its listener, writes a new bearer secret, keeps
+the parent-liveness write end, and sends `POST /api/start` with `mode` `phone`
+and the Let ping work choice.
 
 This mirrors the macOS credential handoff: the user engine passes the pairing
 on a private inherited descriptor, the privileged side passes the descriptor

@@ -304,6 +304,13 @@ namespace HotspotShade.WinUI2.Core.App
                 || (model.Primary == DashboardAction.Retry && input.RetryStartsTunnel);
             model.ShowPairHint = model.Title == AppText.NotPaired && model.Primary == DashboardAction.Pair && model.Attention.Count == 0;
             Enablement(input, pairing, busy, model);
+            // The status is unavailable, but the tunnel was last seen on:
+            // offer Turn off next to Check now.
+            if (model.CanTurnOff && input.Freshness == StatusFreshness.Unavailable
+                && model.Primary != DashboardAction.TurnOff && model.Secondary == DashboardAction.None)
+            {
+                model.Secondary = DashboardAction.TurnOff;
+            }
             return model;
         }
 
@@ -709,8 +716,14 @@ namespace HotspotShade.WinUI2.Core.App
 
             // Turn off stays available for a retryable cleanup mark, so a
             // stop that could not be confirmed can be tried again.
+            // When the status is unavailable but the last known status was
+            // running, the tunnel may still be on, so Turn off stays
+            // available: stopping is the safe direction. Turn on stays
+            // blocked above.
             bool stopTarget = input.Running || (input.ElevatedSource && input.Cleanup == CleanupKind.Retryable);
-            model.CanTurnOff = healthy && stopTarget && input.Operation == TunnelOperation.None && !busy && !unavailable;
+            bool stopWhileUnavailable = unavailable && input.Running;
+            model.CanTurnOff = healthy && stopTarget && input.Operation == TunnelOperation.None && !busy
+                && (!unavailable || stopWhileUnavailable);
             if (model.CanTurnOff)
             {
                 model.TurnOffReason = null;

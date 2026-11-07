@@ -48,6 +48,11 @@ namespace HotspotShade.WinUI2.Core.App
 
         public string Mode { get; private set; }
 
+        // When the engine started the current tunnel (Unix seconds), or null
+        // when no tunnel runs. A change means a new run, possibly in a new
+        // engine process whose log sequence starts again.
+        public double? StartedAt { get; private set; }
+
         public string Error { get; private set; }
 
         public bool Paired { get; private set; }
@@ -178,6 +183,7 @@ namespace HotspotShade.WinUI2.Core.App
             value.Demo = root.GetBool("demo") == true;
             value.Running = root.GetBool("running");
             value.Mode = root.GetString("mode");
+            value.StartedAt = root.GetNumber("started_at");
             value.Error = root.GetString("error");
             value.Paired = root.GetBool("paired") == true;
             value.IcmpEnabled = root.GetBool("icmp_enabled");

@@ -519,15 +519,42 @@ namespace HotspotShade.WinUI2.Core.Tests
                 AssertEx.False(ElevationProtocol.IsRendezvousToken("..\\pipe\\x"), "no path");
             });
 
-            runner.Check("install: an elevated engine starts only from an installed package", delegate
+            runner.Check("install: the text pre-filter admits only package store paths", delegate
             {
-                AssertEx.True(InstallRules.IsProtectedPackageRoot(@"C:\Program Files\WindowsApps\HotspotShade.Windows_0.2.0.0_x64__abc", @"C:\Program Files"), "installed package");
-                AssertEx.False(InstallRules.IsProtectedPackageRoot(@"C:\Users\me\source\repos\windows\src\HotspotShade.WinUI2\bin\x64\Debug\AppX", @"C:\Program Files"), "loose deployment");
-                AssertEx.False(InstallRules.IsProtectedPackageRoot(@"C:\Program Files\WindowsAppsEvil\x", @"C:\Program Files"), "prefix trick");
-                AssertEx.False(InstallRules.IsProtectedPackageRoot(@"C:\Program Files\WindowsApps", @"C:\Program Files"), "the folder itself");
-                AssertEx.True(InstallRules.IsProtectedPackageRoot(@"D:\WindowsApps\HotspotShade.Windows_0.2.0.0_x64__abc", @"C:\Program Files"), "package store on another volume");
-                AssertEx.False(InstallRules.IsProtectedPackageRoot(@"D:\Users\me\WindowsApps\x", @"C:\Program Files"), "a user folder named WindowsApps");
-                AssertEx.False(InstallRules.IsProtectedPackageRoot(@"D:\WindowsApps\..\x", @"C:\Program Files"), "traversal");
+                AssertEx.True(InstallRules.IsPackageStorePath(@"C:\Program Files\WindowsApps\HotspotShade.Windows_0.2.0.0_x64__abc", @"C:\Program Files"), "installed package");
+                AssertEx.False(InstallRules.IsPackageStorePath(@"C:\Users\me\source\repos\windows\src\HotspotShade.WinUI2\bin\x64\Debug\AppX", @"C:\Program Files"), "loose deployment");
+                AssertEx.False(InstallRules.IsPackageStorePath(@"C:\Program Files\WindowsAppsEvil\x", @"C:\Program Files"), "prefix trick");
+                AssertEx.False(InstallRules.IsPackageStorePath(@"C:\Program Files\WindowsApps", @"C:\Program Files"), "the folder itself");
+                AssertEx.False(InstallRules.IsPackageStorePath(@"D:\Users\me\WindowsApps\x", @"C:\Program Files"), "a user folder named WindowsApps");
+                AssertEx.False(InstallRules.IsPackageStorePath(@"D:\WindowsApps\..\x", @"C:\Program Files"), "traversal");
+            });
+
+            runner.Check("install: a WindowsApps folder on another drive is not trusted by text alone", delegate
+            {
+                // The path passes the pre-filter, so the broker offers Turn
+                // on, but the starter trusts only what the owner and DACL say.
+                // A standard user who creates D:\WindowsApps owns it.
+                string root = @"D:\WindowsApps\HotspotShade.Windows_0.2.0.0_x64__abc";
+                AssertEx.True(InstallRules.IsPackageStorePath(root, @"C:\Program Files"), "location pre-filter only");
+                const string user = "S-1-5-21-1004336348-1177238915-682003330-1001";
+                List<InstallAce> userFolder = new List<InstallAce>
+                {
+                    new InstallAce(InstallSecurity.AccessAllowed, 0x03, 0x001F01FF, user),
+                    new InstallAce(InstallSecurity.AccessAllowed, 0x03, InstallSecurity.ReadAndExecute, InstallSecurity.UsersSid)
+                };
+                AssertEx.Equal(InstallCheck.OwnerUntrusted, InstallSecurity.Evaluate(user, true, userFolder), "user-created store");
+                List<InstallAce> rootLike = new List<InstallAce>
+                {
+                    new InstallAce(InstallSecurity.AccessAllowed, 0x03, 0x001F01FF, InstallSecurity.SystemSid),
+                    new InstallAce(InstallSecurity.AccessAllowed, 0x0B, InstallSecurity.GenericWrite | InstallSecurity.Delete, InstallSecurity.AuthenticatedUsersSid)
+                };
+                AssertEx.Equal(InstallCheck.WritableByOthers, InstallSecurity.Evaluate(InstallSecurity.SystemSid, true, rootLike), "a drive-root style DACL");
+                List<InstallAce> store = new List<InstallAce>
+                {
+                    new InstallAce(InstallSecurity.AccessAllowed, 0x03, 0x001F01FF, InstallSecurity.TrustedInstallerSid),
+                    new InstallAce(InstallSecurity.AccessAllowed, 0x03, InstallSecurity.ReadAndExecute, InstallSecurity.UsersSid)
+                };
+                AssertEx.Equal(InstallCheck.Trusted, InstallSecurity.Evaluate(InstallSecurity.TrustedInstallerSid, true, store), "a real package store");
             });
 
             runner.Check("reports: failures and diagnostics come from engine answers", delegate
@@ -564,6 +591,141 @@ namespace HotspotShade.WinUI2.Core.Tests
                 h.Run(h.Session.LoadActivityAsync(true));
                 AssertEx.Equal(ListState.Empty, h.Session.ActivityState, "empty");
             });
+
+            runner.Check("activity: Turn on starts the log cursor again for the elevated engine", delegate
+            {
+                Harness h = new Harness();
+                h.Channel.Status = IdleStatus(true, "ready");
+                h.Refresh();
+                h.Channel.Logs = Logs(1, 3);
+                h.Run(h.Session.LoadActivityAsync(true));
+                AssertEx.Equal(3, h.Session.Activity.Count, "user engine lines");
+                h.Channel.Logs = Logs(4, 4);
+                h.Run(h.Session.LoadActivityAsync(false));
+                AssertEx.Equal("3", h.Channel.Last(BrokerOps.Logs)[BrokerProtocol.SinceField], "cursor continues");
+                AssertEx.Equal(4, h.Session.Activity.Count, "one more line");
+
+                // Turn on: a new elevated engine whose sequence starts at 1.
+                h.Channel.Source = BrokerSources.Elevated;
+                h.Channel.Status = RunningStatus(1, 0);
+                h.Refresh();
+                h.Channel.Logs = Logs(1, 2);
+                h.Run(h.Session.LoadActivityAsync(false));
+                AssertEx.Equal("0", h.Channel.Last(BrokerOps.Logs)[BrokerProtocol.SinceField], "cursor reset for the new engine");
+                AssertEx.Equal(2, h.Session.Activity.Count, "the elevated engine's lines");
+                AssertEx.Equal(ListState.Loaded, h.Session.ActivityState, "not empty");
+
+                // The same run again keeps the cursor.
+                h.Refresh();
+                h.Channel.Logs = Logs(3, 3);
+                h.Run(h.Session.LoadActivityAsync(false));
+                AssertEx.Equal("2", h.Channel.Last(BrokerOps.Logs)[BrokerProtocol.SinceField], "same run keeps the cursor");
+                AssertEx.Equal(3, h.Session.Activity.Count, "appended");
+
+                // A new started_at from the same source is a new run too.
+                h.Channel.Status = RunningStatus(1, 0).Replace("\"started_at\":", "\"started_at\":17");
+                h.Refresh();
+                h.Channel.Logs = Logs(1, 3);
+                h.Run(h.Session.LoadActivityAsync(false));
+                AssertEx.Equal("0", h.Channel.Last(BrokerOps.Logs)[BrokerProtocol.SinceField], "cursor reset for a new run");
+                AssertEx.Equal(3, h.Session.Activity.Count, "no line shown twice");
+            });
+
+            runner.Check("activity: a log answer from before a run change is dropped", delegate
+            {
+                Harness h = new Harness();
+                h.Channel.Status = IdleStatus(true, "ready");
+                h.Refresh();
+                h.Channel.Logs = Logs(1, 2);
+                h.Run(h.Session.LoadActivityAsync(true));
+                h.Channel.Logs = Logs(3, 5);
+                h.Channel.BeforeLogs = delegate
+                {
+                    h.Channel.BeforeLogs = null;
+                    h.Channel.Source = BrokerSources.Elevated;
+                    h.Channel.Status = RunningStatus(1, 0);
+                    h.Refresh();
+                };
+                h.Run(h.Session.LoadActivityAsync(false));
+                AssertEx.Equal(2, h.Session.Activity.Count, "old-run answer dropped");
+                h.Channel.Logs = Logs(1, 1);
+                h.Run(h.Session.LoadActivityAsync(false));
+                AssertEx.Equal("0", h.Channel.Last(BrokerOps.Logs)[BrokerProtocol.SinceField], "next load starts the new run");
+                AssertEx.Equal(1, h.Session.Activity.Count, "new run only");
+            });
+
+            runner.Check("window: a test-data status shows at once as an unreadable answer with Try again", delegate
+            {
+                Harness h = new Harness();
+                h.Channel.Status = IdleStatus(true, "ready").Replace("\"demo\":false", "\"demo\":true");
+                h.Refresh();
+                DashboardModel model = h.Session.Dashboard();
+                AssertEx.Equal(AppText.Attention, model.Title, "not the starting screen");
+                AssertEx.Equal(AppText.TestDataEngine, model.Subtitle, "unreadable answer");
+                AssertEx.Contains(AppText.TestDataEngine, "cannot read", "plain reason");
+                AssertEx.Equal(DashboardAction.Retry, model.Primary, "Try again");
+                AssertEx.True(h.Session.HasBrokerFailure, "Try again restarts the broker path");
+                AssertEx.False(model.CanTurnOn, "no Turn on");
+                AssertEx.False(model.CanPair, "no Pair");
+
+                h.Channel.Status = IdleStatus(true, "ready");
+                h.Refresh();
+                AssertEx.Equal(AppText.Ready, h.Session.Dashboard().Title, "a real status replaces it");
+
+                h.Channel.Status = IdleStatus(true, "ready").Replace("\"demo\":false", "\"demo\":true");
+                h.Refresh();
+                DashboardModel later = h.Session.Dashboard();
+                AssertEx.Equal(AppText.UnknownTitle, later.Title, "unavailable at once after a real status");
+                AssertEx.Equal(AppText.TestDataEngine, later.Subtitle, "same reason");
+                AssertEx.False(later.CanTurnOn, "no Turn on");
+            });
+
+            runner.Check("window: Turn off stays available when the status is lost while running", delegate
+            {
+                Harness h = new Harness();
+                h.Channel.Source = BrokerSources.Elevated;
+                h.Channel.Status = RunningStatus(2, 0);
+                h.Refresh();
+                h.Channel.Fail = BrokerCodes.Timeout;
+                h.Clock.Advance(11);
+                h.Refresh();
+                DashboardModel gone = h.Session.Dashboard();
+                AssertEx.Equal(AppText.UnknownTitle, gone.Title, "unavailable");
+                AssertEx.True(gone.CanTurnOff, "Turn off allowed");
+                AssertEx.False(gone.CanTurnOn, "Turn on stays blocked");
+                AssertEx.Equal(DashboardAction.TurnOff, gone.Secondary, "Turn off offered");
+                AssertEx.True(WindowState.Build(h.Session).CanTurnOff, "the Turn off menu is enabled");
+                h.Channel.Fail = null;
+                h.Channel.Status = null;
+                h.Run(h.Session.TurnOffAsync());
+                AssertEx.Equal(1, h.Channel.Count(BrokerOps.TurnOff), "the stop is sent");
+
+                Harness idle = new Harness();
+                idle.Channel.Status = IdleStatus(true, "ready");
+                idle.Refresh();
+                idle.Channel.Fail = BrokerCodes.Timeout;
+                idle.Clock.Advance(11);
+                idle.Refresh();
+                DashboardModel idleGone = idle.Session.Dashboard();
+                AssertEx.False(idleGone.CanTurnOff, "nothing to stop when it was last seen off");
+                AssertEx.Equal(DashboardAction.None, idleGone.Secondary, "no Turn off offered");
+                idle.Run(idle.Session.TurnOffAsync());
+                AssertEx.Equal(0, idle.Channel.Count(BrokerOps.TurnOff), "no stop sent");
+            });
+        }
+
+        private static string Logs(int first, int last)
+        {
+            StringBuilder lines = new StringBuilder();
+            for (int seq = first; seq <= last; seq++)
+            {
+                if (lines.Length > 0)
+                {
+                    lines.Append(',');
+                }
+                lines.Append("{\"seq\":" + seq + ",\"level\":\"info\",\"msg\":\"line " + seq + "\",\"ts\":1762430400}");
+            }
+            return "{\"logs\":[" + lines + "],\"next\":" + last + "}";
         }
 
         // MARK: - Engine answers in the shape that the Rust engine writes.
@@ -696,6 +858,8 @@ namespace HotspotShade.WinUI2.Core.Tests
             public int ForgetHttp { get; set; }
             public BrokerReply TurnOnReply { get; set; }
             public BrokerReply TurnOffReply { get; set; }
+            // Runs while a logs request is out, before its answer returns.
+            public Action BeforeLogs { get; set; }
 
             public int Count(string op)
             {
@@ -732,6 +896,10 @@ namespace HotspotShade.WinUI2.Core.Tests
                     case BrokerOps.Diagnostics:
                         return Ok(Diagnostics);
                     case BrokerOps.Logs:
+                        if (BeforeLogs != null)
+                        {
+                            BeforeLogs();
+                        }
                         return Ok(Logs);
                     case BrokerOps.TurnOn:
                         return Task.FromResult(TurnOnReply ?? new BrokerReply(true, 200, "", "{\"ok\":true}", Source, Phase, TurnOn));

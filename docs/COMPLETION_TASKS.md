@@ -77,7 +77,9 @@ Linux and Android, with parallel hermetic work on all of them.
 - [x] W6. Windows engine (2026-11-06, reviewed): token gate = default gateway on a physical adapter, re-checked every 2 s, first refusal stops; pairing, cancel, forget, handoff with the macOS/Linux API; Rust 1551 passed; Windows x86_64/i686 check+clippy clean; not run on Windows.
 - [x] W7. WinUI wired to the real engine via broker + NativeAOT elevated starter (one UAC prompt at Turn on), DemoSession removed, unsupported features listed (2026-11-06, reviewed; Core 244, ServiceHost 281 checks pass; static contract and delimiter checks pass; not built on Windows). GetNamedPipeInfo on the handoff write end confirmed correct by the FFI audit.
 - [x] W8. (fixed 2026-11-06: Broker builds 0 warnings in both configs; Core 250, ServiceHost 281 checks pass; static contract passes; Windows-only I/O paths not run) Broker compile review (real .NET 8 SDK at ~/.dotnet8/dotnet builds it clean): HARD BREAK RendezvousPipe manual-reset event makes every Turn on fail; also close-timeout handle loss, OpenAsync not retried, IPv6-disabled listener check, shutdown race, manifest EntryPoint, reply size. Fix in progress.
-- [ ] W9. Elevate + Core review (2026-11-06): HIGH SECURITY text-only WindowsApps trust lets a standard user get a payload run elevated via the signed starter; HIGH BUILD stage_payload.ps1 global PublishAot breaks publish; Activity silent after Turn on; test-data status wedges Starting; Turn off unavailable when status unavailable. Fix in progress (Opus, reviewed).
+- [x] W9. (fixed 2026-11-06, reviewed: starter proves install root by final path, owner and DACL, package path, fixed disk; publish fix; Activity, test-data, Turn off fixes; Core 266, ServiceHost 281; not run on Windows. Risk: strict rule may refuse a genuine install - collect owner/SDDL/icacls per BUILD_AND_TEST_ON_PC.md section 5 on first install) Elevate + Core review (2026-11-06): HIGH SECURITY text-only WindowsApps trust lets a standard user get a payload run elevated via the signed starter; HIGH BUILD stage_payload.ps1 global PublishAot breaks publish; Activity silent after Turn on; test-data status wedges Starting; Turn off unavailable when status unavailable. Fix in progress (Opus, reviewed).
+- [x] W10. (fixed 2026-11-06; static contract and delimiter checks pass; not built on Windows) UWP review: compiles as written; fixed min-version mismatch (csproj 17763 vs manifest 19041), attention list rebuilt every second, Activity list reset every 2 s, binding refresh, disabled Turn on reason, CoreWindow guard, MaxVersionTested, assembly version.
+- [x] W-READY. Windows is ready for the owner's first PC build and test (2026-11-06) with windows/BUILD_AND_TEST_ON_PC.md: engine gate and pairing, real WinUI app, broker, hardened elevated starter. First compile of the UWP app and package happens on the PC.
 - [ ] W1. Readiness assessment from current code and the linked Windows host:
   what is real, what is simulated, what is blocked by a product decision.
 - [ ] W2. Real app, service, and engine integration needed for a first test.
@@ -183,7 +185,7 @@ smoke-test seam that no app offers.
 
 ## Linux evidence (needs owner approval)
 
-- [ ] LE1. (OWNER APPROVED 2026-11-06; run after the Linux session fix is committed) docs/LINUX_EVIDENCE_PROPOSAL.md recommends a git archive of the
+- [~] LE1. (RUN 1 done on 417c6d43, Boat Ubuntu 24.04: helper 92 + container 26 pass, Xvfb settings + a11y pass, .deb build and install/remove/purge pass; 3 Linux-only failures being fixed: clippy dead_code, dash fd>9 in a test, flock fork in a test; evidence docs/evidence/linux-boat-2026-11-06/; sandbox deleted) docs/LINUX_EVIDENCE_PROPOSAL.md recommends a git archive of the
   committed branch, SHA-256 pinned, extracted with tar --no-same-owner as an
   unprivileged user on a disposable Boat Ubuntu 24.04 amd64 sandbox, for the
   Rust/helper tests, npm test, Xvfb checks, and a .deb build. Needs the owner's

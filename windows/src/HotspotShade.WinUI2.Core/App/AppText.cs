@@ -91,7 +91,7 @@ namespace HotspotShade.WinUI2.Core.App
         public const string GatewayUnproven = "The source device must be the default gateway of a physical hotspot adapter. Turn off any VPN, connect to the source device hotspot, then try again.";
         public const string StaleStatus = "HotspotShade did not answer. This status may be out of date.";
         public const string StatusUnavailableSubtitle = "HotspotShade did not answer.";
-        public const string TestDataEngine = "The engine returned test data. HotspotShade does not show it. Reinstall HotspotShade.";
+        public const string TestDataEngine = "The engine sent an answer that HotspotShade cannot read: it holds test data, which this app never shows. If this happens again, reinstall HotspotShade.";
         public const string CheckNow = "Check now";
         public const string CheckedJustNow = "Checked just now";
         public const string WaitForAction = "Wait for the current action to finish.";

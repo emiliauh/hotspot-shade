@@ -170,6 +170,16 @@ namespace HotspotShade.WinUI2.Core.App
         private bool pairingActive;
         private string pairingFailure;
         private long activityNext;
+        // Which engine run the activity cursor belongs to. The engine's log
+        // sequence starts again in a new engine process, and /api/logs never
+        // answers with a `next` below the cursor it was sent, so the cursor
+        // is reset from the status: when the status source (user or
+        // elevated engine) or started_at changes.
+        private bool logRunKnown;
+        private string logRunSource;
+        private double? logRunStartedAt;
+        private bool logResetPending;
+        private int logRun;
 
         public AppSession(IBrokerChannel channel, Func<DateTime> utcNow)
         {
@@ -281,11 +291,14 @@ namespace HotspotShade.WinUI2.Core.App
                     if (parsed.Demo)
                     {
                         // Test data is never a status that this app shows.
+                        // The window shows it at once as an engine answer
+                        // that HotspotShade cannot use (BuildInput).
                         testData = true;
                         return;
                     }
                     testData = false;
                     status = parsed;
+                    TrackLogRun(source, parsed.StartedAt);
                     lastStatusAt = utcNow();
                     everAnswered = true;
                     brokerFailure = null;
@@ -558,11 +571,16 @@ namespace HotspotShade.WinUI2.Core.App
 
         public async Task LoadActivityAsync(bool reset)
         {
-            if (reset)
+            if (reset || logResetPending)
             {
+                // A new engine run: read its log from the start. The old
+                // lines are dropped, so a run in the same engine process
+                // (whose sequence continues) is not shown twice.
                 activity.Clear();
                 activityNext = 0;
+                logResetPending = false;
             }
+            int run = logRun;
             if (activity.Count == 0)
             {
                 ActivityState = ListState.Loading;
@@ -570,6 +588,14 @@ namespace HotspotShade.WinUI2.Core.App
             Dictionary<string, string> extra = new Dictionary<string, string>(StringComparer.Ordinal);
             extra[BrokerProtocol.SinceField] = BrokerProtocol.FormatSince(activityNext);
             BrokerReply reply = await Send(BrokerOps.Logs, extra).ConfigureAwait(true);
+            if (run != logRun)
+            {
+                // The engine run changed while this request was out. The
+                // answer may come from the old run; the next load reads the
+                // new run from the start.
+                ActivityState = activity.Count == 0 ? ListState.Loading : ListState.Loaded;
+                return;
+            }
             LogBatch batch;
             if (!reply.Ok || reply.Http != 200 || !LogBatch.TryParse(reply.Body, out batch))
             {
@@ -583,16 +609,10 @@ namespace HotspotShade.WinUI2.Core.App
                     activity.Add(batch.Lines[index]);
                 }
             }
-            if (batch.Next < activityNext)
-            {
-                // A new engine starts its sequence again. Keep the old lines
-                // and continue from the new engine.
-                activityNext = batch.Next;
-            }
-            else
-            {
-                activityNext = Math.Max(activityNext, batch.Next);
-            }
+            // The engine answers next = max(since, newest seq), so it never
+            // moves the cursor back. A new engine run is found from the
+            // status instead (TrackLogRun).
+            activityNext = Math.Max(activityNext, batch.Next);
             if (activity.Count > MaxActivityLines)
             {
                 activity.RemoveRange(0, activity.Count - MaxActivityLines);
@@ -701,6 +721,12 @@ namespace HotspotShade.WinUI2.Core.App
         {
             DashboardInput input = new DashboardInput();
             input.BrokerFailure = brokerFailure;
+            if (input.BrokerFailure == null && !everAnswered && testData)
+            {
+                // The engine answered, but with test data. Waiting longer
+                // will not help, so show it at once with Try again.
+                input.BrokerFailure = AppText.TestDataEngine;
+            }
             if (input.BrokerFailure == null && !everAnswered && lastFailureCode != null
                 && (lastFailureCode == BrokerCodes.EngineMissing || utcNow() - createdAt >= FirstAnswerBudget))
             {
@@ -708,7 +734,9 @@ namespace HotspotShade.WinUI2.Core.App
             }
             input.EngineStarting = input.BrokerFailure == null && !everAnswered;
             input.TestDataEngine = testData;
-            input.Freshness = Freshness();
+            // Test data after a real status makes the status unavailable at
+            // once instead of after UnavailableAfter.
+            input.Freshness = testData && everAnswered ? StatusFreshness.Unavailable : Freshness();
             input.Operation = operation;
             if (input.Operation == TunnelOperation.None)
             {
@@ -822,6 +850,20 @@ namespace HotspotShade.WinUI2.Core.App
                 return AppText.CheckedMinutes((int)(age / 60));
             }
             return null;
+        }
+
+        // Marks a new engine run when the status source or started_at
+        // changes. The next activity load then starts again from 0.
+        private void TrackLogRun(string runSource, double? startedAt)
+        {
+            if (logRunKnown && (runSource != logRunSource || startedAt != logRunStartedAt))
+            {
+                logResetPending = true;
+                logRun++;
+            }
+            logRunKnown = true;
+            logRunSource = runSource;
+            logRunStartedAt = startedAt;
         }
 
         private void TrackSourceTrouble()

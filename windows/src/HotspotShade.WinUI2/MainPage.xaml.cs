@@ -9,6 +9,7 @@ using Windows.System.Profile;
 using Windows.UI.Core;
 using Windows.UI.ViewManagement;
 using Windows.UI.Xaml;
+using Windows.UI.Xaml.Automation;
 using Windows.UI.Xaml.Controls;
 using Windows.UI.Xaml.Input;
 using muxc = Microsoft.UI.Xaml.Controls;
@@ -36,7 +37,13 @@ namespace HotspotShade.WinUI2
         public MainPage()
         {
             settingsStore = new LocalSettingsStore();
-            ViewModel = new MainViewModel(BrokerConnection.Instance, CoreWindow.GetForCurrentThread().Dispatcher);
+            // CoreWindow.GetForCurrentThread() is null on a thread without a
+            // window; fall back to the current window's dispatcher.
+            CoreWindow coreWindow = CoreWindow.GetForCurrentThread();
+            CoreDispatcher dispatcher = coreWindow != null
+                ? coreWindow.Dispatcher
+                : (Window.Current != null ? Window.Current.Dispatcher : null);
+            ViewModel = new MainViewModel(BrokerConnection.Instance, dispatcher);
             Privacy = new PrivacyCapabilityViewModel();
             this.InitializeComponent();
             ViewModel.PropertyChanged += ViewModel_PropertyChanged;
@@ -51,10 +58,9 @@ namespace HotspotShade.WinUI2
 
         private void ViewModel_PropertyChanged(object sender, PropertyChangedEventArgs e)
         {
-            if (this.Bindings != null)
-            {
-                this.Bindings.Update();
-            }
+            // The OneWay x:Bind bindings refresh themselves from the "State"
+            // notification. Calling Bindings.Update() here re-evaluated every
+            // binding on every poll, so it is not called.
             RefreshControls();
         }
 
@@ -82,6 +88,12 @@ namespace HotspotShade.WinUI2
             Window.Current.VisibilityChanged += Window_VisibilityChanged;
             RefreshControls();
             await ViewModel.StartAsync();
+            // One refresh of the compiled bindings after start, in case the
+            // first answer arrived before the bindings were initialized.
+            if (this.Bindings != null)
+            {
+                this.Bindings.Update();
+            }
         }
 
         private void Window_VisibilityChanged(object sender, VisibilityChangedEventArgs e)
@@ -545,7 +557,17 @@ namespace HotspotShade.WinUI2
             ToolTipService.SetToolTip(TurnOnMenu, state.CanTurnOn ? AppText.AdminAuthorization : state.TurnOnReason);
             ToolTipService.SetToolTip(TurnOffMenu, state.CanTurnOff ? null : state.TurnOffReason);
             // A Turn on button is never shown disabled without its reason.
-            PrimaryButton.IsEnabled = state.PrimaryAction != DashboardAction.TurnOn || state.CanTurnOn;
+            // The reason is a visible caption under the button, the tooltip,
+            // and the help text a screen reader reads with the button.
+            bool turnOnBlocked = state.PrimaryAction == DashboardAction.TurnOn && !state.CanTurnOn;
+            PrimaryButton.IsEnabled = !turnOnBlocked;
+            string blockedReason = turnOnBlocked
+                ? (string.IsNullOrEmpty(state.TurnOnReason) ? AppText.WaitForAction : state.TurnOnReason)
+                : "";
+            TurnOnReasonText.Text = blockedReason;
+            TurnOnReasonText.Visibility = turnOnBlocked ? Visibility.Visible : Visibility.Collapsed;
+            ToolTipService.SetToolTip(PrimaryButton, turnOnBlocked ? blockedReason : null);
+            AutomationProperties.SetHelpText(PrimaryButton, blockedReason);
             ThemeSystemMenu.Icon = theme == ElementTheme.Default ? CheckIcon() : null;
             ThemeLightMenu.Icon = theme == ElementTheme.Light ? CheckIcon() : null;
             ThemeDarkMenu.Icon = theme == ElementTheme.Dark ? CheckIcon() : null;

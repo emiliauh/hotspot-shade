@@ -179,7 +179,9 @@ fn seal_control_descriptors(descriptors: &[(Option<i64>, &str)]) -> Result<(), S
 enum ControlDescriptorKind {
     /// A pipe or a socket. The parent watcher polls for a hang-up on either.
     PipeOrSocket,
-    /// A socket only.
+    /// A socket only. Only macOS's `HANDOFF` selects this kind, so Linux
+    /// constructs no value of it and would otherwise warn about dead code.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Socket,
 }
 
@@ -4072,12 +4074,15 @@ mod tests {
             moved
         }
 
-        /// True when a spawned child has the descriptor open. The shell
-        /// duplicates it onto its output, which fails when it is closed.
+        /// True when a spawned child has the descriptor open. `/dev/fd` exposes
+        /// one entry per open descriptor on Linux and macOS, so testing that
+        /// path does not depend on the shell's redirection syntax. dash, the
+        /// Ubuntu `/bin/sh`, accepts only single-digit descriptors in a
+        /// redirection, so `>&64` fails there regardless of inheritance.
         fn child_inherits(descriptor: libc::c_int) -> bool {
             std::process::Command::new("/bin/sh")
                 .arg("-c")
-                .arg(format!("{{ : >&{descriptor}; }} 2>/dev/null"))
+                .arg(format!("[ -e /dev/fd/{descriptor} ]"))
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())

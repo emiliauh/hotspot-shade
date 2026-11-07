@@ -19,21 +19,31 @@ namespace HotspotShade.WinUI2.Elevate
     // 3. Opens the broker pipe with identification-level impersonation only,
     //    so the pipe server cannot act with this elevated token.
     // 4. Finds the package root from the final path of its own image, then
-    //    checks that the pipe server is the packaged broker, by process id
-    //    and the final path of its image, before it reads any byte.
+    //    checks that the pipe server is the packaged broker before it reads
+    //    any byte: by process id, the final path of its image, and its
+    //    package full name, which must be the root folder's name. This
+    //    rejects another program; it cannot reject malware that runs as the
+    //    same user inside the broker. The trust anchor for starting at all
+    //    is the person's UAC approval, so the elevated engine must treat
+    //    the port, the pipes, and the pairing frame as untrusted input.
     // 5. Reads the request, then verifies the install location before it
-    //    duplicates any handle or creates any process: the package root,
-    //    the Engine folder, the engine, and wintun.dll are each opened, their
-    //    final paths must be where the package puts them below a WindowsApps
-    //    package store, and their owner and DACL must pass InstallSecurity.
-    //    The handles stay open, without delete sharing, until the engine
-    //    process exists, so no folder can be renamed or swapped in between.
+    //    duplicates any handle or creates any process: the root must be the
+    //    path that Windows reports for that package, on a fixed local disk,
+    //    below a WindowsApps package store; the package root, the Engine
+    //    folder, the engine, wintun.dll, and its own image are each opened,
+    //    their final paths must be where the package puts them, and their
+    //    owner and DACL must pass InstallSecurity. The handles ask for read
+    //    access (so their share modes take effect) and share neither write
+    //    nor delete, so until the engine process exists none of these
+    //    objects can be renamed, replaced, or written.
     // 6. Duplicates the three pipe handles that the broker named into itself
     //    as inheritable handles, and checks that each one is a pipe and that
     //    no two are the same object.
-    // 7. Starts the packaged engine by its verified final path with a fixed
-    //    argument list and an explicit inherited-handle list, and answers
-    //    with its process id.
+    // 7. Starts the packaged engine by its verified path, while the checked
+    //    handles are still held, with a fixed argument list and an explicit
+    //    inherited-handle list, and answers with its process id. The engine
+    //    loads wintun.dll after the starter exits, so only the DACL rule
+    //    protects that file at load time.
     // It never reads the bearer secret or the pairing frame: the engine
     // reads them from the inherited pipes. A watchdog ends the program if
     // any step stalls; it and any unexpected failure first send a failure
@@ -67,8 +77,14 @@ namespace HotspotShade.WinUI2.Elevate
         private const int TokenElevationClass = 20;
         private const uint ThreadTerminate = 0x0001;
 
+        private const int ErrorInsufficientBuffer = 122;
+
         // The install-location check opens each object with these rights
-        // only: enough to read its final path, owner, and DACL.
+        // only: its final path, owner, and DACL, plus read data (list
+        // directory for a folder). Windows applies share modes only to an
+        // open that asks for data access, so read data is what makes the
+        // held handles block a rename, a replacement, or a write.
+        private const uint FileReadData = 0x00000001;
         private const uint FileReadAttributes = 0x00000080;
         private const uint ReadControl = 0x00020000;
         private const uint FileShareRead = 0x00000001;
@@ -94,6 +110,8 @@ namespace HotspotShade.WinUI2.Elevate
         // Set once a reply was written, so the broker never sees two.
         private static int replied;
         private static IntPtr mainThread;
+        // Set by the watchdog; the main thread starts no new pipe read.
+        private static int stopping;
         private static Timer watchdog;
 
         [STAThread]
@@ -122,8 +140,9 @@ namespace HotspotShade.WinUI2.Elevate
 
         // The watchdog sends a best-effort failure reply and ends the
         // program. A synchronous read on the same pipe would hold the write
-        // back, so it cancels the main thread's blocking call first, and it
-        // waits for the write only briefly.
+        // back, so it stops new reads and cancels the main thread's blocking
+        // call (several times, for a read that starts just after a cancel)
+        // first, and it waits for the write only briefly.
         private static void OnWatchdog(object state)
         {
             try
@@ -141,9 +160,11 @@ namespace HotspotShade.WinUI2.Elevate
 
         private static void WatchdogReply()
         {
-            if (mainThread != IntPtr.Zero)
+            Volatile.Write(ref stopping, 1);
+            for (int attempt = 0; attempt < 10 && mainThread != IntPtr.Zero; attempt++)
             {
                 CancelSynchronousIo(mainThread);
+                Thread.Sleep(20);
             }
             SendFailure();
         }
@@ -218,6 +239,13 @@ namespace HotspotShade.WinUI2.Elevate
                 {
                     return Answer(pipe, ElevationReplyCode.BrokerRejected, 0);
                 }
+                // The broker runs with the package identity. Its package full
+                // name must be the name of the folder this starter runs from.
+                string packageName = PackageFullNameOf(broker);
+                if (!InstallSecurity.RootNamesPackage(root, packageName))
+                {
+                    return Answer(pipe, ElevationReplyCode.BrokerRejected, 0);
+                }
 
                 byte[] frame = ReadExact(pipe, ElevationProtocol.RequestLength);
                 ElevationRequest request;
@@ -227,7 +255,7 @@ namespace HotspotShade.WinUI2.Elevate
                 }
 
                 string enginePath = root + "\\" + EngineFolder + "\\" + EngineLaunchRules.ExecutableName;
-                ElevationReplyCode verdict = VerifyInstall(root, self, enginePath, held);
+                ElevationReplyCode verdict = VerifyInstall(root, packageName, self, enginePath, held);
                 if (verdict != ElevationReplyCode.Started)
                 {
                     return Answer(pipe, verdict, 0);
@@ -301,34 +329,45 @@ namespace HotspotShade.WinUI2.Elevate
             }
         }
 
-        // The install-location check. Each object is opened by the path
-        // that the verified root implies, its final path must be that same
-        // path (so no link leads out of the package), and its owner and DACL
-        // must pass InstallSecurity. The handles go into held and stay open
-        // until the engine process exists.
-        private static ElevationReplyCode VerifyInstall(string root, IntPtr self, string enginePath, List<IntPtr> held)
+        // The install-location check. The root must be the install folder
+        // that Windows reports for the broker's package, on a fixed local
+        // disk, below a WindowsApps package store. Each object is opened by
+        // the path that the verified root implies, its final path must be
+        // that same path (so no link leads out of the package), and its owner
+        // and DACL must pass InstallSecurity. The handles go into held and
+        // stay open until the engine process exists.
+        private static ElevationReplyCode VerifyInstall(string root, string packageName, IntPtr self, string enginePath, List<IntPtr> held)
         {
             string programFiles = FinalPathOf(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles));
             if (!InstallSecurity.IsPackageStoreLocation(root, programFiles))
             {
                 return ElevationReplyCode.InstallUntrusted;
             }
-            ElevationReplyCode result = CheckObject(root, true, ElevationReplyCode.InstallUntrusted, held);
+            if (!InstallSecurity.MatchesPackage(root, packageName, FinalPathOf(PackagePathOf(packageName))))
+            {
+                return ElevationReplyCode.InstallUntrusted;
+            }
+            if (!InstallSecurity.IsTrustedDriveType(DriveTypeOf(root)))
+            {
+                return ElevationReplyCode.InstallUntrusted;
+            }
+            IntPtr ignored;
+            ElevationReplyCode result = CheckObject(root, true, ElevationReplyCode.InstallUntrusted, held, out ignored);
             if (result != ElevationReplyCode.Started)
             {
                 return result;
             }
-            result = CheckObject(root + "\\" + EngineFolder, true, ElevationReplyCode.EngineMissing, held);
+            result = CheckObject(root + "\\" + EngineFolder, true, ElevationReplyCode.EngineMissing, held, out ignored);
             if (result != ElevationReplyCode.Started)
             {
                 return result;
             }
-            result = CheckObject(enginePath, false, ElevationReplyCode.EngineMissing, held);
+            result = CheckObject(enginePath, false, ElevationReplyCode.EngineMissing, held, out ignored);
             if (result != ElevationReplyCode.Started)
             {
                 return result;
             }
-            result = CheckObject(root + "\\" + EngineFolder + "\\" + AdapterFileName, false, ElevationReplyCode.AdapterDllMissing, held);
+            result = CheckObject(root + "\\" + EngineFolder + "\\" + AdapterFileName, false, ElevationReplyCode.AdapterDllMissing, held, out ignored);
             if (result != ElevationReplyCode.Started)
             {
                 return result;
@@ -338,9 +377,8 @@ namespace HotspotShade.WinUI2.Elevate
             return InstallSecurity.ReplyFor(SecurityOf(self), ElevationReplyCode.InstallUntrusted);
         }
 
-        private static ElevationReplyCode CheckObject(string path, bool directory, ElevationReplyCode missing, List<IntPtr> held)
+        private static ElevationReplyCode CheckObject(string path, bool directory, ElevationReplyCode missing, List<IntPtr> held, out IntPtr handle)
         {
-            IntPtr handle;
             string final;
             ElevationReplyCode opened = OpenChecked(path, directory, held, out handle, out final);
             if (opened == ElevationReplyCode.EngineMissing)
@@ -358,11 +396,71 @@ namespace HotspotShade.WinUI2.Elevate
             return InstallSecurity.ReplyFor(SecurityOf(handle), ElevationReplyCode.InstallUntrusted);
         }
 
-        // Opens path for its attributes and security only, checks that it is
-        // a folder or a file as expected, and reads its final path. The
-        // handle goes into held. A folder is shared for read and write and a
-        // file for read only; neither allows delete, so nothing can rename,
-        // replace, or remove it while the handle is open. Returns Started on
+        // The package full name of a process, or null when it has no package
+        // identity.
+        private static string PackageFullNameOf(IntPtr process)
+        {
+            char[] buffer = new char[130];
+            int length = buffer.Length;
+            int status = GetPackageFullName(process, ref length, buffer);
+            if (status != 0 || length <= 1 || length > buffer.Length)
+            {
+                return null;
+            }
+            return new string(buffer, 0, length - 1);
+        }
+
+        // The install folder that Windows reports for a package, or null.
+        private static string PackagePathOf(string packageName)
+        {
+            if (!InstallSecurity.IsPackageFullName(packageName))
+            {
+                return null;
+            }
+            char[] buffer = new char[1024];
+            int length = buffer.Length;
+            int status = GetPackagePathByFullName(packageName, ref length, buffer);
+            if (status == ErrorInsufficientBuffer && length > buffer.Length && length < 32768)
+            {
+                buffer = new char[length];
+                status = GetPackagePathByFullName(packageName, ref length, buffer);
+            }
+            if (status != 0 || length <= 1 || length > buffer.Length)
+            {
+                return null;
+            }
+            return new string(buffer, 0, length - 1);
+        }
+
+        // The drive type of the volume that holds path (through any mount
+        // point), or 0 when it cannot be read.
+        private static uint DriveTypeOf(string path)
+        {
+            string normalized = InstallSecurity.NormalizeFinalPath(path);
+            if (normalized == null)
+            {
+                return 0;
+            }
+            char[] volume = new char[1024];
+            if (!GetVolumePathNameW(normalized, volume, (uint)volume.Length))
+            {
+                return 0;
+            }
+            int end = Array.IndexOf(volume, '\0');
+            if (end <= 0)
+            {
+                return 0;
+            }
+            return GetDriveTypeW(new string(volume, 0, end));
+        }
+
+        // Opens path for its attributes, security, and read data (list
+        // directory for a folder), checks that it is a folder or a file as
+        // expected, and reads its final path. The handle goes into held. The
+        // read-data right makes Windows apply the share mode: a folder is
+        // shared for read and write and a file for read only, and neither
+        // allows delete, so nothing can rename, replace, remove, or (for a
+        // file) write it while the handle is open. Returns Started on
         // success, EngineMissing when the path does not exist,
         // InstallUntrusted when the object has the wrong kind, and Failed
         // for any other open failure.
@@ -377,7 +475,7 @@ namespace HotspotShade.WinUI2.Elevate
             }
             IntPtr opened = CreateFileW(
                 @"\\?\" + normalized,
-                FileReadAttributes | ReadControl,
+                FileReadAttributes | ReadControl | FileReadData,
                 directory ? FileShareRead | FileShareWrite : FileShareRead,
                 IntPtr.Zero,
                 OpenExisting,
@@ -675,6 +773,10 @@ namespace HotspotShade.WinUI2.Elevate
             int have = 0;
             while (have < count)
             {
+                if (Volatile.Read(ref stopping) != 0)
+                {
+                    return null;
+                }
                 int read;
                 if (!ReadFile(pipe, chunk, count - have, out read, IntPtr.Zero) || read <= 0)
                 {
@@ -876,6 +978,19 @@ namespace HotspotShade.WinUI2.Elevate
 
         [DllImport("kernel32.dll")]
         private static extern IntPtr LocalFree(IntPtr memory);
+
+        // Returns a Win32 error code. The length counts the final null.
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetPackageFullName(IntPtr process, ref int length, [Out] char[] name);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetPackagePathByFullName(string packageFullName, ref int length, [Out] char[] path);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool GetVolumePathNameW(string path, [Out] char[] volume, uint length);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern uint GetDriveTypeW(string root);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool InitializeProcThreadAttributeList(IntPtr attributeList, int count, int flags, ref IntPtr size);
