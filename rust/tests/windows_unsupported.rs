@@ -28,6 +28,17 @@ fn unsupported_commands_report_a_clear_error() {
 }
 
 #[test]
+fn the_real_gui_fails_closed_without_an_authenticated_launcher() {
+    let output = Command::new(env!("CARGO_BIN_EXE_hotspotshade"))
+        .args(["gui", "--no-open", "--port", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("authenticated launcher"), "{stderr}");
+}
+
+#[test]
 fn probe_reports_read_only_values_without_a_tunnel() {
     let output = Command::new(env!("CARGO_BIN_EXE_hotspotshade"))
         .arg("probe")
@@ -57,8 +68,12 @@ fn a_tunnel_start_without_a_source_device_names_the_mode_error() {
     );
 }
 
+/// The token gate runs after the elevation check and the Wintun load, right
+/// before the token check. A standard-user test run stops at the elevation
+/// check, and an elevated run stops at the missing Wintun file. Neither path
+/// reaches the token gate, a token use, an adapter, or a route.
 #[test]
-fn a_tunnel_start_with_a_missing_wintun_path_names_the_dependency() {
+fn a_phone_tunnel_start_stops_before_any_token_use_without_admin_or_wintun() {
     let output = Command::new(env!("CARGO_BIN_EXE_hotspotshade"))
         .args([
             "tun",
@@ -74,11 +89,11 @@ fn a_tunnel_start_with_a_missing_wintun_path_names_the_dependency() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // The process checks Administrator rights before it loads the DLL.
     assert!(
         stderr.contains("administrator privileges") || stderr.contains("wintun.dll"),
         "{stderr}"
     );
+    assert!(!stderr.contains("source_gateway_unproven"), "{stderr}");
     assert!(
         !stderr.contains("The tunnel is not implemented on Windows."),
         "{stderr}"

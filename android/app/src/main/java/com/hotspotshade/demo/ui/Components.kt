@@ -5,7 +5,6 @@ import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.FiniteAnimationSpec
 import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
@@ -25,23 +24,16 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.selection.selectable
-import androidx.compose.foundation.selection.selectableGroup
-import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -49,14 +41,10 @@ import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
@@ -77,7 +65,6 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.hotspotshade.demo.model.StatusKind
 import com.hotspotshade.demo.ui.theme.LocalHsTokens
@@ -153,60 +140,6 @@ fun SectionDivider() {
         thickness = 1.dp,
         color = LocalHsTokens.current.separator,
     )
-}
-
-@Composable
-fun SettingsToggleRow(
-    title: String,
-    checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit,
-    modifier: Modifier = Modifier,
-    description: String? = null,
-    enabled: Boolean = true,
-) {
-    Row(
-        modifier = modifier
-            .fillMaxWidth()
-            .toggleable(
-                value = checked,
-                enabled = enabled,
-                role = Role.Switch,
-                onValueChange = onCheckedChange,
-            )
-            .padding(horizontal = 16.dp, vertical = 12.dp)
-            .heightIn(min = 24.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(16.dp),
-    ) {
-        Column(Modifier.weight(1f)) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.bodyLarge,
-                color = if (enabled) {
-                    MaterialTheme.colorScheme.onSurface
-                } else {
-                    LocalHsTokens.current.secondaryText
-                },
-            )
-            if (description != null) {
-                Text(
-                    text = description,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = LocalHsTokens.current.secondaryText,
-                    modifier = Modifier.padding(top = 2.dp),
-                )
-            }
-        }
-        Switch(
-            checked = checked,
-            onCheckedChange = null,
-            enabled = enabled,
-            colors = SwitchDefaults.colors(
-                checkedThumbColor = Color.White,
-                checkedTrackColor = MaterialTheme.colorScheme.primary,
-            ),
-        )
-    }
 }
 
 @Composable
@@ -418,7 +351,6 @@ fun StatusDot(kind: StatusKind, size: Dp = 11.dp) {
         StatusKind.OFF -> tokens.statusOff
         StatusKind.STARTING -> scheme.primary
         StatusKind.ON -> tokens.success
-        StatusKind.PAIRING -> scheme.primary
         StatusKind.ATTENTION -> tokens.warning
     }
     val reduce = LocalReduceMotion.current
@@ -451,171 +383,6 @@ fun StatusDot(kind: StatusKind, size: Dp = 11.dp) {
             }
             .background(color, CircleShape),
     )
-}
-
-@Composable
-fun SimulatedBadge(text: String = "Simulated") {
-    val tokens = LocalHsTokens.current
-    Surface(
-        shape = RoundedCornerShape(6.dp),
-        color = tokens.warning.copy(alpha = 0.12f),
-        contentColor = tokens.warning,
-        border = BorderStroke(1.dp, tokens.warning.copy(alpha = 0.35f)),
-    ) {
-        Text(
-            text = text.uppercase(),
-            style = MaterialTheme.typography.labelSmall,
-            color = tokens.warning,
-            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-        )
-    }
-}
-
-@Composable
-fun SegmentedControl(
-    options: List<String>,
-    selectedIndex: Int,
-    onSelect: (Int) -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    require(options.isNotEmpty())
-    val tokens = LocalHsTokens.current
-    val reduce = LocalReduceMotion.current
-    Surface(
-        modifier = modifier,
-        shape = RoundedCornerShape(10.dp),
-        color = tokens.tertiaryFill,
-        tonalElevation = 0.dp,
-    ) {
-        BoxWithConstraints(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(48.dp),
-        ) {
-            val itemWidth = maxWidth / options.size
-            val offset by animateDpAsState(
-                targetValue = itemWidth * selectedIndex,
-                animationSpec = if (reduce) snap() else tween(180, easing = FastOutSlowInEasing),
-                label = "segmented selection",
-            )
-            Box(
-                Modifier
-                    .offset { IntOffset(x = offset.roundToPx(), y = 0) }
-                    .width(itemWidth)
-                    .fillMaxHeight()
-                    .padding(3.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(tokens.segmentIndicator)
-                    .shadow(1.dp, RoundedCornerShape(8.dp), clip = false),
-            )
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .fillMaxHeight()
-                    .selectableGroup(),
-            ) {
-                options.forEachIndexed { index, option ->
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxHeight()
-                            .selectable(
-                                selected = index == selectedIndex,
-                                onClick = { onSelect(index) },
-                                role = Role.Tab,
-                            ),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text(
-                            text = option,
-                            style = MaterialTheme.typography.labelMedium,
-                            color = if (index == selectedIndex) {
-                                MaterialTheme.colorScheme.onSurface
-                            } else {
-                                tokens.secondaryText
-                            },
-                            maxLines = 1,
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
-@Composable
-fun OptionChips(
-    options: List<String>,
-    selectedIndex: Int,
-    onSelect: (Int) -> Unit,
-    modifier: Modifier = Modifier,
-    enabled: Boolean = true,
-) {
-    val tokens = LocalHsTokens.current
-    androidx.compose.foundation.layout.FlowRow(
-        modifier = modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        options.forEachIndexed { index, label ->
-            FilterChip(
-                selected = index == selectedIndex,
-                enabled = enabled,
-                onClick = { onSelect(index) },
-                label = { Text(label, style = MaterialTheme.typography.labelMedium) },
-                shape = RoundedCornerShape(8.dp),
-                colors = FilterChipDefaults.filterChipColors(
-                    containerColor = MaterialTheme.colorScheme.surface,
-                    labelColor = MaterialTheme.colorScheme.onSurface,
-                    selectedContainerColor = tokens.chipSurface,
-                    selectedLabelColor = MaterialTheme.colorScheme.primary,
-                ),
-                border = FilterChipDefaults.filterChipBorder(
-                    enabled = enabled,
-                    selected = index == selectedIndex,
-                    borderColor = tokens.separator,
-                    selectedBorderColor = tokens.chipBorder,
-                ),
-            )
-        }
-    }
-}
-
-@Composable
-fun EmptyState(
-    icon: ImageVector,
-    title: String,
-    detail: String,
-    modifier: Modifier = Modifier,
-) {
-    val tokens = LocalHsTokens.current
-    Column(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(vertical = 40.dp, horizontal = 16.dp)
-            .semantics(mergeDescendants = true) {},
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = null,
-            tint = tokens.secondaryText,
-            modifier = Modifier.size(40.dp),
-        )
-        Text(
-            text = title,
-            style = MaterialTheme.typography.titleMedium,
-            textAlign = TextAlign.Center,
-        )
-        Text(
-            text = detail,
-            style = MaterialTheme.typography.bodyMedium,
-            color = tokens.secondaryText,
-            textAlign = TextAlign.Center,
-        )
-    }
 }
 
 @Composable

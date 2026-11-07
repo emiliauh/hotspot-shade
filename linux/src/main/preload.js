@@ -23,7 +23,8 @@ const windowKind = typeof process !== 'undefined'
   ? 'settings'
   : 'main';
 
-const SETTING_NAMES = Object.freeze(['notifications', 'launchAtLogin', 'ping']);
+const SETTING_NAMES = Object.freeze(['notifications', 'launchAtLogin', 'ping', 'tunnelMode']);
+const START_MODES = Object.freeze(['phone', 'direct']);
 
 const MENU_COMMANDS = Object.freeze([
   'dashboard',
@@ -63,8 +64,11 @@ contextBridge.exposeInMainWorld('hotspotshade', Object.freeze({
     return invoke('hs:forget');
   },
   start: function (options) {
+    const mode = options && typeof options === 'object' && START_MODES.includes(options.mode)
+      ? options.mode
+      : 'phone';
     const ping = options && typeof options === 'object' && options.ping === true;
-    return invoke('hs:start', { ping: ping });
+    return invoke('hs:start', { mode: mode, ping: ping });
   },
   stop: function () {
     return invoke('hs:stop');
@@ -92,6 +96,10 @@ contextBridge.exposeInMainWorld('hotspotshade', Object.freeze({
   },
   updateSetting: function (name, value) {
     if (!SETTING_NAMES.includes(name)) return Promise.resolve({ ok: false, error: { code: 'invalid_input', message: 'The request is not valid.' } });
+    if (name === 'tunnelMode') {
+      if (!START_MODES.includes(value)) return Promise.resolve({ ok: false, error: { code: 'invalid_input', message: 'The request is not valid.' } });
+      return invoke('hs:settings-update', { name: name, value: value });
+    }
     return invoke('hs:settings-update', { name: name, value: value === true });
   },
   onMenuCommand: function (handler) {

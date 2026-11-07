@@ -12,6 +12,7 @@ const {
   resolveEngineConfig
 } = require('../src/backend/engine-client.js');
 const { createEngineBackend } = require('../src/backend/engine-backend.js');
+const { BackendError } = require('../src/backend/errors.js');
 
 const SECRET = 'ab'.repeat(32);
 
@@ -40,6 +41,9 @@ async function fakeEngine(handler) {
   return {
     port: server.address().port,
     requests,
+    closeAllConnections() {
+      server.closeAllConnections();
+    },
     close() {
       return new Promise((resolve) => server.close(resolve));
     }
@@ -165,7 +169,7 @@ test('the HTTP boundary sends only the fixed operations', async () => {
     assert.deepEqual(await client.call('pairCancel'), { state: 'idle', code: null, error: null });
     assert.deepEqual(await client.call('forget'), { ok: true });
     assert.deepEqual(await client.call('probe'), { ok: true, phone: { state: 'ready' } });
-    assert.deepEqual(await client.call('start', { ping: true }), { running: true, paired: true });
+    assert.deepEqual(await client.call('start', { mode: 'phone', ping: true }), { running: true, paired: true });
     assert.deepEqual(await client.call('stop'), { running: false, last_stop_message: 'You turned the tunnel off.' });
     assert.deepEqual(await client.call('failures'), { ok: true, total: 0, groups: [], recent: [] });
     assert.deepEqual(await client.call('diagnostics'), { ok: true, running: false, demo: true });
@@ -198,6 +202,40 @@ test('the HTTP boundary sends only the fixed operations', async () => {
   }
 });
 
+test('direct mode sends one fixed engine body with IPv6 blocked', async () => {
+  const engine = await fakeEngine((request, response) => {
+    reply(response, 200, { ok: true, status: { running: true, mode: 'tun' }, result: { mode: 'tun' } });
+  });
+  try {
+    const client = createEngineHttpClient({ port: engine.port, secret: SECRET });
+    assert.deepEqual(await client.call('start', { mode: 'direct', ping: true }), { running: true, mode: 'tun' });
+    assert.equal(engine.requests.length, 1);
+    const request = engine.requests[0];
+    assert.equal(request.method, 'POST');
+    assert.equal(request.url, '/api/start');
+    assert.equal(request.body, '{"mode":"tun","options":{"ipv6":"block"}}');
+    assert.doesNotMatch(request.body, /iface|host|token|dns|no_pin|experimental_icmp/);
+  } finally {
+    await engine.close();
+  }
+});
+
+test('a direct start refusal keeps a stable code and message', async () => {
+  const engine = await fakeEngine((request, response) => {
+    reply(response, 400, { ok: false, error: 'Start HotspotShade as Administrator to use the tunnel.' });
+  });
+  try {
+    const client = createEngineHttpClient({ port: engine.port, secret: SECRET });
+    await assert.rejects(client.call('start', { mode: 'direct', ping: false }), (error) => {
+      assert.equal(error.code, 'admin_required');
+      assert.match(error.message, /Administrator/);
+      return true;
+    });
+  } finally {
+    await engine.close();
+  }
+});
+
 test('unknown operations and invalid activity values never reach the engine', async () => {
   const engine = await fakeEngine((request, response) => reply(response, 200, {}));
   try {
@@ -206,6 +244,7 @@ test('unknown operations and invalid activity values never reach the engine', as
     await assert.rejects(client.call('/api/status'), { code: 'invalid_request' });
     await assert.rejects(client.call('activity', { since: -1 }), { code: 'invalid_request' });
     await assert.rejects(client.call('activity', { since: 1.5 }), { code: 'invalid_request' });
+    await assert.rejects(client.call('start', { mode: 'tun', ping: true }), { code: 'invalid_request' });
     assert.equal(engine.requests.length, 0);
   } finally {
     await engine.close();
@@ -243,14 +282,14 @@ test('engine errors become plain errors with fixed codes', async () => {
     });
   });
   await one((request, response) => reply(response, 409, { ok: false, code: 'phone_token_rejected', error: 'Pair again.' }), async (client) => {
-    await assert.rejects(client.call('start', { ping: true }), (error) => {
+    await assert.rejects(client.call('start', { mode: 'phone', ping: true }), (error) => {
       assert.equal(error.code, 'phone_token_rejected');
       assert.equal(error.message, 'Pair again.');
       return true;
     });
   });
   await one((request, response) => reply(response, 200, { ok: false, error: 'The service could not start.' }), async (client) => {
-    await assert.rejects(client.call('start', { ping: false }), (error) => {
+    await assert.rejects(client.call('start', { mode: 'phone', ping: false }), (error) => {
       assert.equal(error.code, 'engine_error');
       assert.equal(error.message, 'The service could not start.');
       return true;
@@ -267,6 +306,144 @@ test('engine errors become plain errors with fixed codes', async () => {
     });
   });
   assert.deepEqual(cases, ['engine_unauthorized']);
+});
+
+test('a trickling response cannot extend the request deadline', { timeout: 10000 }, async () => {
+  let interval;
+  let writes = 0;
+  let watchdog;
+  const engine = await fakeEngine((_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.write(' ');
+    interval = setInterval(() => { writes += 1; response.write(' '); }, 100);
+    response.on('close', () => clearInterval(interval));
+  });
+  try {
+    const client = createEngineHttpClient({ port: engine.port, secret: SECRET });
+    const start = performance.now();
+    const watchdogFailure = new Promise((_, reject) => {
+      watchdog = setTimeout(() => reject(new Error('test watchdog expired')), 5500);
+    });
+    await assert.rejects(Promise.race([client.call('status'), watchdogFailure]), { code: 'engine_timeout' });
+    const elapsed = performance.now() - start;
+    assert.ok(elapsed >= 2300 && elapsed < 5000, `deadline took ${elapsed}ms`);
+    assert.ok(writes > 10, `only ${writes} trickle writes`);
+  } finally {
+    clearTimeout(watchdog);
+    clearInterval(interval);
+    engine.closeAllConnections();
+    await engine.close();
+  }
+});
+
+test('a response that trickles within the deadline can complete', { timeout: 6000 }, async () => {
+  let interval;
+  let completion;
+  let writes = 0;
+  const engine = await fakeEngine((_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    interval = setInterval(() => { writes += 1; response.write(' '); }, 100);
+    completion = setTimeout(() => {
+      clearInterval(interval);
+      response.end('{"running":false}');
+    }, 2000);
+    response.on('close', () => { clearInterval(interval); clearTimeout(completion); });
+  });
+  try {
+    const client = createEngineHttpClient({ port: engine.port, secret: SECRET });
+    assert.deepEqual(await client.call('status'), { running: false });
+    assert.ok(writes > 10, `only ${writes} trickle writes`);
+  } finally {
+    clearInterval(interval);
+    clearTimeout(completion);
+    engine.closeAllConnections();
+    await engine.close();
+  }
+});
+
+test('start and stop keep their longer request budgets', async () => {
+  const requests = [];
+  const client = createEngineHttpClient({
+    port: 1,
+    secret: SECRET,
+    request: async (request) => {
+      requests.push(request);
+      return { statusCode: 200, body: '{"ok":true,"status":{}}' };
+    }
+  });
+  await client.call('start', { mode: 'direct' });
+  await client.call('stop');
+  assert.deepEqual(requests.map((request) => request.timeoutMs), [90000, 70000]);
+});
+
+test('start and stop timeouts do not imply that the engine operation was canceled', async () => {
+  const client = createEngineHttpClient({
+    port: 1,
+    secret: SECRET,
+    request: async () => { throw new BackendError('engine_timeout', 'The engine did not answer in time.'); }
+  });
+  for (const [operation, state] of [['start', 'starting'], ['stop', 'stopping']]) {
+    await assert.rejects(client.call(operation, operation === 'start' ? { mode: 'direct' } : undefined), (error) => {
+      assert.equal(error.code, 'engine_timeout');
+      assert.equal(error.message, `The engine did not answer in time. It may still be ${state}. Check the current status.`);
+      return true;
+    });
+  }
+  await assert.rejects(client.call('status'), {
+    code: 'engine_timeout', message: 'The engine did not answer in time.'
+  });
+});
+
+test('unusable start and stop responses leave the operation outcome unknown', async () => {
+  const scenarios = [
+    { request: async () => { throw new Error('private transport detail'); }, code: 'engine_unavailable' },
+    { request: async () => { throw new BackendError('engine_response_too_large', 'oversized'); }, code: 'engine_response_too_large' },
+    { request: async () => null, code: 'engine_bad_response' },
+    { request: async () => ({ statusCode: 200, body: '{' }), code: 'engine_bad_response' },
+    { request: async () => ({ statusCode: 200, body: '[]' }), code: 'engine_bad_response' }
+  ];
+  for (const scenario of scenarios) {
+    const client = createEngineHttpClient({ port: 1, secret: SECRET, request: scenario.request });
+    for (const [operation, state] of [['start', 'starting'], ['stop', 'stopping']]) {
+      await assert.rejects(client.call(operation, operation === 'start' ? { mode: 'direct' } : undefined), (error) => {
+        assert.equal(error.code, scenario.code);
+        assert.equal(error.message, `The engine did not return a usable response. It may still be ${state}. Check the current status.`);
+        assert.ok(!error.message.includes('private transport detail'));
+        return true;
+      });
+    }
+  }
+});
+
+test('a dropped response can follow an applied start or stop', async () => {
+  let running = false;
+  const engine = await fakeEngine((request, response) => {
+    if (request.url === '/api/start') {
+      running = true;
+      response.destroy();
+    } else if (request.url === '/api/stop') {
+      running = false;
+      response.destroy();
+    } else {
+      reply(response, 200, { running });
+    }
+  });
+  try {
+    const client = createEngineHttpClient({ port: engine.port, secret: SECRET });
+    await assert.rejects(client.call('start', { mode: 'direct' }), {
+      code: 'engine_unavailable',
+      message: 'The engine did not return a usable response. It may still be starting. Check the current status.'
+    });
+    assert.equal((await client.call('status')).running, true);
+    await assert.rejects(client.call('stop'), {
+      code: 'engine_unavailable',
+      message: 'The engine did not return a usable response. It may still be stopping. Check the current status.'
+    });
+    assert.equal((await client.call('status')).running, false);
+  } finally {
+    engine.closeAllConnections();
+    await engine.close();
+  }
 });
 
 test('a response over the size limit is refused', async () => {
@@ -304,7 +481,8 @@ test('the backend maps the fixed methods and never adds a path or secret', async
   assert.deepEqual(await backend.beginPairing(), { operation: 'pair' });
   assert.deepEqual(await backend.cancelPairing(), { operation: 'pairCancel' });
   assert.deepEqual(await backend.forget(), { operation: 'forget' });
-  assert.deepEqual(await backend.start({ ping: true }), { operation: 'start' });
+  assert.deepEqual(await backend.start({ mode: 'phone', ping: true }), { operation: 'start' });
+  assert.deepEqual(await backend.start({ mode: 'direct', ping: true }), { operation: 'start' });
   assert.deepEqual(await backend.stop(), { operation: 'stop' });
   assert.deepEqual(await backend.probe(), { operation: 'probe' });
   assert.deepEqual(await backend.activity({ since: 3 }), { operation: 'activity' });
@@ -318,7 +496,8 @@ test('the backend maps the fixed methods and never adds a path or secret', async
     ['pair', undefined],
     ['pairCancel', undefined],
     ['forget', undefined],
-    ['start', { ping: true }],
+    ['start', { mode: 'phone', ping: true }],
+    ['start', { mode: 'direct', ping: false }],
     ['stop', undefined],
     ['probe', undefined],
     ['activity', { since: 3 }],

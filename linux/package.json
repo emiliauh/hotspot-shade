@@ -16,6 +16,7 @@
     "test:settings-window": "electron test/settings-window-main.js",
     "test:engine-smoke": "electron test/engine-smoke-main.js",
     "test:main-engine": "electron test/main-engine-launch.js",
+    "test:main-engine-warning": "HS_TEST_DEMO_CRASH_WARNING=1 electron test/main-engine-launch.js",
     "measure:memory": "electron test/memory-main.js",
     "measure:responsiveness": "electron test/responsiveness-main.js",
     "package:deb": "sh scripts/package-deb.sh"

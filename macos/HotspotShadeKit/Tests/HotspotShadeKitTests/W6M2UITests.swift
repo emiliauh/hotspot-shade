@@ -168,6 +168,9 @@ import XCTest
         XCTAssertTrue(status.contains(Strings.on))
         XCTAssertTrue(status.contains(Strings.onSubtitle))
 
+        let detailed = AccessibilityText.status(kind: .on, title: Strings.on, subtitle: Strings.onSubtitle, checkedText: Strings.checkedJustNow)
+        XCTAssertTrue(detailed.contains(Strings.checkedJustNow))
+
         let card = AccessibilityText.card(title: "Connection", lines: ["Ping is on.", "Last stop: none."])
         XCTAssertEqual(card, "Connection. Ping is on. Last stop: none.")
 
@@ -178,6 +181,37 @@ import XCTest
         XCTAssertEqual(AccessibilityText.code("123 456"), "Pairing code 123 456")
         XCTAssertEqual(AccessibilityText.code(nil), UIStrings.pairingCodeLabel)
         XCTAssertEqual(AccessibilityText.menuStatus(title: "On", detail: "The tunnel is on."), "On. The tunnel is on.")
+    }
+
+    // The failure table has one plain text for each state. An unavailable
+    // status never claims that the tunnel is off, and Refresh stays off.
+    func testFailureTableUnavailableAndStaleText() {
+        XCTAssertEqual(
+            FailuresViewText.placeholder(state: .idle, tunnelRunning: false, unavailable: true, stale: false, recoveryBlocked: false, serviceStateUnknown: false),
+            UIStrings.statusUnavailableLine
+        )
+        XCTAssertFalse(
+            FailuresViewText.refreshEnabled(state: .idle, tunnelRunning: false, unavailable: true, recoveryBlocked: false)
+        )
+        XCTAssertEqual(
+            FailuresViewText.placeholder(state: .idle, tunnelRunning: false, unavailable: false, stale: true, recoveryBlocked: false, serviceStateUnknown: false),
+            Strings.staleStatus
+        )
+        XCTAssertEqual(
+            FailuresViewText.placeholder(state: .idle, tunnelRunning: false, unavailable: false, stale: false, recoveryBlocked: false, serviceStateUnknown: false),
+            Strings.failuresTunnelOff
+        )
+        XCTAssertEqual(
+            FailuresViewText.placeholder(state: .empty, tunnelRunning: true, unavailable: false, stale: false, recoveryBlocked: false, serviceStateUnknown: false),
+            Strings.noFailures
+        )
+        XCTAssertEqual(
+            FailuresViewText.placeholder(state: .loading, tunnelRunning: true, unavailable: false, stale: false, recoveryBlocked: false, serviceStateUnknown: false),
+            nil
+        )
+        XCTAssertTrue(
+            FailuresViewText.refreshEnabled(state: .empty, tunnelRunning: true, unavailable: false, recoveryBlocked: false)
+        )
     }
 
     // MARK: - Screen mapping
@@ -203,7 +237,7 @@ import XCTest
         XCTAssertEqual(content.sourceDevice.value, UIStrings.statusUnavailableLine)
         XCTAssertEqual(content.sourceDevice.details, [UIStrings.checkStatusAgain])
         XCTAssertEqual(content.connection.value, UIStrings.statusUnavailableLine)
-        XCTAssertEqual(content.connection.details, [UIStrings.noConnectionYet])
+        XCTAssertEqual(content.connection.details, [UIStrings.checkStatusAgain])
     }
 
     // The source card uses the same state as the header. It must not say

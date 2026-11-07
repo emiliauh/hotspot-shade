@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <meta name="description" content="HotspotShade for Linux. The app uses a labeled demo backend or the local engine service.">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'; media-src 'none'; object-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'">
-  <title>HotspotShade (Demo) · Dashboard</title>
+  <title>HotspotShade · Dashboard</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <script src="boot.js"></script>
   <link rel="stylesheet" href="styles.css">
@@ -111,6 +111,14 @@
               <div class="hero-actions">
                 <button type="button" class="button button-primary button-large" id="primaryAction" hidden>Pair with source device</button>
                 <button type="button" class="button button-secondary button-large" id="secondaryAction" hidden>Forget this source device</button>
+              </div>
+              <div class="mode-choice">
+                <span class="field-label" id="modeChoiceLabel">Tunnel mode</span>
+                <div class="segmented" role="group" aria-labelledby="modeChoiceLabel">
+                  <button type="button" class="segment" id="modePhone" data-start-mode="phone" aria-pressed="true">Source device proxy</button>
+                  <button type="button" class="segment" id="modeDirect" data-start-mode="direct" aria-pressed="false">Direct</button>
+                </div>
+                <p class="mode-help" id="modeHelp">Uses the HotspotShade app on the source device. IPv6 is forwarded through the source device.</p>
               </div>
               <p class="hint-line" id="pairHint" hidden>Pair when you are ready.</p>
             </article>
@@ -270,8 +278,8 @@
             </article>
 
             <article class="card" id="modeCard">
-              <h2 class="section-title" id="modeCardTitle">Demo mode</h2>
-              <p class="body-copy" id="modeCardBody">This app uses the in-memory demo backend. It has no tunnel, no route change, no TUN device, no listener, and no external request. Demo data only.</p>
+              <h2 class="section-title" id="modeCardTitle">App mode</h2>
+              <p class="body-copy" id="modeCardBody">Loading the app mode.</p>
             </article>
           </div>
 
@@ -285,6 +293,7 @@
                 <button type="button" class="button button-secondary" id="settingsCancel" hidden>Cancel</button>
                 <button type="button" class="button button-secondary" id="settingsForget" hidden>Forget this source device</button>
                 <button type="button" class="button button-danger" id="settingsTurnOffForget" hidden>Turn off and forget</button>
+                <button type="button" class="button button-secondary" id="settingsTryStop" hidden>Try to turn off</button>
               </div>
               <p class="note" id="settingsPairReason" hidden></p>
               <p class="note">Forget removes this pairing from this target device. Stop the tunnel first.</p>
@@ -326,7 +335,24 @@
               <p class="body-copy" id="wifiAdvice">No Wi-Fi advice right now.</p>
             </article>
 
-            <article class="card" id="demoScenariosCard">
+            <article class="card" id="privacyCard" aria-labelledby="privacyTitle">
+              <div class="section-head">
+                <div>
+                  <h2 class="section-title" id="privacyTitle">Destination privacy</h2>
+                  <p class="section-subtitle" id="privacySubtitle">What this build can and cannot hide. This card is read-only and does not report a live mode.</p>
+                </div>
+                <span class="pill" id="privacyModePill">Off (default)</span>
+              </div>
+              <p class="body-copy" id="privacyIntro">This card reports what this build can do. It does not report whether a tunnel is running.</p>
+              <ul class="privacy-modes" id="privacyModes"></ul>
+              <h3 class="privacy-heading" id="privacyFactsTitle">Build capabilities</h3>
+              <ul class="privacy-facts" id="privacyFacts"></ul>
+              <h3 class="privacy-heading" id="privacyLimitsTitle">What may stay visible</h3>
+              <ul class="limitation-list" id="privacyLimits"></ul>
+              <p class="note" id="privacyStorageNote">This card has no switch and saves no setting.</p>
+            </article>
+
+            <article class="card" id="demoScenariosCard" hidden>
               <h2 class="section-title">Demo scenarios</h2>
               <p class="section-subtitle">These controls change simulated data only. They cannot start a tunnel.</p>
               <div class="scenario-row">
@@ -346,7 +372,7 @@
               <dl class="detail-table">
                 <div><dt>App version</dt><dd id="appVersion">0.1.0</dd></div>
                 <div><dt>Platform</dt><dd id="appPlatform">Linux</dd></div>
-                <div><dt>Mode</dt><dd id="appMode">Demo. Data is simulated.</dd></div>
+                <div><dt>Mode</dt><dd id="appMode">Loading.</dd></div>
                 <div><dt>Status</dt><dd id="appStatus">Starting</dd></div>
                 <div><dt>Engine boundary</dt><dd id="appBoundary">Not connected</dd></div>
                 <div><dt>Tunnel</dt><dd id="appTunnel">Not implemented</dd></div>
@@ -357,7 +383,7 @@
               </div>
             </article>
 
-            <article class="card" id="demoLimits">
+            <article class="card" id="demoLimits" hidden>
               <h2 class="section-title">Demo limitations</h2>
               <ul class="limitation-list">
                 <li>No tunnel and no route change.</li>
@@ -375,7 +401,8 @@
               <ul class="limitation-list">
                 <li>The engine listens on 127.0.0.1 only. The page never receives the engine secret.</li>
                 <li>The packaged app starts the engine with the pkexec helper. A development build needs an explicit engine path and root outside the app.</li>
-                <li>Direct mode is not implemented in this app.</li>
+                <li>Direct mode is available through the same engine service. It uses no source device app and blocks IPv6 by default.</li>
+                <li>Live direct-mode routing and route cleanup are not verified. The engine removes its routes and device on a graceful stop.</li>
                 <li>Live hotspot support is not verified.</li>
                 <li>The app never restarts the engine or the tunnel by itself.</li>
               </ul>

@@ -11,15 +11,13 @@ public enum MainSection: Hashable {
 // the bottom. Closing the window keeps the app and the menu bar item alive.
 public struct MainWindowView: View {
     @ObservedObject public var model: AppModel
-    public var demo: Bool
     @State private var selection: MainSection? = .dashboard
     @State private var refreshingDashboard = false
     @State private var refreshingActivity = false
     @Environment(\.openSettings) private var openSettings
 
-    public init(model: AppModel, demo: Bool = false) {
+    public init(model: AppModel) {
         self.model = model
-        self.demo = demo
     }
 
     public var body: some View {
@@ -75,7 +73,6 @@ public struct MainWindowView: View {
                 linkAdvice: model.linkAdvice,
                 isPairing: model.isPairing,
                 pairingCode: model.pairing.code,
-                demo: demo,
                 isRefreshing: refreshingDashboard,
                 onAction: perform,
                 onRefresh: refreshDashboard,
@@ -87,6 +84,7 @@ public struct MainWindowView: View {
             ActivityView(
                 lines: model.logLines,
                 unavailable: model.statusUnavailable,
+                error: model.logsError,
                 isLoading: refreshingActivity,
                 onRefresh: refreshActivity
             )
@@ -98,8 +96,10 @@ public struct MainWindowView: View {
         switch action {
         case .pair, .pairAgain:
             Task { await model.beginPairing() }
-        case .turnOn, .turnOff:
-            Task { await model.toggle() }
+        case .turnOn:
+            Task { await model.turnOn() }
+        case .turnOff:
+            Task { await model.turnOff() }
         case .retry:
             Task { await model.perform(.retry) }
         case .checkNow:

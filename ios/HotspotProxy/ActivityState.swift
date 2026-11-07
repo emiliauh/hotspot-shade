@@ -2,11 +2,13 @@ import Foundation
 
 /// Why the proxy stopped. The raw value is saved, so it survives a relaunch.
 enum StopReason: String, CaseIterable {
-    case user, hotspotLost, failed, locationLost, appClosed
+    case user, hotspotLost, hotspotChanged, hotspotUnsupported, failed, locationLost, appClosed
     var message: String {
         switch self {
         case .user: return "You stopped the proxy."
         case .hotspotLost: return "The app lost the hotspot address, so the proxy stopped. Check Personal Hotspot, then tap Start."
+        case .hotspotChanged: return "The hotspot link changed, so the proxy stopped. Check Personal Hotspot, then tap Start."
+        case .hotspotUnsupported: return "The hotspot address is on an unsupported link, so the proxy stopped. Check Personal Hotspot, then tap Start."
         case .failed: return "The proxy stopped because of an error."
         case .locationLost: return LocationHealth.permissionOff
         case .appClosed: return "The app was closed by iOS."
@@ -18,6 +20,8 @@ enum StopReason: String, CaseIterable {
         switch self {
         case .user: return "You stopped it."
         case .hotspotLost: return "The hotspot address was lost."
+        case .hotspotChanged: return "The hotspot link changed."
+        case .hotspotUnsupported: return "The hotspot link is not supported."
         case .failed: return "The proxy stopped because of an error."
         case .locationLost: return "Location turned off."
         case .appClosed: return "The app was closed by iOS."
@@ -32,8 +36,23 @@ enum StopReason: String, CaseIterable {
 enum PlainMessage {
     static let invalidPort = "The proxy port is not valid. Change it in Settings, Advanced."
     static let noHotspot = "Turn on Personal Hotspot. Connect the target device, then tap Start."
+    /// The interface table or the hotspot address could not be read. This is
+    /// not the same as a missing hotspot, so Start must not claim one.
+    static let hotspotUnreadable = "The app cannot read the network interfaces. Check Personal Hotspot, then tap Start."
     static let portInUse = "Something else on this source device uses the proxy port. Change it in Settings, Advanced."
     static let startFailed = "The proxy could not start. Try again."
+    static let tokenUnavailable = "The proxy token is not available. Unlock the device and try again."
+    static let tokenRotationReloaded = "The app could not confirm the token change. It reloaded the stored token."
+    static let tokenRotated = "The source token changed. Paired target devices must pair again for the new token. A trusted target can pair again without a prompt."
+    static let tokenRotationRecovered = "The app finished an interrupted token rotation. Target devices with the old token must pair again for the new token."
+    static let tokenRotationAborted = "The app cleared an interrupted token rotation. The saved token did not change."
+    static let tokenReplaced = "The saved source token was replaced. Target devices that were previously paired must pair again."
+    /// The valid old copy moved back into the Keychain. The app cannot tell
+    /// whether that copy is current. It may predate a rotation whose cleanup
+    /// failed, so this line must not promise that access stayed the same.
+    static let tokenRestored = "The saved source token was restored. If it is older than a rotation, devices with the old token can connect again, and devices using the newer token lose access. Check access on each target device."
+    /// A delayed recovery created a new token because no usable one remained.
+    static let tokenRecreated = "The app created a new source token. Target devices that were paired must pair again."
     static let started = "Proxy started."
     /// A new target device paired. The line names no device.
     static let paired = "A target device was added."
@@ -46,8 +65,16 @@ enum PlainMessage {
 /// or credentials. Each text says what stays on the other side.
 enum ConfirmationText {
     static let forgetAllTitle = "Forget all target devices?"
-    static let forgetAllMessage = "Each target device keeps its copy until it contacts this source device again."
+    static let forgetAllMessage = "Target devices can still connect with their saved token. Forgetting them does not revoke that token. A forgotten target device must be approved to pair again."
+    static let rotateTokenTitle = "Rotate the source token?"
+    static let rotateTokenMessage = "This creates a new source token. Paired target devices must pair again. A target device that is still trusted can pair again without a prompt. A restore can bring back older credentials."
     static let rotateTokenNote = "Target devices that are already paired keep the old token. Pair them again after you rotate the token."
+    static let replaceInvalidTokenTitle = "Replace the saved source token?"
+    static let replaceInvalidTokenMessage = "This replaces the saved source token and deletes the damaged copy. Target devices that were previously paired must pair again. This cannot be undone."
+    static let replaceInvalidTokenNote = "This is available only when no valid saved token remains. Stop the proxy before you replace the token."
+    static let restoreLegacyTokenTitle = "Restore the saved source token?"
+    static let restoreLegacyTokenMessage = "This deletes the damaged keychain item and writes the earlier saved token back. If it is older than a rotation, target devices that still hold the old token can connect again, and devices using the newer token lose access. This can undo a rotation used to revoke access. Continue only if you accept this risk."
+    static let restoreLegacyTokenNote = "This is available only when the keychain item is damaged and the earlier saved token is still valid. The app cannot tell whether that copy is current; it may be older than a rotation whose cleanup failed. Stop the proxy before restoring, then check access on each target device."
 }
 
 enum DisplayState {
@@ -61,11 +88,50 @@ enum DisplayState {
     }
 }
 
+/// The plain Start message for the last hotspot observation. A missing
+/// hotspot and a link that this build cannot use need different words, so
+/// Start does not tell the person to turn on a hotspot that is already on.
+/// The messages hold no address and no port.
+enum HotspotStartMessage {
+    enum Observation: Equatable {
+        case present, unsupported, absent, unreadable
+    }
+
+    static func message(for observation: Observation) -> String {
+        switch observation {
+        case .present, .absent: return PlainMessage.noHotspot
+        case .unsupported: return StopReason.hotspotUnsupported.message
+        case .unreadable: return PlainMessage.hotspotUnreadable
+        }
+    }
+}
+
 enum WakeGap {
     static func message(lastTick: Date?, now: Date) -> String? {
         guard let lastTick = lastTick, now.timeIntervalSince(lastTick) > 60 else { return nil }
         let minutes = max(1, Int(now.timeIntervalSince(lastTick) / 60))
         return "iOS paused the app for \(minutes) \(minutes == 1 ? "minute" : "minutes")"
+    }
+}
+
+/// Tracks a token copy without reading pasteboard contents.
+struct TokenPasteboardOwnership {
+    static let expirationSeconds: TimeInterval = 120
+    private var copiedChangeCount: Int?
+
+    mutating func record(before: Int, after: Int) {
+        let (next, overflow) = before.addingReportingOverflow(1)
+        copiedChangeCount = !overflow && after == next ? after : nil
+    }
+
+    mutating func takeIfUnchanged(currentChangeCount: Int) -> Bool {
+        let owned = copiedChangeCount == currentChangeCount
+        copiedChangeCount = nil
+        return owned
+    }
+
+    mutating func forget() {
+        copiedChangeCount = nil
     }
 }
 
@@ -82,6 +148,13 @@ enum TokenReveal {
         guard let until = until else { return false }
         return now < until
     }
+}
+
+/// The SOCKS5 control values that the proxy and the manual connection screen
+/// must agree on.
+enum ProxyProtocol {
+    /// The SOCKS5 user name. It is not secret, but every client must send it.
+    static let socksUsername = "hotspotshade"
 }
 
 /// The proxy port. The phone picks a random port by itself and tells the target
@@ -234,7 +307,7 @@ enum LocationHealth {
     /// A fix older than this is so old that it says nothing about the app now.
     static let stoppedSeconds: TimeInterval = 300
 
-    static let keepingAwake = "The app stays awake while the proxy runs."
+    static let keepingAwake = "Location updates are active. iOS can still pause the app."
     static let updatesStopped = "Location updates stopped. Open HotspotShade to restart."
     static let noFix = "No location yet."
     static let permissionOff = "Location is off, so iOS can pause the app. Open Settings to turn it on."
@@ -254,8 +327,8 @@ enum LocationHealth {
         return .none
     }
 
-    /// The plain line for the keep-awake card. It must tell the truth: the app
-    /// stays awake only while the location updates flow. `hadFix` is true when
+    /// The plain line for the keep-awake card. Recent location updates do not
+    /// guarantee that iOS will keep the app running. `hadFix` is true when
     /// the app ever received a fix, also in an earlier run.
     static func message(access: LocationAccess, lastFix: Date?, hadFix: Bool, now: Date,
                         keepAwake: Bool, running: Bool, capReached: Bool) -> String {

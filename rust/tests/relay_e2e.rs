@@ -131,6 +131,118 @@ fn udp_echo(socket: UdpSocket, count: usize) -> thread::JoinHandle<()> {
 }
 
 #[test]
+fn mapped_ipv6_inner_flows_use_ipv4_outer_sockets() {
+    let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let udp_listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let tcp_port = tcp_listener.local_addr().unwrap().port();
+    let udp_port = udp_listener.local_addr().unwrap().port();
+    let tcp_task = tcp_echo(tcp_listener, 1);
+    let udp_task = udp_echo(udp_listener, 1);
+    let source: IpAddr = "fd42::2".parse().unwrap();
+    let mapped: IpAddr = Ipv4Addr::LOCALHOST.to_ipv6_mapped().into();
+    let mut tcp = flow(source, mapped, 22001, tcp_port, 7);
+    let udp = flow(source, mapped, 22002, udp_port, 8);
+    let mut relay = Relay::start(RelayConfig {
+        allow_unpinned: true,
+        ipv6_forward: true,
+        workers: 1,
+        ..RelayConfig::default()
+    })
+    .unwrap();
+    relay
+        .dispatch(tcp.tcp(tcp.client_next, 0, packet::SYN, &[]))
+        .unwrap();
+    relay.dispatch(udp.udp(&udp.payload[..128])).unwrap();
+    let mut udp_seen = false;
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && (!tcp.fin_seen || !udp_seen) {
+        let Ok(raw) = relay.recv_timeout(Duration::from_millis(100)) else {
+            continue;
+        };
+        let ip = packet::parse_ip(&raw).expect("valid inner reply");
+        assert_eq!((ip.src, ip.dst), (mapped, source));
+        match ip.protocol {
+            packet::PROTO_UDP => {
+                let segment = packet::parse_udp(ip.payload).unwrap();
+                assert_eq!((segment.sport, segment.dport), (udp_port, udp.sport));
+                assert_eq!(segment.data, &udp.payload[..128]);
+                udp_seen = true;
+            }
+            packet::PROTO_TCP => {
+                let segment = packet::parse_tcp(ip.payload).unwrap();
+                assert_eq!((segment.sport, segment.dport), (tcp_port, tcp.sport));
+                assert_eq!(segment.flags & packet::RST, 0);
+                if !tcp.syn_done
+                    && segment.flags & (packet::SYN | packet::ACK) == (packet::SYN | packet::ACK)
+                {
+                    tcp.syn_done = true;
+                    tcp.client_next += 1;
+                    tcp.server_next = Some(segment.seq.wrapping_add(1));
+                    relay
+                        .dispatch(tcp.tcp(
+                            tcp.client_next,
+                            tcp.server_next.unwrap(),
+                            packet::ACK,
+                            &[],
+                        ))
+                        .unwrap();
+                    for chunk in tcp.payload.chunks(1024) {
+                        relay
+                            .dispatch(tcp.tcp(
+                                tcp.client_next,
+                                tcp.server_next.unwrap(),
+                                packet::ACK | packet::PSH,
+                                chunk,
+                            ))
+                            .unwrap();
+                        tcp.client_next = tcp.client_next.wrapping_add(chunk.len() as u32);
+                    }
+                } else if tcp.syn_done {
+                    let expected = tcp.server_next.unwrap();
+                    if !segment.data.is_empty() && segment.seq == expected {
+                        tcp.received.extend_from_slice(segment.data);
+                        tcp.server_next = Some(expected.wrapping_add(segment.data.len() as u32));
+                    }
+                    if segment.flags & packet::FIN != 0
+                        && segment.seq.wrapping_add(segment.data.len() as u32)
+                            == tcp.server_next.unwrap()
+                    {
+                        tcp.server_next = Some(tcp.server_next.unwrap().wrapping_add(1));
+                        tcp.fin_seen = true;
+                    }
+                    if !segment.data.is_empty() || segment.flags & packet::FIN != 0 {
+                        relay
+                            .dispatch(tcp.tcp(
+                                tcp.client_next,
+                                tcp.server_next.unwrap(),
+                                packet::ACK,
+                                &[],
+                            ))
+                            .unwrap();
+                    }
+                }
+            }
+            _ => panic!("unexpected reply protocol"),
+        }
+    }
+    assert!(udp_seen && tcp.syn_done && tcp.fin_seen);
+    assert_eq!(tcp.received, tcp.payload);
+    let stats = relay.stats();
+    assert_eq!(
+        (
+            stats.tcp_flows,
+            stats.udp_datagrams_in,
+            stats.udp_datagrams_out,
+            stats.ttl_bad
+        ),
+        (1, 1, 1, 0)
+    );
+    relay.stop();
+    tcp_task.join().unwrap();
+    udp_task.join().unwrap();
+}
+
+#[test]
 fn concurrent_ipv4_ipv6_tcp_bulk_and_udp_flows() {
     let v4 = TcpListener::bind("127.0.0.1:0").unwrap();
     let v6 = TcpListener::bind("[::1]:0").unwrap();

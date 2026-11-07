@@ -1,9 +1,12 @@
 using System;
 using System.ComponentModel;
 using System.Threading.Tasks;
-using HotspotShade.WinUI2.Core;
+using HotspotShade.WinUI2.Core.App;
 using HotspotShade.WinUI2.Services;
 using HotspotShade.WinUI2.ViewModels;
+using Windows.ApplicationModel;
+using Windows.System.Profile;
+using Windows.UI.Core;
 using Windows.UI.ViewManagement;
 using Windows.UI.Xaml;
 using Windows.UI.Xaml.Controls;
@@ -12,116 +15,114 @@ using muxc = Microsoft.UI.Xaml.Controls;
 
 namespace HotspotShade.WinUI2
 {
-    // The one window. It shows a native WinUI 2 menu bar, a NavigationView with
-    // Dashboard, Activity, and Settings, and simulated data only. No engine,
-    // service, route, network listener, or credential is present.
+    // The one window: a native WinUI 2 menu bar and a NavigationView with
+    // Dashboard, Activity, and Settings. Every value comes from the real
+    // engine through the broker.
     public sealed partial class MainPage : Page
     {
+        private const string ThemeKey = "app.theme";
+        private const string PingKey = "app.ping";
+        private const string DetailsKey = "app.details";
+
         private readonly LocalSettingsStore settingsStore;
-        private DispatcherTimer pendingTimer;
         private bool syncingControls;
         private bool syncingNavigation;
         private bool dialogOpen;
         private bool initialized;
         private bool codeCopied;
+        private string section = "dashboard";
+        private ElementTheme theme = ElementTheme.Default;
 
         public MainPage()
         {
-            ViewModel = new DemoViewModel(new DemoSession(new SystemDemoClock()));
             settingsStore = new LocalSettingsStore();
+            ViewModel = new MainViewModel(BrokerConnection.Instance, CoreWindow.GetForCurrentThread().Dispatcher);
+            Privacy = new PrivacyCapabilityViewModel();
             this.InitializeComponent();
             ViewModel.PropertyChanged += ViewModel_PropertyChanged;
             Loaded += MainPage_Loaded;
-            Unloaded += MainPage_Unloaded;
         }
 
-        public DemoViewModel ViewModel { get; private set; }
+        public MainViewModel ViewModel { get; private set; }
+
+        // The read-only destination-privacy card. It is fixed capability
+        // text, the same as the macOS Settings card. It offers no control.
+        public PrivacyCapabilityViewModel Privacy { get; private set; }
 
         private void ViewModel_PropertyChanged(object sender, PropertyChangedEventArgs e)
         {
-            // The core replaces its content objects. Update every compiled
-            // binding after one change, including nested card and failure
-            // paths.
             if (this.Bindings != null)
             {
                 this.Bindings.Update();
             }
+            RefreshControls();
         }
 
-        private void MainPage_Loaded(object sender, RoutedEventArgs e)
+        private async void MainPage_Loaded(object sender, RoutedEventArgs e)
         {
-            if (!initialized)
+            if (initialized)
             {
-                initialized = true;
-                LoadSavedSettings();
-                ApplyTheme(ViewModel.Theme);
-                RefreshControls();
-                SelectSection("dashboard");
-                try
-                {
-                    ApplicationView.GetForCurrentView().Title = DemoText.WindowTitle;
-                }
-                catch
-                {
-                    // The manifest display name remains the window title.
-                }
+                return;
             }
-            else
+            initialized = true;
+            LoadSavedSettings();
+            ApplyTheme(theme);
+            SelectSection("dashboard");
+            try
             {
-                RefreshControls();
-                if (ViewModel.HasPendingAction)
-                {
-                    StartPendingTimer();
-                }
+                ApplicationView.GetForCurrentView().Title = "";
             }
+            catch
+            {
+                // The manifest display name remains the window title.
+            }
+            AppVersionText.Text = AppVersion();
+            WindowsVersionText.Text = WindowsVersion();
+            BrokerConnection.Instance.OwnerWindow = WindowHandle.Current();
+            Window.Current.VisibilityChanged += Window_VisibilityChanged;
+            RefreshControls();
+            await ViewModel.StartAsync();
         }
 
-        private void MainPage_Unloaded(object sender, RoutedEventArgs e)
+        private void Window_VisibilityChanged(object sender, VisibilityChangedEventArgs e)
         {
-            StopPendingTimer();
+            ViewModel.SetWindowVisible(e.Visible);
         }
 
         private void LoadSavedSettings()
         {
-            string theme = settingsStore.Read("demo.theme");
-            DemoTheme parsedTheme;
-            if (theme != null && Enum.TryParse<DemoTheme>(theme, out parsedTheme))
+            string savedTheme = settingsStore.Read(ThemeKey);
+            if (savedTheme == "light")
             {
-                ViewModel.SetTheme(parsedTheme);
+                theme = ElementTheme.Light;
+            }
+            else if (savedTheme == "dark")
+            {
+                theme = ElementTheme.Dark;
+            }
+            else
+            {
+                theme = ElementTheme.Default;
             }
 
-            string ping = settingsStore.Read("demo.ping");
-            if (ping == "on")
-            {
-                ViewModel.SetPing(true);
-            }
-            else if (ping == "off")
-            {
-                ViewModel.SetPing(false);
-            }
-
-            string details = settingsStore.Read("demo.details");
-            if (details == "on")
-            {
-                ViewModel.SetActivityDetails(true);
-            }
-            else if (details == "off")
-            {
-                ViewModel.SetActivityDetails(false);
-            }
+            // Let ping work is on by default, like the macOS app.
+            ViewModel.SetPing(settingsStore.Read(PingKey) != "off");
+            ViewModel.SetActivityDetails(settingsStore.Read(DetailsKey) == "on");
         }
 
         // MARK: - Section navigation
 
         private void ShowSection(string tag)
         {
-            if (tag == null)
+            section = tag ?? "dashboard";
+            DashboardScroll.Visibility = section == "dashboard" ? Visibility.Visible : Visibility.Collapsed;
+            ActivityScroll.Visibility = section == "activity" ? Visibility.Visible : Visibility.Collapsed;
+            SettingsScroll.Visibility = section == "settings" ? Visibility.Visible : Visibility.Collapsed;
+            ViewModel.SetActivityVisible(section == "activity");
+            if (section == "activity")
             {
-                tag = "dashboard";
+                Task ignored = ViewModel.LoadActivityAsync(false);
             }
-            DashboardScroll.Visibility = tag == "dashboard" ? Visibility.Visible : Visibility.Collapsed;
-            ActivityScroll.Visibility = tag == "activity" ? Visibility.Visible : Visibility.Collapsed;
-            SettingsScroll.Visibility = tag == "settings" ? Visibility.Visible : Visibility.Collapsed;
         }
 
         private void FocusSection(string tag)
@@ -201,72 +202,68 @@ namespace HotspotShade.WinUI2
 
         // MARK: - Dashboard actions
 
-        private void PrimaryAction_Click(object sender, RoutedEventArgs e)
+        private async void PrimaryAction_Click(object sender, RoutedEventArgs e)
         {
-            ViewModel.PerformPrimaryAction();
-            AfterAction();
+            await ViewModel.PerformAsync(ViewModel.State.PrimaryAction);
         }
 
-        private void SecondaryAction_Click(object sender, RoutedEventArgs e)
+        private async void SecondaryAction_Click(object sender, RoutedEventArgs e)
         {
-            ViewModel.PerformSecondaryAction();
-            AfterAction();
+            DashboardAction action = ViewModel.State.SecondaryAction;
+            if (action == DashboardAction.Forget || action == DashboardAction.TurnOffAndForget)
+            {
+                if (!await ConfirmForgetAsync(action))
+                {
+                    return;
+                }
+            }
+            await ViewModel.PerformAsync(action);
         }
 
-        private void AttentionAction_Click(object sender, RoutedEventArgs e)
+        private async void AttentionAction_Click(object sender, RoutedEventArgs e)
         {
             FrameworkElement element = sender as FrameworkElement;
             AttentionRow row = element == null ? null : element.DataContext as AttentionRow;
-            if (row == null)
+            if (row == null || row.Action == DashboardAction.None)
             {
                 return;
             }
-            ViewModel.PerformAttentionAction(row.Action);
-            AfterAction();
+            if (row.Action == DashboardAction.TurnOffAndForget && !await ConfirmForgetAsync(row.Action))
+            {
+                return;
+            }
+            await ViewModel.PerformAsync(row.Action);
         }
 
-        private void ApprovePairing_Click(object sender, RoutedEventArgs e)
+        private async void CancelPairing_Click(object sender, RoutedEventArgs e)
         {
-            ViewModel.ApprovePairing();
-            AfterAction();
-        }
-
-        private void CancelPairing_Click(object sender, RoutedEventArgs e)
-        {
-            ViewModel.CancelPairing();
-            AfterAction();
-        }
-
-        private void SimulatePairingFailure_Click(object sender, RoutedEventArgs e)
-        {
-            ViewModel.SimulatePairingFailure();
-            AfterAction();
+            await ViewModel.CancelPairingAsync();
         }
 
         private void CopyCode_Click(object sender, RoutedEventArgs e)
         {
-            bool copied = ClipboardService.TrySetText(ViewModel.Dashboard.PairingCode);
+            bool copied = ClipboardService.TrySetText(ViewModel.State.PairingCode);
             codeCopied = copied;
-            CodeCopiedText.Text = copied ? DemoText.CodeCopied : DemoText.CodeCopyFailed;
+            CodeCopiedText.Text = copied ? AppText.CodeCopied : AppText.CopyFailed;
             CodeCopiedText.Visibility = Visibility.Visible;
+        }
+
+        private async void CheckNowFromDashboard_Click(object sender, RoutedEventArgs e)
+        {
+            await CheckNowAsync();
         }
 
         // MARK: - Activity actions
 
-        private void RefreshActivity_Click(object sender, RoutedEventArgs e)
+        private async void RefreshActivity_Click(object sender, RoutedEventArgs e)
         {
-            ViewModel.RefreshActivity();
-            AfterAction();
+            await ViewModel.LoadActivityAsync(false);
         }
 
-        private void CheckNowFromActivity_Click(object sender, RoutedEventArgs e)
+        private async void CheckNowFromActivity_Click(object sender, RoutedEventArgs e)
         {
-            CheckNow();
-        }
-
-        private void CheckNowFromDashboard_Click(object sender, RoutedEventArgs e)
-        {
-            CheckNow();
+            await CheckNowAsync();
+            await ViewModel.LoadActivityAsync(false);
         }
 
         private void ActivityDetails_Changed(object sender, RoutedEventArgs e)
@@ -275,9 +272,9 @@ namespace HotspotShade.WinUI2
             {
                 return;
             }
-            ViewModel.SetActivityDetails(ActivityDetailsToggle.IsChecked == true);
-            settingsStore.Write("demo.details", ViewModel.ShowActivityDetails ? "on" : "off");
-            RefreshControls();
+            bool on = ActivityDetailsToggle.IsChecked == true;
+            ViewModel.SetActivityDetails(on);
+            settingsStore.Write(DetailsKey, on ? "on" : "off");
         }
 
         // MARK: - Settings actions
@@ -289,8 +286,7 @@ namespace HotspotShade.WinUI2
                 return;
             }
             ViewModel.SetPing(PingSwitch.IsOn);
-            settingsStore.Write("demo.ping", PingSwitch.IsOn ? "on" : "off");
-            RefreshControls();
+            settingsStore.Write(PingKey, PingSwitch.IsOn ? "on" : "off");
         }
 
         private void ThemeCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -299,117 +295,92 @@ namespace HotspotShade.WinUI2
             {
                 return;
             }
-            DemoTheme theme;
             if (ThemeCombo.SelectedIndex == 1)
             {
-                theme = DemoTheme.Light;
+                ApplyThemeAndSave(ElementTheme.Light);
             }
             else if (ThemeCombo.SelectedIndex == 2)
             {
-                theme = DemoTheme.Dark;
+                ApplyThemeAndSave(ElementTheme.Dark);
             }
             else
             {
-                theme = DemoTheme.System;
+                ApplyThemeAndSave(ElementTheme.Default);
             }
-            ApplyThemeAndSave(theme);
         }
 
-        private void PairFromSettings_Click(object sender, RoutedEventArgs e)
+        private async void PairFromSettings_Click(object sender, RoutedEventArgs e)
         {
-            ViewModel.BeginPairing();
-            AfterAction();
             SelectSection("dashboard");
+            await ViewModel.PairAsync();
         }
 
-        private void CancelPairingSettings_Click(object sender, RoutedEventArgs e)
+        private async void ForgetButton_Click(object sender, RoutedEventArgs e)
         {
-            ViewModel.CancelPairing();
-            AfterAction();
-        }
-
-        private void ForgetButton_Click(object sender, RoutedEventArgs e)
-        {
-            if (ViewModel.Settings.ForgetBlocked)
+            DashboardAction action = ViewModel.State.ForgetLabel == AppText.TurnOffAndForget
+                ? DashboardAction.TurnOffAndForget
+                : DashboardAction.Forget;
+            if (!await ConfirmForgetAsync(action))
             {
-                ViewModel.TurnOffAndForget();
+                return;
             }
-            else
+            await ViewModel.PerformAsync(action);
+        }
+
+        private async void SettingsPivot_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            // The failure list loads when the person opens Advanced. It
+            // never polls.
+            if (SettingsPivot.SelectedIndex == 2 && !ViewModel.State.FailuresLoading)
             {
-                ViewModel.Forget();
+                await ViewModel.LoadFailuresAsync();
             }
-            AfterAction();
         }
 
-        // MARK: - Failure actions
+        // MARK: - Failure and diagnostics actions
 
-        private void RefreshFailures_Click(object sender, RoutedEventArgs e)
+        private async void RefreshFailures_Click(object sender, RoutedEventArgs e)
         {
-            ViewModel.LoadFailures();
-            AfterAction();
-        }
-
-        private void ClearFailures_Click(object sender, RoutedEventArgs e)
-        {
-            ViewModel.ClearFailures();
-            RefreshControls();
+            await ViewModel.LoadFailuresAsync();
         }
 
         private void CopyFailureReport_Click(object sender, RoutedEventArgs e)
         {
             bool copied = ClipboardService.TrySetText(ViewModel.FailureReport);
-            ReportCopiedText.Text = copied ? DemoText.ReportCopied : DemoText.CopyFailed;
+            ReportCopiedText.Text = copied ? AppText.ReportCopied : AppText.CopyFailed;
             ReportCopiedText.Visibility = Visibility.Visible;
         }
 
-        private void CopyDiagnostics_Click(object sender, RoutedEventArgs e)
+        private async void CopyDiagnostics_Click(object sender, RoutedEventArgs e)
         {
-            bool copied = ClipboardService.TrySetText(ViewModel.DiagnosticsReport);
-            DiagnosticsCopiedText.Text = copied ? DemoText.DiagnosticsCopied : DemoText.CopyFailed;
+            string report = await ViewModel.DiagnosticsReportAsync(AppVersion(), WindowsVersion());
+            bool copied = ClipboardService.TrySetText(report);
+            DiagnosticsCopiedText.Text = copied ? AppText.DiagnosticsCopied : AppText.CopyFailed;
             DiagnosticsCopiedText.Visibility = Visibility.Visible;
         }
 
-        // MARK: - Scenario picker
-
-        private void ScenarioCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
-        {
-            if (syncingControls)
-            {
-                return;
-            }
-            int index = ScenarioCombo.SelectedIndex;
-            if (index < 0 || index >= ViewModel.Scenarios.Count)
-            {
-                return;
-            }
-            StopPendingTimer();
-            ViewModel.ApplyScenario(ViewModel.Scenarios[index].Scenario);
-            AfterAction();
-        }
-
-        private async void ResetDemoButton_Click(object sender, RoutedEventArgs e)
-        {
-            await ResetDemoAsync();
-        }
-
-        private async void ResetDemoMenu_Click(object sender, RoutedEventArgs e)
-        {
-            await ResetDemoAsync();
-        }
-
-        private async Task ResetDemoAsync()
-        {
-            ContentDialogResult result = await ShowDialogAsync(DemoText.ResetDemoTitle, DemoText.ResetDemoMessage, DemoText.Reset);
-            if (result == ContentDialogResult.Primary)
-            {
-                StopPendingTimer();
-                ViewModel.ApplyScenario(DemoScenario.Unpaired);
-                AfterAction();
-                SelectSection("dashboard");
-            }
-        }
-
         // MARK: - Menus
+
+        private async void TurnOnMenu_Click(object sender, RoutedEventArgs e)
+        {
+            await ViewModel.PerformAsync(DashboardAction.TurnOn);
+        }
+
+        private async void TurnOffMenu_Click(object sender, RoutedEventArgs e)
+        {
+            await ViewModel.PerformAsync(DashboardAction.TurnOff);
+        }
+
+        private async void PairMenu_Click(object sender, RoutedEventArgs e)
+        {
+            SelectSection("dashboard");
+            await ViewModel.PairAsync();
+        }
+
+        private async void CancelPairingMenu_Click(object sender, RoutedEventArgs e)
+        {
+            await ViewModel.CancelPairingAsync();
+        }
 
         private void DashboardMenu_Click(object sender, RoutedEventArgs e)
         {
@@ -426,57 +397,65 @@ namespace HotspotShade.WinUI2
             SelectSection("settings");
         }
 
-        private void RefreshStatusMenu_Click(object sender, RoutedEventArgs e)
+        private async void RefreshStatusMenu_Click(object sender, RoutedEventArgs e)
         {
-            CheckNow();
+            await ViewModel.RefreshAsync();
         }
 
-        private void CheckSourceNowMenu_Click(object sender, RoutedEventArgs e)
+        private async void CheckSourceNowMenu_Click(object sender, RoutedEventArgs e)
         {
-            CheckNow();
+            await CheckNowAsync();
         }
 
         private void ThemeSystemMenu_Click(object sender, RoutedEventArgs e)
         {
-            ApplyThemeAndSave(DemoTheme.System);
+            ApplyThemeAndSave(ElementTheme.Default);
         }
 
         private void ThemeLightMenu_Click(object sender, RoutedEventArgs e)
         {
-            ApplyThemeAndSave(DemoTheme.Light);
+            ApplyThemeAndSave(ElementTheme.Light);
         }
 
         private void ThemeDarkMenu_Click(object sender, RoutedEventArgs e)
         {
-            ApplyThemeAndSave(DemoTheme.Dark);
+            ApplyThemeAndSave(ElementTheme.Dark);
         }
 
-        private void ScenarioMenu_Click(object sender, RoutedEventArgs e)
+        // Quitting closes the app process. The broker sees the process end,
+        // stops the tunnel, and stops both engines.
+        private async void QuitMenu_Click(object sender, RoutedEventArgs e)
         {
-            MenuFlyoutItem item = sender as MenuFlyoutItem;
-            if (item == null)
+            if (ViewModel.State.CanTurnOff)
             {
-                return;
+                ContentDialogResult result = await ShowDialogAsync(
+                    "Quit HotspotShade?",
+                    "Quitting turns the tunnel off and removes its routes.",
+                    "Quit");
+                if (result != ContentDialogResult.Primary)
+                {
+                    return;
+                }
             }
-            string tag = item.Tag as string;
-            DemoScenario scenario;
-            if (tag != null && Enum.TryParse<DemoScenario>(tag, out scenario))
-            {
-                StopPendingTimer();
-                ViewModel.ApplyScenario(scenario);
-                AfterAction();
-                SelectSection("dashboard");
-            }
+            Application.Current.Exit();
         }
 
-        private async void DemoLimitations_Click(object sender, RoutedEventArgs e)
+        private async void Unavailable_Click(object sender, RoutedEventArgs e)
         {
-            await ShowDialogAsync(DemoText.LimitationsTitle, DemoText.LimitationsText, null);
+            await ShowDialogAsync(
+                AppText.UnavailableHeading,
+                AppText.UnavailableNotifications + " " + AppText.UnavailableLaunchAtLogin + " "
+                    + AppText.UnavailableTray + " " + AppText.UnavailableDirect
+                    + " HotspotShade does not offer these features on Windows.",
+                null);
         }
 
         private async void About_Click(object sender, RoutedEventArgs e)
         {
-            await ShowDialogAsync(DemoText.AboutTitle, DemoText.AboutText + " Version " + DemoText.PrototypeVersion + ".", null);
+            await ShowDialogAsync(
+                "About HotspotShade",
+                "HotspotShade for Windows " + AppVersion() + ". It runs the HotspotShade engine on this target device and uses the source device proxy on your phone. Windows asks for administrator approval only when you turn on the tunnel.",
+                null);
         }
 
         // MARK: - Keyboard accelerators
@@ -499,77 +478,78 @@ namespace HotspotShade.WinUI2
             SelectSection("settings");
         }
 
-        private void RefreshAccelerator_Invoked(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
+        private async void RefreshAccelerator_Invoked(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
         {
             args.Handled = true;
-            CheckNow();
+            await ViewModel.RefreshAsync();
         }
 
-        private void CheckNowAccelerator_Invoked(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
+        private async void CheckNowAccelerator_Invoked(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
         {
             args.Handled = true;
-            CheckNow();
+            await CheckNowAsync();
         }
 
         // MARK: - Local helpers
 
-        private void CheckNow()
+        private async Task CheckNowAsync()
         {
-            if (!ViewModel.Dashboard.CanCheckNow)
+            if (!ViewModel.State.CanCheckNow)
             {
                 return;
             }
-            ViewModel.CheckNow();
-            AfterAction();
+            await ViewModel.PerformAsync(DashboardAction.CheckNow);
         }
 
-        private void ApplyThemeAndSave(DemoTheme theme)
+        private async Task<bool> ConfirmForgetAsync(DashboardAction action)
         {
-            ApplyTheme(theme);
-            ViewModel.SetTheme(theme);
-            settingsStore.Write("demo.theme", theme.ToString());
+            string title = action == DashboardAction.TurnOffAndForget ? "Turn off and forget?" : "Forget this source device?";
+            string body = action == DashboardAction.TurnOffAndForget
+                ? "HotspotShade turns the tunnel off, waits for a confirmed stop, then forgets the pairing. You must pair again to use this source device."
+                : "HotspotShade forgets the pairing on this target device. You must pair again to use this source device.";
+            ContentDialogResult result = await ShowDialogAsync(title, body, action == DashboardAction.TurnOffAndForget ? AppText.TurnOffAndForget : "Forget");
+            return result == ContentDialogResult.Primary;
+        }
+
+        private void ApplyThemeAndSave(ElementTheme value)
+        {
+            ApplyTheme(value);
+            settingsStore.Write(ThemeKey, value == ElementTheme.Light ? "light" : value == ElementTheme.Dark ? "dark" : "system");
             RefreshControls();
         }
 
-        private void ApplyTheme(DemoTheme theme)
+        private void ApplyTheme(ElementTheme value)
         {
-            if (theme == DemoTheme.Light)
-            {
-                RequestedTheme = ElementTheme.Light;
-            }
-            else if (theme == DemoTheme.Dark)
-            {
-                RequestedTheme = ElementTheme.Dark;
-            }
-            else
-            {
-                RequestedTheme = ElementTheme.Default;
-            }
-            AppMenu.RequestedTheme = RequestedTheme;
+            theme = value;
+            RequestedTheme = value;
+            AppMenu.RequestedTheme = value;
         }
 
         private void RefreshControls()
         {
-            if (PingSwitch == null || ThemeCombo == null || ActivityDetailsToggle == null
-                || ScenarioCombo == null || ScenarioDescriptionText == null)
+            if (PingSwitch == null || ThemeCombo == null || ActivityDetailsToggle == null)
             {
                 return;
             }
-
             syncingControls = true;
             PingSwitch.IsOn = ViewModel.PingEnabled;
             ActivityDetailsToggle.IsChecked = ViewModel.ShowActivityDetails;
-            ThemeCombo.SelectedIndex = (int)ViewModel.Theme;
-            ScenarioCombo.SelectedIndex = ViewModel.ScenarioIndex;
-            RefreshStatusMenu.IsEnabled = ViewModel.Dashboard.CanCheckNow;
-            CheckSourceNowMenu.IsEnabled = ViewModel.Dashboard.CanCheckNow;
-            int scenarioIndex = ViewModel.ScenarioIndex;
-            if (scenarioIndex >= 0 && scenarioIndex < ViewModel.Scenarios.Count)
-            {
-                ScenarioDescriptionText.Text = ViewModel.Scenarios[scenarioIndex].Description;
-            }
-            UpdateThemeMenuIcons();
-            if (!ViewModel.Dashboard.PairingCodeReady)
+            ThemeCombo.SelectedIndex = theme == ElementTheme.Light ? 1 : theme == ElementTheme.Dark ? 2 : 0;
+            HotspotShade.WinUI2.Core.App.WindowState state = ViewModel.State;
+            TurnOnMenu.IsEnabled = state.CanTurnOn;
+            TurnOffMenu.IsEnabled = state.CanTurnOff;
+            PairMenu.IsEnabled = state.CanPair;
+            CancelPairingMenu.IsEnabled = state.CanCancelPairing;
+            RefreshStatusMenu.IsEnabled = true;
+            CheckSourceNowMenu.IsEnabled = state.CanCheckNow;
+            ToolTipService.SetToolTip(TurnOnMenu, state.CanTurnOn ? AppText.AdminAuthorization : state.TurnOnReason);
+            ToolTipService.SetToolTip(TurnOffMenu, state.CanTurnOff ? null : state.TurnOffReason);
+            // A Turn on button is never shown disabled without its reason.
+            PrimaryButton.IsEnabled = state.PrimaryAction != DashboardAction.TurnOn || state.CanTurnOn;
+            ThemeSystemMenu.Icon = theme == ElementTheme.Default ? CheckIcon() : null;
+            ThemeLightMenu.Icon = theme == ElementTheme.Light ? CheckIcon() : null;
+            ThemeDarkMenu.Icon = theme == ElementTheme.Dark ? CheckIcon() : null;
+            if (!state.PairingCodeReady)
             {
                 codeCopied = false;
             }
@@ -577,59 +557,39 @@ namespace HotspotShade.WinUI2
             syncingControls = false;
         }
 
-        private void UpdateThemeMenuIcons()
-        {
-            ThemeSystemMenu.Icon = ViewModel.Theme == DemoTheme.System ? CheckIcon() : null;
-            ThemeLightMenu.Icon = ViewModel.Theme == DemoTheme.Light ? CheckIcon() : null;
-            ThemeDarkMenu.Icon = ViewModel.Theme == DemoTheme.Dark ? CheckIcon() : null;
-        }
-
         private static FontIcon CheckIcon()
         {
-            return new FontIcon { Glyph = "\uE73E", FontSize = 12 };
+            return new FontIcon { Glyph = "", FontSize = 12 };
         }
 
-        private void AfterAction()
+        private static string AppVersion()
         {
-            RefreshControls();
-            if (ViewModel.HasPendingAction)
+            try
             {
-                StartPendingTimer();
+                PackageVersion version = Package.Current.Id.Version;
+                return version.Major + "." + version.Minor + "." + version.Build + "." + version.Revision;
             }
-            else
+            catch
             {
-                StopPendingTimer();
-            }
-        }
-
-        private void StartPendingTimer()
-        {
-            if (pendingTimer == null)
-            {
-                pendingTimer = new DispatcherTimer();
-                pendingTimer.Interval = TimeSpan.FromMilliseconds(900);
-                pendingTimer.Tick += PendingTimer_Tick;
-            }
-            if (pendingTimer.IsEnabled)
-            {
-                return;
-            }
-            pendingTimer.Start();
-        }
-
-        private void StopPendingTimer()
-        {
-            if (pendingTimer != null)
-            {
-                pendingTimer.Stop();
+                return "unknown";
             }
         }
 
-        private void PendingTimer_Tick(object sender, object e)
+        private static string WindowsVersion()
         {
-            StopPendingTimer();
-            ViewModel.CompletePending();
-            AfterAction();
+            try
+            {
+                ulong value = ulong.Parse(AnalyticsInfo.VersionInfo.DeviceFamilyVersion);
+                ulong major = (value & 0xFFFF000000000000UL) >> 48;
+                ulong minor = (value & 0x0000FFFF00000000UL) >> 32;
+                ulong build = (value & 0x00000000FFFF0000UL) >> 16;
+                ulong revision = value & 0x000000000000FFFFUL;
+                return major + "." + minor + "." + build + "." + revision;
+            }
+            catch
+            {
+                return "unknown";
+            }
         }
 
         private async Task<ContentDialogResult> ShowDialogAsync(string title, string message, string primaryButtonText)
@@ -644,7 +604,7 @@ namespace HotspotShade.WinUI2
                 ContentDialog dialog = new ContentDialog();
                 dialog.Title = title;
                 dialog.RequestedTheme = this.RequestedTheme;
-                dialog.CloseButtonText = DemoText.Close;
+                dialog.CloseButtonText = primaryButtonText == null ? AppText.Close : AppText.Cancel;
                 dialog.DefaultButton = ContentDialogButton.Close;
                 if (!string.IsNullOrEmpty(primaryButtonText))
                 {

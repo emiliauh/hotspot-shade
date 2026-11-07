@@ -36,6 +36,7 @@ function fakeSettings(overrides = {}) {
     notifications: true,
     notificationsSupported: true,
     ping: true,
+    tunnelMode: 'phone',
     launchAtLogin: false,
     launchAtLoginAvailable: true
   }, overrides);
@@ -111,11 +112,17 @@ test('bootstrap reports settings and the settings route is bounded', async () =>
   assert.equal(login.ok, true);
   assert.equal(login.data.launchAtLogin, true);
 
+  const direct = await router.invoke('settingsUpdate', { name: 'tunnelMode', value: 'direct' });
+  assert.equal(direct.ok, true);
+  assert.equal(direct.data.tunnelMode, 'direct');
+
   const badName = await router.invoke('settingsUpdate', { name: 'theme', value: true });
   assert.equal(badName.ok, false);
   assert.equal(badName.error.code, 'invalid_input');
   const badValue = await router.invoke('settingsUpdate', { name: 'ping', value: 'true' });
   assert.equal(badValue.ok, false);
+  const badMode = await router.invoke('settingsUpdate', { name: 'tunnelMode', value: 'tun' });
+  assert.equal(badMode.ok, false);
   const extra = await router.invoke('settingsUpdate', { name: 'ping', value: true, path: '/tmp/x' });
   assert.equal(extra.ok, false);
 });
@@ -145,7 +152,7 @@ test('every fixed route runs one backend method', async () => {
   results.push(await router.invoke('pair', undefined));
   results.push(await router.invoke('pairCancel', undefined));
   results.push(await router.invoke('forget', undefined));
-  results.push(await router.invoke('start', { ping: true }));
+  results.push(await router.invoke('start', { mode: 'phone', ping: true }));
   results.push(await router.invoke('stop', undefined));
   results.push(await router.invoke('probe', undefined));
   results.push(await router.invoke('activity', { since: 4 }));
@@ -160,7 +167,7 @@ test('every fixed route runs one backend method', async () => {
     ['beginPairing'],
     ['cancelPairing'],
     ['forget'],
-    ['start', { ping: true }],
+    ['start', { mode: 'phone', ping: true }],
     ['stop'],
     ['probe'],
     ['activity', { since: 4 }],
@@ -170,15 +177,32 @@ test('every fixed route runs one backend method', async () => {
   ]);
 });
 
+test('the start route passes one normalized mode to the backend', async () => {
+  const backend = fakeBackend();
+  const router = routerFor(backend);
+  const phone = await router.invoke('start', { mode: 'phone', ping: true });
+  assert.equal(phone.ok, true);
+  const direct = await router.invoke('start', { mode: 'direct', ping: true });
+  assert.equal(direct.ok, true);
+  assert.deepEqual(backend.calls, [
+    ['start', { mode: 'phone', ping: true }],
+    ['start', { mode: 'direct', ping: false }]
+  ]);
+});
+
 test('unknown routes and invalid payloads are refused', async () => {
   const router = routerFor();
   const unknown = await router.invoke('openUrl', { url: 'https://example.com' });
   assert.equal(unknown.ok, false);
   assert.equal(unknown.error.code, 'invalid_request');
 
-  const badStart = await router.invoke('start', { ping: true, iface: 'wlan0' });
+  const badStart = await router.invoke('start', { mode: 'phone', ping: true, iface: 'wlan0' });
   assert.equal(badStart.ok, false);
   assert.equal(badStart.error.code, 'invalid_input');
+
+  const badMode = await router.invoke('start', { mode: 'tun', ping: true });
+  assert.equal(badMode.ok, false);
+  assert.equal(badMode.error.code, 'invalid_input');
 
   const badSince = await router.invoke('activity', { since: -1 });
   assert.equal(badSince.ok, false);

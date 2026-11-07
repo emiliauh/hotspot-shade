@@ -1,26 +1,32 @@
+using System;
+using System.Threading.Tasks;
+using HotspotShade.WinUI2.Services;
 using Windows.ApplicationModel;
 using Windows.ApplicationModel.Activation;
+using Windows.ApplicationModel.AppService;
 using Windows.Foundation;
 using Windows.UI.ViewManagement;
 using Windows.UI.Xaml;
 
 namespace HotspotShade.WinUI2
 {
-    // The app is a UI-only WinUI 2 prototype. It starts no engine, no service,
-    // no network listener, and no tunnel. All displayed data is simulated.
+    // The UWP window. It runs in an AppContainer as the signed-in user and
+    // never asks for administrator approval at launch. It starts the packaged
+    // full-trust broker, which starts the standard-user engine. Only Turn on
+    // makes the broker show a UAC prompt.
     public sealed partial class App : Application
     {
         public App()
         {
             InitializeComponent();
-            Suspending += OnSuspending;
+            Resuming += OnResuming;
         }
 
         protected override void OnLaunched(LaunchActivatedEventArgs e)
         {
-            // Set a preferred launch size. UWP SetPreferredMinSize caps the
-            // preferred minimum at 500 by 500, so the macOS minimum of 780 by
-            // 560 cannot be enforced. The page layout is responsive.
+            // UWP SetPreferredMinSize caps the preferred minimum at 500 by
+            // 500, so the macOS minimum of 780 by 560 cannot be enforced. The
+            // page layout is responsive.
             ApplicationView.PreferredLaunchViewSize = new Size(1000, 720);
             ApplicationView.PreferredLaunchWindowingMode = ApplicationViewWindowingMode.PreferredLaunchViewSize;
             try
@@ -40,10 +46,24 @@ namespace HotspotShade.WinUI2
             Window.Current.Activate();
         }
 
-        private void OnSuspending(object sender, SuspendingEventArgs e)
+        // The broker opens the in-process app service. BrokerConnection
+        // accepts it only from this package.
+        protected override void OnBackgroundActivated(BackgroundActivatedEventArgs args)
         {
-            // The demo has no background work. UWP suspends the UI process and
-            // may terminate it. The page timer stops when the page unloads.
+            base.OnBackgroundActivated(args);
+            AppServiceTriggerDetails details = args.TaskInstance.TriggerDetails as AppServiceTriggerDetails;
+            if (details != null)
+            {
+                BrokerConnection.Instance.Attach(args.TaskInstance, details);
+            }
+        }
+
+        // Windows may close the app-service connection while the window is
+        // suspended. The broker keeps the engines while this process lives;
+        // on resume the window asks it to connect again.
+        private void OnResuming(object sender, object e)
+        {
+            Task ignored = BrokerConnection.Instance.EnsureStartedAsync();
         }
     }
 }

@@ -6,9 +6,16 @@
 //! timer. One down sample never stops the tunnel. An unknown link observation
 //! or a stale probe breaks the evidence of continuous loss in the GUI.
 //!
+//! A plaintext status frame is not proof that the source device app is
+//! present, and a timeout is not proof that it is absent. The policy keeps
+//! those two apart. An unverified answer neither resets the silence timer nor
+//! starts it immediately. A continuous run of unverified answers is bounded,
+//! so a stuck or forged frame cannot hold the tunnel open for good.
+//!
 //! The policy is pure and takes an injected clock. The link observer reads
-//! interface flags and addresses through `getifaddrs`. It never starts a
-//! process on the hot path.
+//! interface flags and IPv4 addresses through `getifaddrs` on Unix and through
+//! the Windows interface and address tables on Windows. It never starts a
+//! process on the hot path. A failed observation is unknown, not link loss.
 use std::time::{Duration, Instant};
 
 /// A hotspot link that stays down for this long stops the tunnel.
@@ -16,6 +23,11 @@ pub const LINK_DOWN_LIMIT: Duration = Duration::from_secs(20);
 /// An answered link whose source device app stays silent for this long stops
 /// the tunnel in source device proxy mode.
 pub const SOURCE_DEVICE_GONE_LIMIT: Duration = Duration::from_secs(90);
+/// A continuous run of plaintext answers is allowed this long before it
+/// counts as source device silence. It matches the longest background pairing
+/// prompt extension (120 seconds). A forged or stuck `Busy`, `Rejected`,
+/// `NotActive`, or `LockedOut` answer cannot hold the tunnel open for good.
+pub const UNVERIFIED_GRACE: Duration = Duration::from_secs(120);
 
 /// One observation of the hotspot and the source device app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,8 +39,32 @@ pub enum HotspotSample {
     LinkDown,
     /// The link is up but the source device app does not answer.
     DeviceGone,
-    /// The link is up and the source device app answered, or no probe is due.
+    /// The link is up and the source device app gave a plaintext answer. The
+    /// answer is not proof of presence and not proof of absence. It keeps an
+    /// existing silence interval and starts one only after
+    /// [`UNVERIFIED_GRACE`].
+    Unverified,
+    /// The probe could not run because the tunnel pin is unknown. This is a
+    /// local failure, not an answer from the source device. It breaks the
+    /// evidence of continuous loss instead of starting a timer.
+    NoEvidence,
+    /// The link is up and the source device app gave an authenticated answer,
+    /// or no probe is due.
     Good,
+}
+
+/// True when a probe state is a plaintext answer from the pairing listener.
+///
+/// These states come from RESULT or CHALLENGE frames that the listener sends
+/// before it authenticates anyone. Any host on the pairing port can send them.
+/// None of them proves that the source device app is present, and none proves
+/// that it is absent. Do not report trust or presence from them.
+///
+/// `pin_unknown` is not in this set. It is a local failure to pin the probe,
+/// not an answer from the source device. It must not start a source device
+/// timer either, so the GUI breaks the silence interval instead.
+pub fn unverified_probe_state(state: &str) -> bool {
+    matches!(state, "checking" | "unpaired" | "not_trusted")
 }
 
 /// Map one probe result to one sample. Only source device proxy mode uses the
@@ -37,18 +73,27 @@ pub fn sample_from(link_up: bool, phone_mode: bool, probe: Option<&str>) -> Hots
     if !link_up || (phone_mode && probe == Some("no_hotspot")) {
         return HotspotSample::LinkDown;
     }
-    if phone_mode && matches!(probe, Some("not_running" | "not_responding")) {
-        return HotspotSample::DeviceGone;
+    if phone_mode {
+        match probe {
+            Some("not_running" | "not_responding") => return HotspotSample::DeviceGone,
+            Some("pin_unknown") => return HotspotSample::NoEvidence,
+            Some(state) if unverified_probe_state(state) => return HotspotSample::Unverified,
+            _ => {}
+        }
     }
     HotspotSample::Good
 }
 
-/// The state machine for the two continuous timers.
+/// The state machine for the continuous timers.
 pub struct AutoStopPolicy {
     link_down_limit: Duration,
     source_device_limit: Duration,
+    unverified_limit: Duration,
     link_down_since: Option<Instant>,
     source_device_since: Option<Instant>,
+    /// When the current run of unverified answers began. A good answer, a
+    /// silent answer, a link failure, or a reset clears it.
+    unverified_since: Option<Instant>,
 }
 impl Default for AutoStopPolicy {
     fn default() -> Self {
@@ -61,16 +106,27 @@ impl AutoStopPolicy {
     }
     /// The limits are separate so that tests can use a short clock.
     pub fn with_limits(link_down_limit: Duration, source_device_limit: Duration) -> Self {
+        Self::with_all_limits(link_down_limit, source_device_limit, UNVERIFIED_GRACE)
+    }
+    /// The full policy limits. Tests use this to keep simulated time short.
+    pub fn with_all_limits(
+        link_down_limit: Duration,
+        source_device_limit: Duration,
+        unverified_limit: Duration,
+    ) -> Self {
         Self {
             link_down_limit,
             source_device_limit,
+            unverified_limit,
             link_down_since: None,
             source_device_since: None,
+            unverified_since: None,
         }
     }
     pub fn reset(&mut self) {
         self.link_down_since = None;
         self.source_device_since = None;
+        self.unverified_since = None;
     }
     /// Record that the link recovered without changing the device timer.
     pub fn link_recovered(&mut self) {
@@ -79,29 +135,45 @@ impl AutoStopPolicy {
     /// Record that the source device answered without changing the link timer.
     pub fn source_device_answered(&mut self) {
         self.source_device_since = None;
+        self.unverified_since = None;
     }
     /// Discard a silence interval when probe data is no longer current.
     pub fn source_device_unobserved(&mut self) {
         self.source_device_since = None;
+        self.unverified_since = None;
     }
     /// Feed one sample. Return the stop reason at most once per continuous
     /// failure.
     pub fn observe(&mut self, now: Instant, sample: HotspotSample) -> Option<&'static str> {
         match sample {
-            HotspotSample::Reset | HotspotSample::Good => {
+            HotspotSample::Reset | HotspotSample::NoEvidence | HotspotSample::Good => {
                 self.reset();
                 None
             }
             HotspotSample::LinkDown => {
                 self.source_device_since = None;
+                self.unverified_since = None;
                 let since = *self.link_down_since.get_or_insert(now);
                 (now.saturating_duration_since(since) >= self.link_down_limit)
                     .then_some("hotspot_lost")
             }
             HotspotSample::DeviceGone => {
                 self.link_down_since = None;
+                self.unverified_since = None;
                 let since = *self.source_device_since.get_or_insert(now);
                 (now.saturating_duration_since(since) >= self.source_device_limit)
+                    .then_some("source_device_gone")
+            }
+            HotspotSample::Unverified => {
+                self.link_down_since = None;
+                // Keep an existing silence interval. A timeout between two
+                // plaintext answers is still continuous silence.
+                let since = *self.unverified_since.get_or_insert(now);
+                if now.saturating_duration_since(since) >= self.unverified_limit {
+                    self.source_device_since.get_or_insert(now);
+                }
+                let source_since = self.source_device_since?;
+                (now.saturating_duration_since(source_since) >= self.source_device_limit)
                     .then_some("source_device_gone")
             }
         }
@@ -181,9 +253,37 @@ pub fn link_observation(iface: &str) -> std::io::Result<bool> {
     Ok(found)
 }
 
-/// Windows has no hotspot link observer. Report the link as up. The source
-/// device probe still stops a tunnel after continuous silence.
-#[cfg(not(unix))]
+/// Windows link observation is unavailable until the status mapping and
+/// identity handling pass independent review and native Windows tests.
+#[cfg(windows)]
+pub fn link_observation(_iface: &str) -> std::io::Result<bool> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Windows link observation is not yet available",
+    ))
+}
+
+/// Other targets have no link observer. An unsupported observation is unknown,
+/// not link loss.
+#[cfg(not(any(unix, windows)))]
+pub fn link_observation(_iface: &str) -> std::io::Result<bool> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "link observation is not implemented on this platform",
+    ))
+}
+
+/// Windows: a conclusive observation wins. An inconclusive observation
+/// reports `true`, because this helper cannot express unknown and an API
+/// failure must not look like link loss.
+#[cfg(windows)]
+pub fn link_up(iface: &str) -> bool {
+    link_observation(iface).unwrap_or(true)
+}
+
+/// Other targets have no link observer. Report the link as up so the policy
+/// never invents link loss on a platform that cannot observe it.
+#[cfg(not(any(unix, windows)))]
 pub fn link_up(_iface: &str) -> bool {
     true
 }
@@ -227,6 +327,123 @@ mod tests {
         );
         assert_eq!(
             p.observe(t + Duration::from_secs(90), HotspotSample::DeviceGone),
+            Some("source_device_gone")
+        );
+    }
+
+    #[test]
+    fn a_continuous_unverified_answer_is_bounded() {
+        let t = Instant::now();
+        // Use short limits so the test shows the two phases clearly.
+        let mut p = AutoStopPolicy::with_all_limits(
+            Duration::from_secs(20),
+            Duration::from_secs(90),
+            Duration::from_secs(30),
+        );
+        // The first 30 seconds only start the unverified run. No stop.
+        assert_eq!(p.observe(t, HotspotSample::Unverified), None);
+        assert_eq!(
+            p.observe(t + Duration::from_secs(29), HotspotSample::Unverified),
+            None
+        );
+        // At 30 seconds the unverified run counts as silence. The normal
+        // source device limit still applies, so the stop comes at 120 seconds.
+        assert_eq!(
+            p.observe(t + Duration::from_secs(30), HotspotSample::Unverified),
+            None
+        );
+        assert_eq!(
+            p.observe(t + Duration::from_secs(119), HotspotSample::Unverified),
+            None
+        );
+        assert_eq!(
+            p.observe(t + Duration::from_secs(120), HotspotSample::Unverified),
+            Some("source_device_gone")
+        );
+        // A good answer clears both the unverified run and the silence timer.
+        assert_eq!(
+            p.observe(t + Duration::from_secs(121), HotspotSample::Good),
+            None
+        );
+        assert_eq!(
+            p.observe(t + Duration::from_secs(122), HotspotSample::Unverified),
+            None
+        );
+        assert_eq!(
+            p.observe(t + Duration::from_secs(151), HotspotSample::Unverified),
+            None
+        );
+        assert_eq!(
+            p.observe(t + Duration::from_secs(152), HotspotSample::Unverified),
+            None
+        );
+        assert_eq!(
+            p.observe(t + Duration::from_secs(241), HotspotSample::Unverified),
+            None
+        );
+        assert_eq!(
+            p.observe(t + Duration::from_secs(242), HotspotSample::Unverified),
+            Some("source_device_gone")
+        );
+    }
+
+    #[test]
+    fn an_unverified_answer_does_not_reset_continuous_silence() {
+        let t = Instant::now();
+        let mut p = AutoStopPolicy::new();
+        // A timeout starts the silence timer.
+        assert_eq!(p.observe(t, HotspotSample::DeviceGone), None);
+        // Plaintext answers in between must not reset it. This is the
+        // alternating Busy and timeout case.
+        for second in (2..=88).step_by(2) {
+            assert_eq!(
+                p.observe(t + Duration::from_secs(second), HotspotSample::Unverified),
+                None,
+                "{second}"
+            );
+        }
+        assert_eq!(
+            p.observe(t + Duration::from_secs(90), HotspotSample::Unverified),
+            Some("source_device_gone")
+        );
+    }
+
+    #[test]
+    fn a_link_failure_clears_the_unverified_run() {
+        let t = Instant::now();
+        let mut p = AutoStopPolicy::with_all_limits(
+            Duration::from_secs(20),
+            Duration::from_secs(90),
+            Duration::from_secs(30),
+        );
+        assert_eq!(p.observe(t, HotspotSample::Unverified), None);
+        assert_eq!(
+            p.observe(t + Duration::from_secs(20), HotspotSample::LinkDown),
+            None
+        );
+        assert_eq!(
+            p.observe(t + Duration::from_secs(40), HotspotSample::LinkDown),
+            Some("hotspot_lost")
+        );
+        // The link recovers. The unverified run starts again from zero.
+        assert_eq!(
+            p.observe(t + Duration::from_secs(41), HotspotSample::Unverified),
+            None
+        );
+        assert_eq!(
+            p.observe(t + Duration::from_secs(70), HotspotSample::Unverified),
+            None
+        );
+        assert_eq!(
+            p.observe(t + Duration::from_secs(71), HotspotSample::Unverified),
+            None
+        );
+        assert_eq!(
+            p.observe(t + Duration::from_secs(160), HotspotSample::Unverified),
+            None
+        );
+        assert_eq!(
+            p.observe(t + Duration::from_secs(161), HotspotSample::Unverified),
             Some("source_device_gone")
         );
     }
@@ -315,13 +532,24 @@ mod tests {
             sample_from(true, true, Some("not_responding")),
             HotspotSample::DeviceGone
         );
-        for answered in ["ready", "proxy_off", "connected", "unpaired", "not_trusted"] {
+        for answered in ["ready", "proxy_off", "connected"] {
             assert_eq!(
                 sample_from(true, true, Some(answered)),
                 HotspotSample::Good,
                 "{answered}"
             );
         }
+        for unverified in ["checking", "unpaired", "not_trusted"] {
+            assert_eq!(
+                sample_from(true, true, Some(unverified)),
+                HotspotSample::Unverified,
+                "{unverified}"
+            );
+        }
+        assert_eq!(
+            sample_from(true, true, Some("pin_unknown")),
+            HotspotSample::NoEvidence
+        );
         assert_eq!(sample_from(true, true, None), HotspotSample::Good);
         // Direct mode ignores the probe.
         assert_eq!(
@@ -365,5 +593,17 @@ mod tests {
             std::io::ErrorKind::InvalidInput
         );
         assert!(!link_observation("hs-missing0").unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_link_observer_is_unavailable_until_integrated() {
+        // The gated observer reports unknown for every name. The helper that
+        // cannot express unknown reports the link as up.
+        assert_eq!(
+            link_observation("").unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert!(link_up(""));
     }
 }

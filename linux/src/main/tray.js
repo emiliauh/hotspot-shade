@@ -16,16 +16,28 @@ function isPlainObject(value) {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
-function trayState(status, pair) {
+function trayState(status, pair, unavailable, tunnelMode) {
   const data = isPlainObject(status) ? status : null;
-  const pairing = isPlainObject(pair) ? pair : {};
+  const pairing = isPlainObject(pair) ? pair : null;
   const running = !!data && data.running === true;
+  const runningKnown = !!data && typeof data.running === 'boolean';
+  const pairingKnown = !!data && typeof data.paired === 'boolean';
   const paired = !!data && data.paired === true;
   const phone = data && isPlainObject(data.phone) ? data.phone : {};
   const demo = !!data && data.demo === true;
+  const unknown = !!data && data.state === 'unknown';
+  const direct = tunnelMode === 'direct';
+  const blocked = unavailable === true || unknown || (!!data && !runningKnown) ||
+    (!!data && data.cleanup_blocked === true);
   let label = 'Starting';
-  if (data) {
+  if (blocked) {
+    /* A configured engine that cannot run has no status to report. "Starting"
+     * would be wrong forever, so the tray says that it is not available. */
+    label = 'Not available';
+  } else if (data) {
     if (running) label = 'Tunnel on';
+    else if (direct) label = 'Ready';
+    else if (!pairingKnown) label = 'Not available';
     else if (paired && phone.state === 'not_trusted') label = 'Not trusted';
     else if (paired) label = 'Ready';
     else label = 'Not paired';
@@ -35,14 +47,15 @@ function trayState(status, pair) {
     label: label,
     demo: demo,
     tooltip: 'HotspotShade. ' + label + '.',
-    startEnabled: !!data && paired && !running && pair && pair.state !== 'connecting' && pair.state !== 'confirm' && pair.state !== 'starting',
-    stopEnabled: running
+    startEnabled: !blocked && !!data && (direct || paired) && !running && !!pairing && pairing.state !== 'connecting' && pairing.state !== 'confirm' && pairing.state !== 'starting',
+    stopEnabled: running && unavailable !== true,
+    stopIsAttempt: blocked && running && unavailable !== true
   };
 }
 
 function createTrayMenuTemplate(options) {
   const settings = options && typeof options === 'object' ? options : {};
-  const state = trayState(settings.status, settings.pair);
+  const state = trayState(settings.status, settings.pair, settings.unavailable, settings.tunnelMode);
   const onStart = typeof settings.onStart === 'function' ? settings.onStart : function () {};
   const onStop = typeof settings.onStop === 'function' ? settings.onStop : function () {};
   const onOpen = typeof settings.onOpen === 'function' ? settings.onOpen : function () {};
@@ -59,7 +72,7 @@ function createTrayMenuTemplate(options) {
       click: onStart
     },
     {
-      label: state.demo ? 'Stop simulated tunnel' : 'Stop tunnel',
+      label: state.stopIsAttempt ? 'Try to turn off' : (state.demo ? 'Stop simulated tunnel' : 'Stop tunnel'),
       enabled: state.stopEnabled,
       click: onStop
     },
@@ -103,6 +116,7 @@ function createTray(options) {
   const onOpen = settings.onOpen;
   const onQuit = settings.onQuit;
   const onError = typeof settings.onError === 'function' ? settings.onError : function () {};
+  const getTunnelMode = typeof settings.getTunnelMode === 'function' ? settings.getTunnelMode : function () { return 'phone'; };
 
   if (typeof Tray !== 'function' || !Menu || typeof Menu.buildFromTemplate !== 'function') {
     return unavailable();
@@ -120,9 +134,17 @@ function createTray(options) {
   }
 
   let current = trayState(null, null);
+  let lastState = { status: null, pair: null };
+
+  function selectedMode() {
+    try { return getTunnelMode() === 'direct' ? 'direct' : 'phone'; }
+    catch (error) { onError(error); return 'phone'; }
+  }
 
   function apply(state) {
-    current = trayState(state && state.status, state && state.pair);
+    lastState = state || { status: null, pair: null };
+    const mode = selectedMode();
+    current = trayState(lastState.status, lastState.pair, lastState.unavailable, mode);
     try {
       tray.setToolTip(current.tooltip);
     } catch (error) {
@@ -131,7 +153,12 @@ function createTray(options) {
     const menu = Menu.buildFromTemplate(createTrayMenuTemplate({
       status: state && state.status,
       pair: state && state.pair,
-      onStart: onStart,
+      unavailable: state && state.unavailable,
+      tunnelMode: mode,
+      onStart: function () {
+        // A setting can change between menu construction and the click.
+        if (trayState(lastState.status, lastState.pair, lastState.unavailable, selectedMode()).startEnabled && typeof onStart === 'function') onStart();
+      },
       onStop: onStop,
       onOpen: onOpen,
       onQuit: onQuit

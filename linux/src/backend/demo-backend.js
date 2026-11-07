@@ -68,6 +68,7 @@ function createDemoBackend(options) {
       paired: false,
       running: false,
       mode: null,
+      startMode: null,
       ping: true,
       icmpEnabled: false,
       phoneState: 'unpaired',
@@ -142,29 +143,36 @@ function createDemoBackend(options) {
 
     if (state.operation && milliseconds >= state.operation.endsAt) {
       if (state.operation.kind === 'start') {
+        const direct = state.operation.mode === 'direct';
         state.running = true;
-        state.mode = 'phone';
-        state.icmpEnabled = state.ping;
-        state.connections = 2;
+        state.mode = direct ? 'tun' : 'phone';
+        state.startMode = state.operation.mode;
+        state.icmpEnabled = !direct && state.ping;
+        state.connections = direct ? null : 2;
         state.lastStop = { reason: null, at: null };
         state.lastStopMessage = null;
         state.operation = null;
-        state.paired = true;
-        state.trustedBySource = true;
-        setPhone('ready', 'The source device is ready.');
+        if (!direct) {
+          state.paired = true;
+          state.trustedBySource = true;
+          setPhone('ready', 'The source device is ready.');
+          state.pairing.state = 'paired';
+        }
         state.checkedAt = nowSeconds();
-        state.pairing.state = 'paired';
         seedFailures();
-        log('info', 'The simulated tunnel is on. Ping is ' + (state.icmpEnabled ? 'on' : 'off') + '.');
+        log('info', direct
+          ? 'The simulated direct tunnel is on. No source device app is used. IPv6 is blocked.'
+          : 'The simulated tunnel is on. Ping is ' + (state.icmpEnabled ? 'on' : 'off') + '.');
       } else if (state.operation.kind === 'stop') {
         state.running = false;
         state.mode = null;
+        state.startMode = null;
         state.icmpEnabled = false;
         state.connections = 0;
         state.operation = null;
         state.lastStop = { reason: 'user', at: nowSeconds() };
         state.lastStopMessage = 'You turned the tunnel off.';
-        setPhone('ready', 'The source device is ready.');
+        if (state.paired) setPhone('ready', 'The source device is ready.');
         state.checkedAt = nowSeconds();
         log('info', 'The simulated tunnel is off. No route or device changed.');
       }
@@ -307,6 +315,7 @@ function createDemoBackend(options) {
 
   function start(payload) {
     advance();
+    const mode = payload && payload.mode === 'direct' ? 'direct' : 'phone';
     const ping = payload && payload.ping === true;
     requireIdleAction();
     if (state.pairing.state === 'connecting' || state.pairing.state === 'confirm') {
@@ -315,17 +324,20 @@ function createDemoBackend(options) {
     if (state.running) {
       throw new BackendError('already_running', 'The tunnel is already on.', 409);
     }
-    if (!state.paired || state.phoneState !== 'ready') {
+    if (mode === 'phone' && (!state.paired || state.phoneState !== 'ready')) {
       throw new BackendError('not_ready', 'The simulated source device is not ready. Pair first.', 409);
     }
-    state.icmpEnabled = ping;
+    state.icmpEnabled = mode === 'phone' && ping;
     state.operation = {
       kind: 'start',
+      mode: mode,
       endsAt: nowMilliseconds() + START_DELAY_MS
     };
     state.counts.starts += 1;
     state.lastStopMessage = null;
-    log('info', 'The app started the simulated tunnel. No route, TUN device, or outer socket is created.');
+    log('info', mode === 'direct'
+      ? 'The app started the simulated direct tunnel. No source device app, route, TUN device, or outer socket is created.'
+      : 'The app started the simulated tunnel. No route, TUN device, or outer socket is created.');
     return status();
   }
 
@@ -453,6 +465,7 @@ function createDemoBackend(options) {
       state.trustedBySource = true;
       state.running = false;
       state.mode = null;
+      state.startMode = null;
       state.connections = null;
       state.icmpEnabled = false;
       state.operation = null;
@@ -468,6 +481,7 @@ function createDemoBackend(options) {
       state.trustedBySource = true;
       state.running = true;
       state.mode = 'phone';
+      state.startMode = 'phone';
       state.icmpEnabled = state.ping;
       state.connections = 0;
       state.operation = null;
@@ -483,6 +497,7 @@ function createDemoBackend(options) {
     state.trustedBySource = false;
     state.running = false;
     state.mode = null;
+    state.startMode = null;
     state.connections = null;
     state.icmpEnabled = false;
     state.operation = null;

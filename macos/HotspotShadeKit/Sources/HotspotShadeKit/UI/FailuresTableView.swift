@@ -7,15 +7,28 @@ public struct FailuresTableView: View {
     public var state: FailuresState
     public var reportCopied: Bool
     public var tunnelRunning: Bool
+    // True after an interrupted operation. The engine cannot list failures,
+    // and an empty table must not look like a healthy record.
+    public var recoveryBlocked: Bool
+    public var serviceStateUnknown: Bool
+    // True when the engine did not answer. The table must not claim that the
+    // tunnel is off, and Refresh is disabled.
+    public var unavailable: Bool
+    // True when the last status is old. An empty list must not claim Off.
+    public var stale: Bool
     private let onRefresh: () -> Void
     private let onCopyReport: () -> Void
     @State private var sortOrder: [KeyPathComparator<FailureTableRow>] = [KeyPathComparator(\.count, order: .reverse)]
 
-    public init(rows: [FailureRow], state: FailuresState, reportCopied: Bool = false, tunnelRunning: Bool = true, onRefresh: @escaping () -> Void = {}, onCopyReport: @escaping () -> Void = {}) {
+    public init(rows: [FailureRow], state: FailuresState, reportCopied: Bool = false, tunnelRunning: Bool = true, recoveryBlocked: Bool = false, serviceStateUnknown: Bool = false, unavailable: Bool = false, stale: Bool = false, onRefresh: @escaping () -> Void = {}, onCopyReport: @escaping () -> Void = {}) {
         self.rows = rows
         self.state = state
         self.reportCopied = reportCopied
         self.tunnelRunning = tunnelRunning
+        self.recoveryBlocked = recoveryBlocked
+        self.serviceStateUnknown = serviceStateUnknown
+        self.unavailable = unavailable
+        self.stale = stale
         self.onRefresh = onRefresh
         self.onCopyReport = onCopyReport
     }
@@ -27,7 +40,7 @@ public struct FailuresTableView: View {
             content
             HStack(spacing: HSMetrics.space12) {
                 Button(Strings.refresh, action: onRefresh)
-                    .disabled(!tunnelRunning || state == .loading)
+                    .disabled(!FailuresViewText.refreshEnabled(state: state, tunnelRunning: tunnelRunning, unavailable: unavailable, recoveryBlocked: recoveryBlocked))
                 if state == .loaded {
                     Button(Strings.copyReport, action: onCopyReport)
                 }
@@ -44,28 +57,17 @@ public struct FailuresTableView: View {
     }
 
     @ViewBuilder private var content: some View {
-        if !tunnelRunning {
-            stateText(Strings.failuresTunnelOff)
-        } else {
-            switch state {
-            case .idle:
-                stateText(Strings.failuresNotLoaded)
-            case .loading:
-                HStack(spacing: HSMetrics.space8) {
-                    ProgressView()
-                        .controlSize(.small)
-                        .accessibilityHidden(true)
-                    Text(Strings.loadingFailures).foregroundStyle(.secondary)
-                }
-            case .empty:
-                stateText(Strings.noFailures)
-            case .unavailable:
-                stateText(UIStrings.failuresUnavailable)
-            case .error(let message):
-                stateText(Strings.sanitized(message) ?? message)
-            case .loaded:
-                table
+        if let text = FailuresViewText.placeholder(state: state, tunnelRunning: tunnelRunning, unavailable: unavailable, stale: stale, recoveryBlocked: recoveryBlocked, serviceStateUnknown: serviceStateUnknown) {
+            stateText(text)
+        } else if state == .loading {
+            HStack(spacing: HSMetrics.space8) {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityHidden(true)
+                Text(Strings.loadingFailures).foregroundStyle(.secondary)
             }
+        } else {
+            table
         }
     }
 
@@ -103,5 +105,32 @@ public struct FailuresTableView: View {
         }
         .frame(minHeight: 180, idealHeight: 220)
         .accessibilityLabel(Strings.recentFailures)
+    }
+}
+
+// The plain text and the Refresh state for the failure table. It is pure, so
+// every unavailable and recovery case is a test without a window.
+public enum FailuresViewText {
+    public static func placeholder(state: FailuresState, tunnelRunning: Bool, unavailable: Bool, stale: Bool, recoveryBlocked: Bool, serviceStateUnknown: Bool) -> String? {
+        if recoveryBlocked {
+            return serviceStateUnknown ? Strings.serviceStateUnknownBody : Strings.cleanupBlockedBody
+        }
+        if unavailable {
+            return UIStrings.statusUnavailableLine
+        }
+        if !tunnelRunning {
+            return stale ? Strings.staleStatus : Strings.failuresTunnelOff
+        }
+        switch state {
+        case .idle: return Strings.failuresNotLoaded
+        case .empty: return Strings.noFailures
+        case .unavailable: return UIStrings.failuresUnavailable
+        case .error(let message): return Strings.sanitized(message) ?? message
+        case .loading, .loaded: return nil
+        }
+    }
+
+    public static func refreshEnabled(state: FailuresState, tunnelRunning: Bool, unavailable: Bool, recoveryBlocked: Bool) -> Bool {
+        tunnelRunning && !unavailable && !recoveryBlocked && state != .loading
     }
 }

@@ -14,10 +14,12 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const SETTING_NAMES = Object.freeze(['notifications', 'launchAtLogin', 'ping']);
+const SETTING_NAMES = Object.freeze(['notifications', 'launchAtLogin', 'ping', 'tunnelMode']);
+const TUNNEL_MODES = Object.freeze(['phone', 'direct']);
 const DEFAULTS = Object.freeze({
   notifications: true,
-  ping: true
+  ping: true,
+  tunnelMode: 'phone'
 });
 
 function isPlainObject(value) {
@@ -26,6 +28,10 @@ function isPlainObject(value) {
 
 function readBoolean(value, fallback) {
   return typeof value === 'boolean' ? value : fallback;
+}
+
+function readTunnelMode(value) {
+  return value === 'direct' ? 'direct' : DEFAULTS.tunnelMode;
 }
 
 function atomicWriteJson(fileSystem, target, value) {
@@ -78,7 +84,8 @@ function createSettingsStore(options) {
 
   let current = {
     notifications: DEFAULTS.notifications,
-    ping: DEFAULTS.ping
+    ping: DEFAULTS.ping,
+    tunnelMode: DEFAULTS.tunnelMode
   };
 
   function read() {
@@ -100,7 +107,8 @@ function createSettingsStore(options) {
     if (!isPlainObject(value)) return;
     current = {
       notifications: readBoolean(value.notifications, DEFAULTS.notifications),
-      ping: readBoolean(value.ping, DEFAULTS.ping)
+      ping: readBoolean(value.ping, DEFAULTS.ping),
+      tunnelMode: readTunnelMode(value.tunnelMode)
     };
   }
 
@@ -114,6 +122,7 @@ function createSettingsStore(options) {
       notifications: current.notifications,
       notificationsSupported: notificationsSupported,
       ping: current.ping,
+      tunnelMode: current.tunnelMode,
       launchAtLogin: login.enabled === true,
       launchAtLoginAvailable: login.available === true
     };
@@ -122,6 +131,14 @@ function createSettingsStore(options) {
   function update(name, value) {
     if (!SETTING_NAMES.includes(name)) {
       throw new TypeError('The setting is not known.');
+    }
+    if (name === 'tunnelMode') {
+      if (!TUNNEL_MODES.includes(value)) {
+        throw new TypeError('The tunnel mode must be phone or direct.');
+      }
+      current = Object.assign({}, current, { tunnelMode: value });
+      write();
+      return snapshot();
     }
     if (typeof value !== 'boolean') {
       throw new TypeError('The setting value must be true or false.');
@@ -148,5 +165,6 @@ function createSettingsStore(options) {
 module.exports = {
   DEFAULTS: DEFAULTS,
   SETTING_NAMES: SETTING_NAMES,
+  TUNNEL_MODES: TUNNEL_MODES,
   createSettingsStore: createSettingsStore
 };

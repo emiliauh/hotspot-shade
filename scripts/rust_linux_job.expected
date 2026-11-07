@@ -1,0 +1,40 @@
+    name: Rust (Linux) foundation checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: github.ref_type != 'tag'
+        with:
+          workspaces: rust
+      - name: Type check (all targets)
+        working-directory: rust
+        run: cargo check --all-targets --locked
+      - name: Test
+        working-directory: rust
+        run: cargo test --locked
+      - name: Clippy (Linux code)
+        working-directory: rust
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test Linux privileged helper
+        run: cargo test --locked --manifest-path linux/helper/Cargo.toml
+      - name: Clippy (Linux privileged helper)
+        run: cargo clippy --all-targets --locked --manifest-path linux/helper/Cargo.toml -- -D warnings
+      - name: Test disposable VM cleanup
+        run: bash scripts/tests/linux_vm_test_test.sh
+      - name: Test the source snapshot helper
+        run: bash scripts/tests/source_snapshot_test.sh
+      - name: Test adversarial source snapshot cases
+        run: bash scripts/tests/source_snapshot_adversarial_test.sh
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Build the demo engine for the Node contract test
+        run: cargo build --locked --manifest-path rust/Cargo.toml
+      - name: Test Linux Electron demo model and security
+        working-directory: linux
+        env:
+          HOTSPOTSHADE_BIN: ${{ github.workspace }}/rust/target/debug/hotspotshade
+        run: npm test
+      - name: Test Linux Electron demo in a sandboxed webview
+        run: bash linux/scripts/test-container.sh smoke

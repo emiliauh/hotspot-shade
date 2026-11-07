@@ -21,7 +21,6 @@ struct PreviewBoth<Content: View>: View {
 // One dashboard state with no engine.
 struct DashboardPreview: View {
     let scenario: PreviewScenario
-    var demo = false
     var isRefreshing = false
     var body: some View {
         let input = PreviewData.input(scenario)
@@ -30,7 +29,6 @@ struct DashboardPreview: View {
             linkAdvice: input.linkAdvice,
             isPairing: scenario == .pairingStart || scenario == .pairingCode,
             pairingCode: PreviewData.pairingCode(scenario),
-            demo: demo,
             isRefreshing: isRefreshing,
             onAction: { _ in }
         )
@@ -109,7 +107,6 @@ struct MenuBarContentPreview: View {
 #Preview("Dashboard: unknown") { PreviewBoth { DashboardPreview(scenario: .unknown) } }
 #Preview("Dashboard: stale status") { PreviewBoth { DashboardPreview(scenario: .staleEngine) } }
 #Preview("Dashboard: after forget") { PreviewBoth { DashboardPreview(scenario: .afterForget) } }
-#Preview("Dashboard: demo") { PreviewBoth { DashboardPreview(scenario: .on, demo: true) } }
 #Preview("Dashboard: refreshing") { PreviewBoth { DashboardPreview(scenario: .on, isRefreshing: true) } }
 
 // The card row at the content width of a 780 and a 900 point window.
@@ -243,6 +240,6 @@ enum ActivityPreviewData {
 // MARK: - Main window
 
 #Preview("Main window") {
-    MainWindowView(model: PreviewData.appModel(paired: true, running: true), demo: false)
+    MainWindowView(model: PreviewData.appModel(paired: true, running: true))
         .frame(width: 900, height: 640)
 }

@@ -94,7 +94,8 @@ namespace HotspotShade.WinUI2.Core.Tests
         }
     }
 
-    internal sealed class FakeClock : IDemoClock
+    // A manual clock for the window session checks.
+    internal sealed class FakeClock
     {
         public FakeClock(DateTimeOffset now)
         {
@@ -106,6 +107,11 @@ namespace HotspotShade.WinUI2.Core.Tests
         public void Advance(double seconds)
         {
             Now = Now.AddSeconds(seconds);
+        }
+
+        public DateTime UtcNow()
+        {
+            return Now.UtcDateTime;
         }
     }
 }

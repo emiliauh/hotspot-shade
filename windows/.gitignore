@@ -13,3 +13,5 @@ TestResults/
 *.cer
 *.key
 *.pem
+out/
+wintun.dll

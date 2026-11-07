@@ -8,10 +8,8 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.togetherWith
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
@@ -19,21 +17,18 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Home
-import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.Settings
-import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.LargeTopAppBar
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -44,8 +39,8 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
-import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.rememberTopAppBarState
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -61,25 +56,20 @@ import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
-import com.hotspotshade.demo.DemoViewModel
+import com.hotspotshade.demo.BuildConfig
+import com.hotspotshade.demo.ManualConnectionViewModel
 import com.hotspotshade.demo.ProxyViewModel
-import com.hotspotshade.demo.model.CopyTarget
-import com.hotspotshade.demo.model.DemoEngine
-import com.hotspotshade.demo.model.PairingActivity
-import com.hotspotshade.demo.model.ThemeChoice
 import com.hotspotshade.demo.ui.theme.LocalHsTokens
 import com.hotspotshade.demo.ui.theme.LocalReduceMotion
 import com.hotspotshade.source.PairingViewModel
@@ -88,20 +78,21 @@ import com.hotspotshade.source.RealPairingStatus
 import com.hotspotshade.source.TrustedTarget
 import kotlinx.coroutines.delay
 
-private enum class AppTab(val label: String) {
+private enum class AppTab(val label: String, val title: String = label) {
     DASHBOARD("Dashboard"),
+    ACTIVITY("Activity", title = "Recent activity"),
     SETTINGS("Settings"),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AppRoot(
-    viewModel: DemoViewModel,
     pairingViewModel: PairingViewModel,
     proxyViewModel: ProxyViewModel,
+    manualConnectionViewModel: ManualConnectionViewModel,
 ) {
-    val state = viewModel.state
     val real = proxyViewModel.state
+    val manual = manualConnectionViewModel.state
     val realPrompt = pairingViewModel.prompt
     val realStatus = pairingViewModel.status
     val targets = pairingViewModel.targets
@@ -111,8 +102,6 @@ fun AppRoot(
     val context = LocalContext.current
     val fontScale = LocalDensity.current.fontScale
     var tab by rememberSaveable { mutableStateOf(AppTab.DASHBOARD) }
-    var showActivity by rememberSaveable { mutableStateOf(false) }
-    var showControls by rememberSaveable { mutableStateOf(false) }
     var showForgetAll by rememberSaveable { mutableStateOf(false) }
     var forgetTargetId by rememberSaveable { mutableStateOf<String?>(null) }
     var showRotate by rememberSaveable { mutableStateOf(false) }
@@ -120,6 +109,11 @@ fun AppRoot(
     val saveableState = rememberSaveableStateHolder()
     val topAppBarState = rememberTopAppBarState()
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior(topAppBarState)
+
+    DisposableEffect(tab, pairingViewModel) {
+        pairingViewModel.setTrustListVisible(tab == AppTab.SETTINGS)
+        onDispose { pairingViewModel.setTrustListVisible(false) }
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -133,12 +127,9 @@ fun AppRoot(
         notificationsEnabled = AppNotifications.enabled(context)
     }
 
-    LaunchedEffect(state.previewMode) {
-        if (!state.previewMode) showActivity = false
-    }
-
     LaunchedEffect(pairingViewModel.message) {
         if (pairingViewModel.message != null) {
+            manualConnectionViewModel.refresh()
             delay(4_000)
             pairingViewModel.clearMessage()
         }
@@ -147,6 +138,15 @@ fun AppRoot(
     LaunchedEffect(tab) {
         topAppBarState.heightOffset = 0f
         topAppBarState.contentOffset = 0f
+        if (tab != AppTab.SETTINGS) manualConnectionViewModel.hideTokenNow()
+    }
+
+    LaunchedEffect(real.port) {
+        manualConnectionViewModel.setRunningPort(real.port)
+    }
+
+    LaunchedEffect(tab, realStatus.trustedTargets) {
+        if (tab == AppTab.SETTINGS) manualConnectionViewModel.refresh()
     }
 
     val startProxy = {
@@ -158,9 +158,7 @@ fun AppRoot(
     }
 
     val onStartStop = {
-        if (state.previewMode) {
-            viewModel.startOrStop()
-        } else if (real.active) {
+        if (real.active) {
             proxyViewModel.stop()
         } else {
             startProxy()
@@ -176,30 +174,9 @@ fun AppRoot(
             LargeTopAppBar(
                 title = {
                     Text(
-                        text = tab.label,
+                        text = tab.title,
                         modifier = Modifier.semantics { heading() },
                     )
-                },
-                actions = {
-                    if (state.previewMode) {
-                        IconButton(onClick = {
-                            showControls = false
-                            showActivity = true
-                        }) {
-                            Icon(
-                                imageVector = Icons.Outlined.History,
-                                contentDescription = "Recent activity",
-                                tint = MaterialTheme.colorScheme.primary,
-                            )
-                        }
-                    }
-                    IconButton(onClick = { showControls = true }) {
-                        Icon(
-                            imageVector = Icons.Outlined.Tune,
-                            contentDescription = "Preview controls",
-                            tint = MaterialTheme.colorScheme.primary,
-                        )
-                    }
                 },
                 scrollBehavior = scrollBehavior,
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -226,8 +203,6 @@ fun AppRoot(
                             selected = selected,
                             onClick = {
                                 tab = item
-                                showActivity = false
-                                showControls = false
                             },
                             icon = {
                                 Icon(
@@ -261,9 +236,6 @@ fun AppRoot(
                 .padding(innerPadding)
                 .imePadding(),
         ) {
-            if (state.previewMode) {
-                PreviewBanner(onOpenControls = { showControls = true })
-            }
             AnimatedContent(
                 targetState = tab,
                 modifier = Modifier
@@ -285,24 +257,23 @@ fun AppRoot(
                 saveableState.SaveableStateProvider(current.name) {
                     when (current) {
                         AppTab.DASHBOARD -> DashboardScreen(
-                            real = real,
-                            preview = state,
-                            previewMode = state.previewMode,
+                real = real,
                             trustedTargets = realStatus.trustedTargets,
                             onStartStop = onStartStop,
-                            onOpenSettings = { tab = AppTab.SETTINGS },
-                            onOpenPreview = { showControls = true },
                         )
+
+                        AppTab.ACTIVITY -> ActivityScreen()
 
                         AppTab.SETTINGS -> SettingsScreen(
                             real = real,
                             pairing = realStatus,
                             targets = targets,
+                            trustUnavailable = pairingViewModel.trustUnavailable,
                             message = pairingViewModel.message,
-                            preview = state,
-                            previewMode = state.previewMode,
+                            manual = manual,
+                            revealedToken = manualConnectionViewModel.revealedToken,
+                            manualNowMillis = manualConnectionViewModel.nowMillis,
                             notificationsEnabled = notificationsEnabled,
-                            nowMillis = viewModel.nowMillis,
                             onOpenNotificationSettings = {
                                 AppNotifications.openSettings(context)
                             },
@@ -311,23 +282,16 @@ fun AppRoot(
                             onRotateTokenRequest = { showRotate = true },
                             onCopyDiagnostics = {
                                 val report = real.diagnosticsReport(
-                                    listenerLabel(realStatus.listener),
+                                    listener = listenerLabel(realStatus.listener),
+                                    version = BuildConfig.VERSION_NAME,
                                 )
                                 clipboard.setText(AnnotatedString(report))
-                                viewModel.copy(CopyTarget.DIAGNOSTICS)
                             },
-                            onOpenPreviewControls = { showControls = true },
-                            onPreviewModeChange = viewModel::setPreviewMode,
-                            onTogglePortAutomatic = viewModel::setPortAutomatic,
-                            onPortTextChange = viewModel::setPortText,
-                            onToggleToken = viewModel::toggleToken,
-                            onCopyToken = {
-                                if (state.tokenVisible) {
-                                    clipboard.setText(AnnotatedString(state.token))
-                                    viewModel.copy(CopyTarget.TOKEN)
-                                }
-                            },
-                            onCheckAddress = viewModel::checkAddress,
+                            onRefreshManual = manualConnectionViewModel::refresh,
+                            onToggleManualToken = manualConnectionViewModel::toggleToken,
+                            onCopyManualToken = manualConnectionViewModel::copyToken,
+                            onCopyConnectionDetails =
+                                manualConnectionViewModel::copyConnectionDetails,
                         )
                     }
                 }
@@ -335,86 +299,18 @@ fun AppRoot(
         }
     }
 
-    if (showActivity && state.previewMode) {
-        ActivitySheet(
-            entries = state.activity,
-            details = state.details,
-            onDismiss = { showActivity = false },
-        )
-    }
-
-    if (showControls) {
-        PreviewControlsSheet(
-            state = state,
-            previewMode = state.previewMode,
-            onDismiss = { showControls = false },
-            onPreviewMode = viewModel::setPreviewMode,
-            onProxyState = viewModel::setProxyScenario,
-            onPairingState = { activity ->
-                if (state.previewMode) {
-                    if (activity == PairingActivity.PAIRING) {
-                        showControls = false
-                        viewModel.triggerPairing()
-                    } else {
-                        viewModel.setPairingScenario(activity)
-                    }
-                }
-            },
-            onLastStop = viewModel::setLastStop,
-            onNotifications = viewModel::setNotifications,
-            onLocationOff = viewModel::setSimulatedLocationOff,
-            onAddEvent = {
-                viewModel.setPreviewMode(true)
-                viewModel.addSampleEvent()
-            },
-            onAddDetail = {
-                viewModel.setPreviewMode(true)
-                viewModel.addSampleDetail()
-            },
-            onOpenActivity = {
-                showControls = false
-                viewModel.setPreviewMode(true)
-                showActivity = true
-            },
-            onClearActivity = {
-                viewModel.setPreviewMode(true)
-                viewModel.clearActivity()
-            },
-            onTheme = viewModel::setTheme,
-            onReduceMotion = viewModel::setReduceMotion,
-            onPlayDemo = {
-                showControls = false
-                viewModel.setPreviewMode(true)
-                viewModel.playDemo()
-            },
-            onResetDemo = {
-                showControls = false
-                showActivity = false
-                viewModel.resetDemo()
-            },
-        )
-    }
-
-    val pairingCode = state.pairingCode
     if (realPrompt != null) {
         PairingDialog(
             code = realPrompt.code,
-            simulated = false,
             onAllow = pairingViewModel::allow,
             onDeny = pairingViewModel::deny,
-        )
-    } else if (state.previewMode && pairingCode != null) {
-        PairingDialog(
-            code = pairingCode,
-            simulated = true,
-            onAllow = viewModel::allowPairing,
-            onDeny = viewModel::denyPairing,
         )
     }
 
     if (showForgetAll) {
-        val text = "Each target device keeps its copy until it contacts this source device again. " +
-            "Each one must pair again."
+        val text = "Each target device must pair again with a prompt. Their current tokens " +
+            "still work until you rotate the source token, so rotate the token after " +
+            "forgetting them if their access must end."
         ConfirmDialog(
             title = "Forget all target devices?",
             text = text,
@@ -431,8 +327,9 @@ fun AppRoot(
     if (target != null) {
         ConfirmDialog(
             title = "Forget this target device?",
-            text = "${target.label} keeps its copy until it contacts this source device " +
-                "again. It must pair again.",
+            text = "${target.label} must pair again with a prompt. Its current token " +
+                "still works until you rotate the source token, so rotate the token " +
+                "after forgetting it if its access must end.",
             confirmLabel = "Forget",
             onConfirm = {
                 forgetTargetId = null
@@ -451,98 +348,30 @@ fun AppRoot(
             onConfirm = {
                 showRotate = false
                 pairingViewModel.rotateToken()
+                manualConnectionViewModel.onTokenWriteAttempted()
             },
             onDismiss = { showRotate = false },
         )
     }
 }
 
-@Composable
-private fun PreviewBanner(onOpenControls: () -> Unit) {
-    val tokens = LocalHsTokens.current
-    val compact = LocalDensity.current.fontScale >= 1.3f
-    Column(Modifier.fillMaxWidth()) {
-        Surface(
-            color = tokens.bannerSurface,
-            contentColor = tokens.bannerText,
-            modifier = Modifier
-                .fillMaxWidth()
-                .clickable(
-                    role = Role.Button,
-                    onClickLabel = "Opens preview controls",
-                    onClick = onOpenControls,
-                ),
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .minimumInteractiveComponentSize()
-                    .padding(horizontal = 16.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                Icon(
-                    imageVector = Icons.Outlined.Info,
-                    contentDescription = null,
-                    tint = tokens.bannerText,
-                    modifier = Modifier.size(18.dp),
-                )
-                if (compact) {
-                    Text(
-                        text = "Preview mode. Simulated data.",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = tokens.bannerText,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.weight(1f),
-                    )
-                } else {
-                    Column(Modifier.weight(1f)) {
-                        Text(
-                            text = "Preview mode",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = tokens.bannerText,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                        Text(
-                            text = "The Dashboard shows simulated values. The real proxy is not affected.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = tokens.bannerText.copy(alpha = 0.86f),
-                        )
-                    }
-                    Text(
-                        text = "Controls",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = tokens.bannerText,
-                    )
-                }
-                Icon(
-                    imageVector = Icons.Outlined.ChevronRight,
-                    contentDescription = null,
-                    tint = tokens.bannerText,
-                    modifier = Modifier.size(18.dp),
-                )
-            }
-        }
-        HorizontalDivider(thickness = 1.dp, color = tokens.bannerBorder)
-    }
-}
-
 private fun listenerLabel(listener: RealPairingListener): String = when (listener) {
     RealPairingListener.LISTENING -> "on"
     RealPairingListener.NO_HOTSPOT -> "no hotspot"
+    RealPairingListener.TOKEN_UNREADABLE -> "token unreadable"
     RealPairingListener.FAILED -> "failed"
     RealPairingListener.STOPPED -> "off"
 }
 
 private fun tabIcon(tab: AppTab, selected: Boolean): ImageVector = when (tab) {
     AppTab.DASHBOARD -> if (selected) Icons.Filled.Home else Icons.Outlined.Home
+    AppTab.ACTIVITY -> if (selected) Icons.Filled.History else Icons.Outlined.History
     AppTab.SETTINGS -> if (selected) Icons.Filled.Settings else Icons.Outlined.Settings
 }
 
 @Composable
 private fun PairingDialog(
     code: String,
-    simulated: Boolean,
     onAllow: () -> Unit,
     onDeny: () -> Unit,
 ) {
@@ -576,7 +405,7 @@ private fun PairingDialog(
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text(
-                        text = if (simulated) DemoEngine.formatPairingCode(code) else code,
+                        text = code,
                         style = MaterialTheme.typography.headlineMedium.copy(
                             fontFamily = FontFamily.Monospace,
                             letterSpacing = 2.sp,
@@ -588,11 +417,7 @@ private fun PairingDialog(
                             .padding(vertical = 16.dp, horizontal = 12.dp)
                             .clearAndSetSemantics {
                                 contentDescription = "Pairing code " +
-                                    (if (simulated) {
-                                        DemoEngine.spokenPairingCode(code)
-                                    } else {
-                                        code
-                                    })
+                                    code.toCharArray().joinToString(" ")
                             },
                     )
                 }
@@ -601,19 +426,11 @@ private fun PairingDialog(
                     style = MaterialTheme.typography.bodyMedium,
                     color = tokens.secondaryText,
                 )
-                if (simulated) {
-                    Text(
-                        text = "Preview: this pairing request is simulated.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = tokens.warning,
-                    )
-                } else {
-                    Text(
-                        text = "Real pairing request. This code comes from a target device on the hotspot.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                }
+                Text(
+                    text = "This code comes from a target device on the hotspot.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
             }
         },
         confirmButton = {

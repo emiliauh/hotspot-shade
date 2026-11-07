@@ -140,6 +140,17 @@ impl AdapterGuid {
     pub fn is_zero(self) -> bool {
         self == Self::ZERO
     }
+
+    /// Return the equivalent read-only route verification GUID.
+    ///
+    /// The two modules keep separate ABI types. This conversion is the one
+    /// bridge, so a caller can bind a native route identity to the retained
+    /// identity check without reading or rebuilding the GUID fields.
+    pub(crate) fn route_verify_guid(self) -> crate::windows_route_verify::AdapterGuid {
+        crate::windows_route_verify::AdapterGuid::new(
+            self.data1, self.data2, self.data3, self.data4,
+        )
+    }
 }
 
 const _: () = {

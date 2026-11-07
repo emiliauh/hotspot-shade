@@ -35,7 +35,11 @@ function createEngineBackend(options) {
     cancelPairing: function () { return call('pairCancel'); },
     forget: function () { return call('forget'); },
     start: function (options) {
-      return call('start', { ping: isPlainObject(options) && options.ping === true });
+      const mode = isPlainObject(options) && options.mode === 'direct' ? 'direct' : 'phone';
+      return call('start', {
+        mode: mode,
+        ping: mode === 'phone' && isPlainObject(options) && options.ping === true
+      });
     },
     stop: function () { return call('stop'); },
     probe: function () { return call('probe'); },
@@ -59,9 +63,9 @@ function createEngineBackend(options) {
   });
 }
 
-/* A configured engine that cannot start. Every call reports the same plain
- * error. The app opens normally, so the person can read the error and fix the
- * setting. */
+/* A configured engine that cannot start. Engine operations report the same
+ * plain error; disposal confirms that no engine was started. The app opens so
+ * the person can read the error and fix the setting. */
 function createUnavailableEngineBackend(message) {
   const text = typeof message === 'string' && message ? message : 'The engine is not available.';
   function fail() {
@@ -86,7 +90,7 @@ function createUnavailableEngineBackend(message) {
     describeEngine: function () {
       return { connected: false, transport: 'not_connected', tunnel: 'engine_service', operations: [] };
     },
-    dispose: function () {}
+    dispose: function () { return { stopped: true, timedOut: false, neverStarted: true }; }
   });
 }
 

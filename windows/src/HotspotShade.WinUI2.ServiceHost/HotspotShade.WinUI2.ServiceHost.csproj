@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <RootNamespace>HotspotShade.WinUI2.ServiceHost</RootNamespace>
+    <AssemblyName>HotspotShade.WinUI2.ServiceHost</AssemblyName>
+    <LangVersion>7.3</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Deterministic>true</Deterministic>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\HotspotShade.WinUI2.Core\HotspotShade.WinUI2.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>HotspotShade.WinUI2.ServiceHost.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
+</Project>

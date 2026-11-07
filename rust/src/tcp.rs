@@ -11,6 +11,10 @@ pub const MAX_INFLIGHT: usize = 256 * 1024;
 pub const OUTBUF_HIGH_WATER: usize = 512 * 1024;
 pub const OUTBUF_LOW_WATER: usize = 256 * 1024;
 pub const OUTBUF_HARD_LIMIT: usize = 2 * 1024 * 1024;
+/// The largest window a peer can advertise in the 16-bit window field. The
+/// endpoint negotiates no window scale. RFC 5961, Section 5, bounds an
+/// acceptable ACK with it.
+const MAX_SND_WND: u32 = u16::MAX as u32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 /// A silent established flow is not a dead flow. After this long without
 /// traffic in either direction, probe the inner peer.
@@ -275,6 +279,17 @@ impl TcpFlow {
     pub fn start_held(&self) -> bool {
         self.start_held
     }
+    /// True when the relay must reset the outer socket instead of closing it
+    /// with a FIN. An abortive teardown whose upload direction was not shut
+    /// down cleanly could otherwise look like a complete upload to the
+    /// destination. A flow that never completed the inner handshake forwarded
+    /// no upload, so it keeps the normal close.
+    pub(crate) fn outer_abortive_close(&self) -> bool {
+        self.state == State::Closed
+            && !self.graceful_close
+            && !self.outer_write_shutdown
+            && self.inner_handshake_complete
+    }
     pub fn next_seq(&self) -> u32 {
         self.isn
             .wrapping_add(1)
@@ -374,19 +389,31 @@ impl TcpFlow {
         if self.state == State::Closed {
             return;
         }
+        // A SYN and FIN cannot establish a valid new connection together.
+        if seg.flags & (packet::SYN | packet::FIN) == (packet::SYN | packet::FIN) {
+            return;
+        }
         if seg.flags & packet::RST != 0 {
+            // RFC 5961, Section 3.2. Only a reset at the exact next receive
+            // byte closes the flow. An in-window reset at another sequence
+            // gets a challenge ACK. A reset outside the receive window is
+            // dropped silently, including one below RCV.NXT.
             if seg.seq == self.cseq {
                 self.close();
             } else if seg.seq.wrapping_sub(self.cseq) < u32::from(self.receive_window()) {
-                // An in-window reset at the wrong sequence needs a challenge.
                 self.ctrl(packet::ACK, self.receive_window());
             }
             return;
         }
         if seg.flags & packet::SYN != 0 {
             if seg.seq != self.client_isn || self.inner_handshake_complete {
-                // Do not acknowledge a new SYN using the old sequence space.
-                // The client can reset the stale flow and retry the SYN.
+                // RFC 5961, Section 4: a SYN in a synchronized state gets a
+                // challenge ACK. The relay does not replace a live flow for a
+                // bare SYN with a new initial sequence number. The tunnel can
+                // carry forwarded as well as local traffic, so a forged SYN on
+                // a known 4-tuple could otherwise close the flow without any
+                // sequence number. A local client answers the challenge with a
+                // reset at the next expected byte and then retries the SYN.
                 self.ctrl(packet::ACK, self.receive_window());
                 return;
             }
@@ -414,11 +441,33 @@ impl TcpFlow {
         if seg.flags & packet::ACK == 0 {
             return;
         }
+        // RFC 9293, Section 3.10.7.4, Table 6: a segment whose sequence space
+        // is outside the receive window must not refresh the keepalive or
+        // zero-window budgets, move SND.WL1, or complete the handshake. Answer
+        // it with an ACK and drop it.
+        if !self.segment_acceptable(seg) {
+            self.ctrl(packet::ACK, self.receive_window());
+            return;
+        }
         if !self.on_ack(seg.ack, seg.window, seg.seq, now) {
-            // The ACK is beyond SND.NXT. Drop the whole segment.
+            // The ACK is beyond SND.NXT or too old to be valid. Drop the
+            // whole segment.
             return;
         }
         if self.state == State::Closed {
+            return;
+        }
+        if self.state == State::Connecting
+            && !self.inner_handshake_complete
+            && seg.ack != self.isn.wrapping_add(1)
+        {
+            // RFC 9293, Section 3.10.7.4 keeps the RFC 793 SYN-RECEIVED rule:
+            // the handshake ACK is acceptable only when SND.UNA < SEG.ACK <=
+            // SND.NXT. Nothing is in flight yet, so that is exactly our
+            // SYN-ACK. Reset the half-open flow instead of entering the
+            // established state. The client retries the SYN and opens a new
+            // flow.
+            self.abort();
             return;
         }
         self.inner_handshake_complete = true;
@@ -741,6 +790,23 @@ impl TcpFlow {
     fn receive_window(&self) -> u16 {
         (MAX_PENDING_CLIENT - self.pending.len()).min(RCV_WINDOW as usize) as u16
     }
+    /// RFC 9293, Section 3.10.7.4, Table 6: a segment is acceptable when its
+    /// first or its last sequence number falls in the receive window. A zero
+    /// receive window still accepts a valid ACK at RCV.NXT, and RFC 1122,
+    /// Section 4.2.3.5, requires an answer to a keepalive probe at RCV.NXT-1.
+    /// A duplicate FIN repeats that same byte before RCV.NXT.
+    fn segment_acceptable(&self, seg: &TcpSegment<'_>) -> bool {
+        let window = u32::from(self.receive_window());
+        let offset = seg.seq.wrapping_sub(self.cseq);
+        if offset < window {
+            return true;
+        }
+        if seg.data.is_empty() {
+            return offset == 0 || offset == u32::MAX;
+        }
+        let last = seg.seq.wrapping_add(seg.data.len() as u32 - 1);
+        last.wrapping_sub(self.cseq) < window
+    }
     fn ctrl(&mut self, flags: u8, window: u16) {
         self.send(
             flags,
@@ -773,6 +839,15 @@ impl TcpFlow {
             .wrapping_add(1)
             .wrapping_add(self.acked_data as u32);
         let nxt = self.next_seq();
+        // RFC 5961, Section 5: an ACK is acceptable only in the range
+        // SND.UNA - MAX.SND.WND <= SEG.ACK <= SND.NXT. An ACK below that range
+        // is too old to be meaningful and must not advance SND.UNA, move
+        // SND.WL1, or refresh a probe budget in the caller. Answer it with an
+        // ACK and drop the segment.
+        if (ack.wrapping_sub(una) as i32) < -(MAX_SND_WND as i32) {
+            self.ctrl(packet::ACK, self.receive_window());
+            return false;
+        }
         if seq_before(nxt, ack) {
             // The peer acknowledges data that was never sent. RFC 9293,
             // Section 3.10.7.4: send an ACK, drop the segment, and return.
@@ -1472,6 +1547,450 @@ mod tests {
             t,
         );
         assert_eq!(f.state, State::Closed);
+    }
+    #[test]
+    fn over_ack_does_not_clear_the_zero_window_persist_state() {
+        let t = Instant::now();
+        let mut f = TcpFlow::new(100, 200, &[], 0, t);
+        f.outer_connected();
+        f.outer_data(b"queued", t);
+        f.actions();
+        let first = t + PERSIST_MIN;
+        f.tick(first);
+        let probe = f.actions();
+        assert!(
+            matches!(&probe[..], [Action::Send { flags, data, .. }]
+                if *flags == packet::ACK && data.is_empty()),
+            "{probe:?}"
+        );
+        assert_eq!(f.persist_probes, 1);
+        assert_eq!(f.persist_at, Some(first));
+        assert_eq!(f.persist_interval, PERSIST_MIN * 2);
+        let activity = f.last_activity;
+        // An ACK beyond SND.NXT is invalid. Its window and its arrival must
+        // not open the send window or clear the zero-window probe budget.
+        let over = f.next_seq().wrapping_add(1);
+        f.on_inner(&seg(101, over, packet::ACK, 65535, &[]), first);
+        assert_eq!(f.peer_window, 0);
+        assert_eq!(f.persist_probes, 1);
+        assert_eq!(f.persist_at, Some(first));
+        assert_eq!(f.persist_interval, PERSIST_MIN * 2);
+        assert_eq!(f.last_activity, activity);
+        assert_eq!(f.outbuf.len(), 6);
+        assert_eq!(f.sent_data, 0);
+        let challenge = f.actions();
+        assert!(
+            matches!(&challenge[..], [Action::Send { flags, data, .. }]
+                if *flags == packet::ACK && data.is_empty()),
+            "{challenge:?}"
+        );
+        // A valid ACK still opens the window and sends the queued bytes.
+        f.on_inner(&seg(101, 201, packet::ACK, 65535, &[]), first);
+        let sent = f.actions();
+        assert!(
+            sent.iter()
+                .any(|action| matches!(action, Action::Send { data, .. } if data == b"queued")),
+            "{sent:?}"
+        );
+        assert_eq!(f.sent_data, 6);
+    }
+    #[test]
+    fn over_ack_during_the_handshake_does_not_complete_it() {
+        let t = Instant::now();
+        let mut f = TcpFlow::new(100, 200, &[], 65535, t);
+        f.idle_probes = 1;
+        f.idle_probe_at = Some(t);
+        let over = f.next_seq().wrapping_add(1);
+        f.on_inner(&seg(101, over, packet::ACK, 65535, b"evil"), t);
+        assert_eq!(f.state, State::Connecting);
+        assert!(!f.inner_handshake_complete);
+        assert!(f.pending_bytes().is_empty());
+        assert_eq!(f.idle_probes, 1);
+        assert_eq!(f.idle_probe_at, Some(t));
+        assert_eq!(f.last_activity, t);
+        let actions = f.actions();
+        assert!(
+            matches!(&actions[..], [Action::Send { flags, data, .. }]
+                if *flags == packet::ACK && data.is_empty()),
+            "{actions:?}"
+        );
+        // The real handshake ACK still completes the handshake.
+        f.on_inner(&seg(101, 201, packet::ACK, 65535, &[]), t);
+        assert!(f.inner_handshake_complete);
+    }
+    #[test]
+    fn ancient_ack_is_rejected_before_liveness_or_window_changes() {
+        let t = Instant::now();
+        let mut f = TcpFlow::new(100, 200, &[], 65535, t);
+        f.outer_connected();
+        f.outer_data(b"abcdef", t);
+        f.actions();
+        assert_eq!(f.inflight(), 6);
+        f.idle_probes = 2;
+        f.idle_probe_at = Some(t);
+        f.persist_probes = 3;
+        f.persist_at = Some(t);
+        let una = f.isn.wrapping_add(1);
+        // An ACK below SND.UNA - MAX.SND.WND used to acknowledge every in-flight
+        // byte and clear the probe budgets. RFC 5961, Section 5, discards it.
+        let ancient = una.wrapping_sub(70_000);
+        f.on_inner(
+            &seg(101, ancient, packet::ACK, 4096, &[]),
+            t + Duration::from_secs(1),
+        );
+        assert_eq!(f.acked_data, 0);
+        assert_eq!(f.inflight(), 6);
+        assert_eq!(f.peer_window, 65535);
+        assert_eq!((f.window_seq, f.window_ack), (100, 201));
+        assert_eq!(f.idle_probes, 2);
+        assert_eq!(f.idle_probe_at, Some(t));
+        assert_eq!(f.persist_probes, 3);
+        assert_eq!(f.last_activity, t);
+        assert!(
+            matches!(&f.actions()[..], [Action::Send { flags, data, .. }]
+                if *flags == packet::ACK && data.is_empty())
+        );
+    }
+    #[test]
+    fn bounded_old_ack_is_processed_without_advancing_the_send_state() {
+        let t = Instant::now();
+        let mut f = TcpFlow::new(100, 200, &[], 65535, t);
+        f.outer_connected();
+        f.outer_data(b"abcdef", t);
+        f.actions();
+        let una = f.isn.wrapping_add(1);
+        // An ACK inside SND.UNA - MAX.SND.WND but below SND.UNA is an old ACK.
+        // Its data is new, so it is accepted, but it cannot move SND.UNA or
+        // the send window.
+        f.on_inner(
+            &seg(101, una.wrapping_sub(100), packet::ACK, 4096, b"xy"),
+            t,
+        );
+        assert_eq!(f.acked_data, 0);
+        assert_eq!(f.inflight(), 6);
+        assert_eq!(f.pending_bytes(), b"xy");
+        assert_eq!(f.cseq, 103);
+        assert_eq!(f.peer_window, 65535);
+        assert_eq!((f.window_seq, f.window_ack), (100, 201));
+        // The ACK is not new, so it does not acknowledge the FIN either.
+        assert!(!f.fin_acked);
+    }
+    #[test]
+    fn out_of_window_sequence_cannot_move_the_send_window_or_probe_budget() {
+        let t = Instant::now();
+        let mut f = TcpFlow::new(100, 200, &[], 65535, t);
+        f.outer_connected();
+        f.actions();
+        f.idle_probes = 1;
+        f.idle_probe_at = Some(t);
+        let at = t + Duration::from_secs(1);
+        // A forged sequence number used to move SND.WL1 ahead, so every real
+        // window update looked stale and a zero-window flow never recovered.
+        let forged = f.cseq.wrapping_add(1 << 30);
+        assert!(forged.wrapping_sub(f.cseq) > u32::from(f.receive_window()));
+        f.on_inner(&seg(forged, 201, packet::ACK, 0, &[]), at);
+        assert_eq!(f.peer_window, 65535);
+        assert_eq!((f.window_seq, f.window_ack), (100, 201));
+        assert_eq!(f.idle_probes, 1);
+        assert_eq!(f.idle_probe_at, Some(t));
+        assert_eq!(f.last_activity, t);
+        assert!(matches!(&f.actions()[..], [Action::Send { flags, .. }] if *flags == packet::ACK));
+        // A real zero-window update at RCV.NXT still applies.
+        f.on_inner(&seg(101, 201, packet::ACK, 0, &[]), at);
+        assert_eq!(f.peer_window, 0);
+        assert_eq!((f.window_seq, f.window_ack), (101, 201));
+    }
+    #[test]
+    fn data_outside_the_receive_window_is_not_accepted_or_observed() {
+        let t = Instant::now();
+        let mut f = TcpFlow::new(100, 200, &[], 65535, t);
+        f.outer_connected();
+        f.actions();
+        f.idle_probes = 2;
+        f.idle_probe_at = Some(t);
+        let at = t + Duration::from_secs(1);
+        // SEG.SEQ at RCV.NXT + RCV.WND is the first byte outside the window.
+        let outside = f.cseq.wrapping_add(u32::from(f.receive_window()));
+        f.on_inner(&seg(outside, 201, packet::ACK, 65535, b"late"), at);
+        assert!(f.pending_bytes().is_empty());
+        assert_eq!(f.cseq, 101);
+        assert_eq!(f.idle_probes, 2);
+        assert_eq!(f.last_activity, t);
+        assert!(
+            matches!(&f.actions()[..], [Action::Send { flags, data, .. }]
+                if *flags == packet::ACK && data.is_empty())
+        );
+    }
+    #[test]
+    fn zero_receive_window_accepts_a_valid_ack_but_not_data() {
+        let t = Instant::now();
+        let mut f = TcpFlow::new(100, 200, &[], 65535, t);
+        f.outer_connected();
+        fill_upload_buffer(&mut f, t);
+        f.actions();
+        assert_eq!(f.receive_window(), 0);
+        let cseq = f.cseq;
+        // RFC 9293 still accepts a valid ACK when the receive window is zero,
+        // so the send direction can reopen while the upload buffer is full.
+        f.on_inner(
+            &seg(cseq, 201, packet::ACK, 4096, &[]),
+            t + Duration::from_secs(1),
+        );
+        assert_eq!(f.peer_window, 4096);
+        assert!(f.actions().is_empty());
+        // Data needs receive window space. It is answered and dropped.
+        let at = t + Duration::from_secs(2);
+        f.on_inner(&seg(cseq, 201, packet::ACK, 4096, b"more"), at);
+        assert_eq!(f.pending_bytes().len(), MAX_PENDING_CLIENT);
+        assert_eq!(f.cseq, cseq);
+        assert!(
+            matches!(&f.actions()[..], [Action::Send { flags, data, .. }]
+                if *flags == packet::ACK && data.is_empty())
+        );
+    }
+    #[test]
+    fn handshake_ack_below_the_syn_ack_resets_the_half_open_flow() {
+        let t = Instant::now();
+        let mut f = TcpFlow::new(100, 200, &[], 65535, t);
+        f.idle_probes = 1;
+        f.idle_probe_at = Some(t);
+        // ACK = ISS is inside the RFC 5961 bound but does not acknowledge our
+        // SYN-ACK. RFC 9293, Section 3.10.7.4 sends a reset and never enters
+        // the established state.
+        f.on_inner(&seg(101, 200, packet::ACK, 65535, b"evil"), t);
+        assert_eq!(f.state, State::Closed);
+        assert!(!f.inner_handshake_complete);
+        assert!(f.pending_bytes().is_empty());
+        assert_eq!(f.idle_probes, 1);
+        assert_eq!(f.idle_probe_at, Some(t));
+        let actions = f.actions();
+        assert!(
+            actions.iter().any(
+                |action| matches!(action, Action::Send { flags, .. } if flags & packet::RST != 0)
+            ),
+            "{actions:?}"
+        );
+        assert!(actions.contains(&Action::Close));
+        // Once the handshake ACK arrived, the flow is logically established
+        // even while the outer connect completion is still pending. A later old
+        // ACK is not a handshake ACK and must not reset the live flow.
+        let mut live = TcpFlow::new(100, 200, &[], 65535, t);
+        live.on_inner(&seg(101, 201, packet::ACK, 65535, &[]), t);
+        assert_eq!(live.state, State::Connecting);
+        assert!(live.inner_handshake_complete);
+        live.on_inner(&seg(101, 200, packet::ACK, 65535, b"ok"), t);
+        assert_eq!(live.state, State::Connecting);
+        assert_eq!(live.pending_bytes(), b"ok");
+        assert!(!live.actions().iter().any(
+            |action| matches!(action, Action::Send { flags, .. } if flags & packet::RST != 0)
+        ));
+    }
+    #[test]
+    fn abortive_close_requests_an_outer_reset_only_when_the_upload_is_incomplete() {
+        let t = Instant::now();
+        // A reset from the inner client after it sent upload data.
+        let mut abortive = TcpFlow::new(100, 200, &[], 65535, t);
+        abortive.outer_connected();
+        abortive.actions();
+        abortive.on_inner(&upload(101, b"part"), t);
+        assert_eq!(abortive.pending_bytes(), b"part");
+        abortive.on_inner(
+            &TcpSegment {
+                flags: packet::RST,
+                seq: 105,
+                ..upload(105, &[])
+            },
+            t,
+        );
+        assert_eq!(abortive.state, State::Closed);
+        assert!(abortive.outer_abortive_close());
+        // A graceful close delivered every byte in both directions.
+        let mut graceful = TcpFlow::new(100, 200, &[], 65535, t);
+        graceful.outer_connected();
+        graceful.outer_end(t);
+        graceful.actions();
+        graceful.on_inner(
+            &TcpSegment {
+                flags: packet::FIN | packet::ACK,
+                seq: 101,
+                ack: 202,
+                ..upload(101, &[])
+            },
+            t,
+        );
+        assert_eq!(graceful.state, State::Closed);
+        assert!(!graceful.outer_abortive_close());
+        // An upload direction that already ended with a FIN is complete even
+        // when the peer resets afterwards.
+        let mut half = TcpFlow::new(100, 200, &[], 65535, t);
+        half.outer_connected();
+        half.actions();
+        half.on_inner(
+            &TcpSegment {
+                flags: packet::FIN | packet::ACK,
+                seq: 101,
+                ack: 201,
+                ..upload(101, &[])
+            },
+            t,
+        );
+        half.outer_written(0);
+        assert!(half.outer_write_shutdown);
+        half.on_inner(
+            &TcpSegment {
+                flags: packet::RST,
+                seq: 102,
+                ..upload(102, &[])
+            },
+            t,
+        );
+        assert_eq!(half.state, State::Closed);
+        assert!(!half.outer_abortive_close());
+        // A setup failure before the inner handshake forwarded no upload, so
+        // the outer socket keeps the normal close.
+        let mut setup = TcpFlow::new(100, 200, &[], 65535, t);
+        setup.outer_failed();
+        assert_eq!(setup.state, State::Closed);
+        assert!(!setup.outer_abortive_close());
+    }
+    #[test]
+    fn reset_outside_the_receive_window_is_dropped_silently() {
+        let t = Instant::now();
+        let mut f = TcpFlow::new(100, 200, &[], 65535, t);
+        f.outer_connected();
+        f.actions();
+        f.idle_probes = 2;
+        f.idle_probe_at = Some(t);
+        let window = f.receive_window();
+        // SEG.SEQ below RCV.NXT and SEG.SEQ at RCV.NXT + RCV.WND are both
+        // outside the receive window. RFC 5961 requires a silent drop.
+        for seq in [f.cseq.wrapping_sub(1), f.cseq.wrapping_add(window as u32)] {
+            f.on_inner(
+                &TcpSegment {
+                    flags: packet::RST,
+                    seq,
+                    ..upload(101, &[])
+                },
+                t + Duration::from_secs(1),
+            );
+            assert_eq!(f.state, State::Established, "seq {seq}");
+            assert!(f.actions().is_empty(), "seq {seq}");
+            assert_eq!(f.idle_probes, 2, "seq {seq}");
+            assert_eq!(f.idle_probe_at, Some(t), "seq {seq}");
+            assert_eq!(f.last_activity, t, "seq {seq}");
+        }
+    }
+    #[test]
+    fn reset_challenge_needs_room_in_the_receive_window() {
+        let t = Instant::now();
+        let mut f = TcpFlow::new(100, 200, &[], 65535, t);
+        f.outer_connected();
+        fill_upload_buffer(&mut f, t);
+        f.actions();
+        assert_eq!(f.receive_window(), 0);
+        let cseq = f.cseq;
+        // A zero receive window accepts no non-exact reset, so there is no
+        // challenge ACK to send.
+        f.on_inner(
+            &TcpSegment {
+                flags: packet::RST,
+                seq: cseq.wrapping_add(1),
+                ..upload(cseq, &[])
+            },
+            t,
+        );
+        assert_eq!(f.state, State::Established);
+        assert!(f.actions().is_empty());
+        // The exact reset is still processed even with a zero window.
+        f.on_inner(
+            &TcpSegment {
+                flags: packet::RST,
+                seq: cseq,
+                ..upload(cseq, &[])
+            },
+            t,
+        );
+        assert_eq!(f.state, State::Closed);
+    }
+    #[test]
+    fn reset_validation_crosses_the_sequence_wrap() {
+        let t = Instant::now();
+        let mut f = TcpFlow::new(u32::MAX, 200, &[], 65535, t);
+        f.outer_connected();
+        assert_eq!(f.cseq, 0);
+        // u32::MAX is outside the window below RCV.NXT.
+        f.on_inner(
+            &TcpSegment {
+                flags: packet::RST,
+                seq: u32::MAX,
+                ..upload(0, &[])
+            },
+            t,
+        );
+        assert_eq!(f.state, State::Established);
+        assert!(f.actions().is_empty());
+        // Sequence 1 is in the window but not the exact next byte.
+        f.on_inner(
+            &TcpSegment {
+                flags: packet::RST,
+                seq: 1,
+                ..upload(0, &[])
+            },
+            t,
+        );
+        assert_eq!(f.state, State::Established);
+        assert!(matches!(&f.actions()[..], [Action::Send { flags, .. }] if *flags == packet::ACK));
+        // Sequence 0 is the exact next byte and resets the flow.
+        f.on_inner(
+            &TcpSegment {
+                flags: packet::RST,
+                seq: 0,
+                ..upload(0, &[])
+            },
+            t,
+        );
+        assert_eq!(f.state, State::Closed);
+    }
+    #[test]
+    fn ackless_segments_do_not_clear_liveness_but_a_syn_still_answers() {
+        let t = Instant::now();
+        let mut f = TcpFlow::new(100, 200, &[], 65535, t);
+        f.outer_connected();
+        f.actions();
+        f.idle_probes = 2;
+        f.idle_probe_at = Some(t);
+        // Data and a FIN without an ACK are dropped before they can refresh
+        // the idle probe cycle.
+        for flags in [0, packet::FIN] {
+            f.on_inner(
+                &TcpSegment {
+                    flags,
+                    seq: f.cseq,
+                    ..upload(f.cseq, b"noack")
+                },
+                t + Duration::from_secs(1),
+            );
+            assert_eq!(f.state, State::Established);
+            assert!(f.pending_bytes().is_empty());
+            assert!(f.actions().is_empty());
+            assert_eq!(f.idle_probes, 2);
+            assert_eq!(f.last_activity, t);
+        }
+        // A handshake SYN has no ACK and is still answered.
+        let mut handshake = TcpFlow::new(100, 200, &[], 65535, t);
+        handshake.on_inner(
+            &TcpSegment {
+                flags: packet::SYN,
+                seq: 100,
+                ack: 0,
+                ..upload(100, &[])
+            },
+            t,
+        );
+        assert!(
+            matches!(&handshake.actions()[..], [Action::Send { flags, ack: 101, .. }]
+                if *flags == packet::SYN | packet::ACK)
+        );
     }
     #[test]
     fn data_and_fin_without_ack_are_not_accepted() {
@@ -2588,6 +3107,10 @@ mod tests {
         f.outer_data(b"ghij", t + Duration::from_millis(1));
         f.actions();
         let nxt = f.next_seq();
+        f.idle_probes = 1;
+        f.idle_probe_at = Some(t);
+        f.persist_probes = 2;
+        let activity = f.last_activity;
         f.on_inner(
             &seg(101, nxt.wrapping_add(1), packet::ACK, 0, &[]),
             t + Duration::from_millis(2),
@@ -2596,6 +3119,10 @@ mod tests {
         assert_eq!(f.inflight(), 4);
         assert_eq!(f.peer_window, 65535);
         assert_eq!(f.state, State::Established);
+        assert_eq!(f.idle_probes, 1);
+        assert_eq!(f.idle_probe_at, Some(t));
+        assert_eq!(f.persist_probes, 2);
+        assert_eq!(f.last_activity, activity);
         assert!(matches!(&f.actions()[..],
             [Action::Send { flags, data, .. }]
                 if *flags == packet::ACK && data.is_empty()));

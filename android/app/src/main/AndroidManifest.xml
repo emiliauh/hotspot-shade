@@ -3,9 +3,9 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <!--
-      The preview UI stays unwired. The app declares the permissions and the
-      foreground service that the Android source proxy needs. The service is
-      not exported and starts only from this app.
+      The app declares the permissions and the foreground service that the
+      Android source proxy needs. The service is not exported and starts only
+      from this app.
     -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -24,13 +24,13 @@
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.HotspotShadeDemo"
+        android:theme="@style/Theme.HotspotShade"
         android:usesCleartextTraffic="false">
 
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:theme="@style/Theme.HotspotShadeDemo"
+            android:theme="@style/Theme.HotspotShade"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

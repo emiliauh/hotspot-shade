@@ -1,6 +1,8 @@
 package com.hotspotshade.source.pairing
 
 import com.hotspotshade.source.PairingTrustAdmin
+import com.hotspotshade.source.PairingTrustGate
+import com.hotspotshade.source.ProcessPairingTrustGate
 import com.hotspotshade.source.TrustFingerprint
 import com.hotspotshade.source.TrustedTarget
 import java.security.SecureRandom
@@ -44,9 +46,15 @@ internal class PairingOutput(
     val frames: List<ByteArray>,
     val close: Boolean,
     val status: PairingStatus?,
+    /**
+     * True when a success could not be sealed because the token could not be
+     * saved. The frames carry a fixed rejection, and no trust was added.
+     */
+    val tokenCommitFailed: Boolean = false,
 ) {
     override fun toString(): String =
-        "PairingOutput(connection=$connection, frameCount=${frames.size}, close=$close, status=$status)"
+        "PairingOutput(connection=$connection, frameCount=${frames.size}, " +
+            "close=$close, status=$status, tokenCommitFailed=$tokenCommitFailed)"
 }
 
 /** The per-session identity material. A real host uses a fresh value each time. */
@@ -76,7 +84,7 @@ internal interface PairingTrustStore {
     val count: Int
 }
 
-/** A trust store in process memory. Use it for tests and previews only. */
+/** A trust store in process memory. Tests use it. The app does not. */
 internal class MemoryPairingTrustStore : PairingTrustStore, PairingTrustAdmin {
     private val lock = Any()
     private val keys = LinkedHashSet<String>()
@@ -117,6 +125,14 @@ private class InvalidBudget {
     var level: Int = 0
 }
 
+/**
+ * One charge in a challenge budget.
+ *
+ * [id] names the session that paid the charge. [at] is the charge time, which
+ * keeps its own expiry even if another session proves later.
+ */
+private class ChallengeCharge(val id: Long, val at: Long)
+
 private sealed interface Stage {
     class AwaitingReveal(
         val ephemeral: ByteArray,
@@ -139,30 +155,108 @@ private class Session(
     var firstDeactivate: Long?,
     val peer: String,
     val nonces: MutableList<ByteArray>,
+    /** The challenge charge that this session paid. A verified known proof refunds this exact charge. */
+    val charge: Long,
     var stage: Stage,
 )
+
+/**
+ * What one pairing responder may answer.
+ *
+ * [FULL] is the visible pairing listener. It keeps the v1 behavior: a trusted
+ * target may pair again without a prompt, an unknown target reaches the host
+ * prompt, and a trusted target may send Forget.
+ *
+ * [STATUS_ONLY] is the background status listener. It answers an authenticated
+ * status request from a trusted target and rejects pairing, re-pairing, and
+ * Forget before any credential callback, prompt, or trust mutation. An unknown
+ * key is rejected before a challenge, so no prompt can exist in the
+ * background.
+ */
+internal enum class PairingResponderMode {
+    FULL,
+    STATUS_ONLY,
+}
 
 /**
  * The source-device pairing responder state machine.
  *
  * One pairing decision runs at a time. The host calls every method on one
  * thread or with its own lock. Do not call one responder from two threads.
+ * The trust check that allows a credential or status answer, and the build that
+ * depends on it, run under [PairingTrustGate]. An administrative Forget that
+ * uses the same gate is therefore ordered before the check or after the sealed
+ * result. It cannot interleave a stale trust read with a credential build.
  *
  * The behavior matches `rust/src/source_pairing.rs`. The clock is monotonic
  * milliseconds. The state machine charges the per-address and global challenge
- * budgets before it creates the ephemeral secret, and only when the source
- * device has pairing credentials.
+ * budgets before it creates the ephemeral secret. An unknown key is charged
+ * only when the source device has pairing credentials.
+ *
+ * A HELLO that claims a trusted key uses a separate known-claim budget:
+ * [MAX_KNOWN_PEER_CHALLENGES] for one source address and
+ * [MAX_KNOWN_CHALLENGES] across all source addresses in the same window. A
+ * public key is public, so the claim is unproven until the REVEAL proof. A
+ * verified proof refunds exactly the charge that its own session paid, so a
+ * real target device is not limited by its own presence checks and a staggered
+ * unproven session keeps its charge and expiry. A bad proof, a timeout, and a
+ * closed connection do not refund. The budgets are an availability limit, not
+ * an authentication limit.
  */
 internal class PairingResponder(
     private val trust: PairingTrustStore,
     private val credentials: () -> PairingCredentials?,
-    private val status: () -> ProxyStatus?,
+    private val status: () -> ProxyStatus? = { null },
     private val identity: PairingIdentity,
     private val clock: () -> Long,
+    /**
+     * Persist the token before a success result is sealed or trust is added.
+     *
+     * The source token must be stored before the target device receives it.
+     * Return false on a failed or superseded write; the responder then sends a
+     * fixed rejection and adds no trust. This callback runs while the listener
+     * holds its own lock, so it must not call back into the listener.
+     */
+    private val commitToken: (String) -> Boolean = { true },
+    /**
+     * Build the status answer from the same credential snapshot that the
+     * caller just built. This avoids a second port probe. When it is null the
+     * older [status] callback is used.
+     */
+    private val statusFor: ((PairingCredentials) -> ProxyStatus?)? = null,
+    /**
+     * Serialize a trust decision with the credential or status build that
+     * depends on it. The app uses the process gate so a settings Forget and
+     * this responder share one boundary.
+     */
+    private val trustGate: PairingTrustGate = ProcessPairingTrustGate,
+    /**
+     * The visible listener uses [PairingResponderMode.FULL]. The background
+     * status listener uses [PairingResponderMode.STATUS_ONLY], which rejects
+     * pairing and Forget before any credential callback, prompt, or trust
+     * mutation.
+     */
+    private val mode: PairingResponderMode = PairingResponderMode.FULL,
 ) {
+    private val statusOnly = mode == PairingResponderMode.STATUS_ONLY
     private val sessions = LinkedHashMap<ConnectionId, Session>()
     private val unknownBudget = HashMap<String, MutableList<Long>>()
-    private val unknownChallenges = HashMap<String, MutableList<Long>>()
+    private val unknownChallenges = HashMap<String, MutableList<ChallengeCharge>>()
+
+    /**
+     * The charges of the challenges for a claimed trusted key, for each source
+     * address. The sum of the lists is at most [MAX_KNOWN_CHALLENGES], so the
+     * map stays small. Each charge has a unique identifier, so a refund removes
+     * the proven session's charge and no other.
+     */
+    private val knownChallenges = HashMap<String, MutableList<ChallengeCharge>>()
+
+    /**
+     * The next challenge identifier. It is unique for the life of the
+     * responder. Wrapping after 2^63 charges cannot collide with a live charge
+     * in practice.
+     */
+    private var nextChallengeId = 0L
     private val invalidBudget = HashMap<String, InvalidBudget>()
     private val failures = HashMap<String, MutableList<Long>>()
     private val lockouts = HashMap<String, Long>()
@@ -189,6 +283,9 @@ internal class PairingResponder(
 
     /** The active session count. */
     fun activeSessions(): Int = sessions.size
+
+    /** The count of tracked invalid-message budgets. The map stays bounded. */
+    internal fun trackedInvalidPeers(): Int = invalidBudget.size
 
     /** The recorded prompt failures. It holds no address and no key. */
     fun promptFailureCount(): Int = failures.values.sumOf { it.size }
@@ -253,6 +350,14 @@ internal class PairingResponder(
         val lS = hello.first
         val commit = hello.second
         val flags = if (frame.size == 67) frame[66].toInt() and 0xFF else 0
+        // The background listener serves an authenticated status request from
+        // a trusted key only. Reject a pairing (flag 0), a re-pairing (flag 0
+        // from a trusted key), and Forget (flag 2) before trust is read, a
+        // challenge is charged, a credential callback runs, or a prompt can
+        // exist. A malformed flag above 2 takes the same path.
+        if (statusOnly && flags != 1) {
+            return reply(connection, PairingStatus.REJECTED, false)
+        }
         val known = trust.contains(lS)
 
         if (flags > 2) return reply(connection, PairingStatus.REJECTED, false)
@@ -264,15 +369,20 @@ internal class PairingResponder(
             return reply(connection, PairingStatus.REJECTED, true)
         }
         if (!known) {
+            // A source device with pairing off answers NOT_ACTIVE. It must not
+            // charge the challenge budget, or the peer is locked out later.
             if (credentials() == null) {
                 return reply(connection, PairingStatus.NOT_ACTIVE, true)
             }
-            pruneChallenges(now)
-            if (challengeBudgetUsed(canonicalPeer)) {
-                return reply(connection, PairingStatus.BUSY, false)
-            }
-            chargeChallenge(canonicalPeer, now)
         }
+        pruneChallenges(now)
+        // Charge the per-address and global budgets before the ephemeral
+        // secret exists. A claimed trusted key is unproven until the REVEAL
+        // proof, so it pays the known-claim budget.
+        if (challengeBudgetUsed(canonicalPeer, known)) {
+            return reply(connection, PairingStatus.BUSY, false)
+        }
+        val charge = chargeChallenge(canonicalPeer, now, known)
 
         val secret = identity.ephemeralSecret()
         if (secret.size != 32) {
@@ -298,6 +408,7 @@ internal class PairingResponder(
             firstDeactivate = null,
             peer = canonicalPeer,
             nonces = mutableListOf(),
+            charge = charge,
             stage = Stage.AwaitingReveal(secret, publicEphemeral, commit),
         )
         return PairingOutput(connection, listOf(challenge), false, null)
@@ -436,17 +547,36 @@ internal class PairingResponder(
         stage.pE.fill(0)
 
         if (session.known) {
-            if (!trust.contains(session.lS)) {
-                keys.wipe()
-                return reply(session.connection, PairingStatus.REJECTED, true)
+            // The proof shows that the peer holds the claimed key, so the
+            // challenge was not wasted work. Refund exactly this session's
+            // charge, not the latest charge for the address, so a staggered
+            // unproven session keeps its own charge and its own expiry.
+            refundKnownChallenge(session.peer, session.charge)
+            // The trust list can change while the handshake runs. Recheck it
+            // and build the credentials or authenticated session under one
+            // decision boundary, so a concurrent Forget is ordered before this
+            // check or after the result is sealed.
+            return trustGate.decision {
+                if (!trust.contains(session.lS)) {
+                    keys.wipe()
+                    return@decision reply(session.connection, PairingStatus.REJECTED, true)
+                }
+                if (statusOnly && session.flags != 1) {
+                    // Defense in depth. The HELLO gate above already rejects
+                    // this value before a session exists. Keep the check here
+                    // too, so no later change can reach the credential path.
+                    keys.wipe()
+                    return@decision reply(session.connection, PairingStatus.REJECTED, true)
+                }
+                if (session.flags == 0) {
+                    successLocked(session, keys, now, addTrust = false)
+                } else {
+                    session.stage = Stage.Authenticated(keys)
+                    session.deadline = now + REVEAL_MILLIS
+                    sessions[session.connection] = session
+                    PairingOutput(session.connection, emptyList(), false, null)
+                }
             }
-            if (session.flags == 0) {
-                return success(session, keys, now, addTrust = false)
-            }
-            session.stage = Stage.Authenticated(keys)
-            session.deadline = now + REVEAL_MILLIS
-            sessions[session.connection] = session
-            return PairingOutput(session.connection, emptyList(), false, null)
         }
 
         val active = decision
@@ -481,16 +611,54 @@ internal class PairingResponder(
         return PairingOutput(session.connection, emptyList(), false, null)
     }
 
+    /**
+     * Build a success result under the trust decision boundary.
+     *
+     * For a newly approved target this boundary covers the credential
+     * snapshot, the token commit, and the trust add. For a known target the
+     * caller already rechecked trust inside the same boundary and calls
+     * [successLocked] directly. A concurrent Forget therefore runs before the
+     * boundary section or after the result is sealed. It cannot remove trust
+     * between a check and a credential build.
+     */
     private fun success(
         session: Session,
         keys: PairingKeys,
         now: Long,
         addTrust: Boolean,
+    ): PairingOutput = trustGate.decision {
+        successLocked(session, keys, now, addTrust)
+    }
+
+    private fun successLocked(
+        session: Session,
+        keys: PairingKeys,
+        now: Long,
+        addTrust: Boolean,
     ): PairingOutput {
+        if (statusOnly) {
+            // The background listener never seals credentials. Check this
+            // before the credential callback, so a future pairing path cannot
+            // disclose the token even if it forgets the HELLO gate.
+            keys.wipe()
+            return reply(session.connection, PairingStatus.REJECTED, true)
+        }
         val current = credentials()
         if (current == null) {
             keys.wipe()
             return reply(session.connection, PairingStatus.NOT_ACTIVE, true)
+        }
+        // The token must be durable before the target device sees it and
+        // before this source device trusts the target. A failed or superseded
+        // write sends a fixed rejection, adds no trust, and seals nothing.
+        if (!commitToken(current.token)) {
+            keys.wipe()
+            return reply(
+                session.connection,
+                PairingStatus.REJECTED,
+                true,
+                tokenCommitFailed = true,
+            )
         }
         val nonce = identity.nonce()
         if (nonce.size != 12 || session.nonces.any { it.contentEquals(nonce) } ||
@@ -513,11 +681,16 @@ internal class PairingResponder(
         if (addTrust) {
             try {
                 trust.add(session.lS)
-            } catch (failure: Exception) {
+            } catch (_: Exception) {
                 nonce.fill(0)
                 ciphertext.fill(0)
                 keys.wipe()
-                throw failure
+                // A trust-store failure is a local failure. Send a rejection
+                // and close instead of leaking an unchecked exception to the
+                // host callback. The saved token stays in place: the same
+                // token is still the active source token, and the next pairing
+                // can add trust.
+                return reply(session.connection, PairingStatus.REJECTED, true)
             }
         }
         session.nonces.add(nonce)
@@ -538,7 +711,15 @@ internal class PairingResponder(
         frame: ByteArray,
     ): PairingOutput {
         val keys = stage.keys
-        if (frame.size < 29 || !trust.contains(session.lS)) {
+        if (frame.size < 29) {
+            keys.wipe()
+            return reply(session.connection, PairingStatus.REJECTED, true)
+        }
+        if (statusOnly && session.flags != 1) {
+            // Defense in depth. The HELLO gate above never creates a Forget or
+            // pairing session in status-only mode. This check runs before the
+            // trust mutation below, so a future path cannot remove a key in
+            // the background.
             keys.wipe()
             return reply(session.connection, PairingStatus.REJECTED, true)
         }
@@ -554,12 +735,21 @@ internal class PairingResponder(
                 return reply(session.connection, PairingStatus.REJECTED, true)
             }
             plaintext.fill(0)
-            try {
-                trust.remove(session.lS)
-            } finally {
-                keys.wipe()
+            // The target device asks to forget itself. The check and the
+            // removal use the same mutation boundary as the settings page, so
+            // the two cannot interleave a stale trust read and a write.
+            return trustGate.mutation {
+                if (!trust.contains(session.lS)) {
+                    keys.wipe()
+                    return@mutation reply(session.connection, PairingStatus.REJECTED, true)
+                }
+                try {
+                    trust.remove(session.lS)
+                } finally {
+                    keys.wipe()
+                }
+                reply(session.connection, PairingStatus.OK, false)
             }
-            return reply(session.connection, PairingStatus.OK, false)
         }
         if (session.flags > 1) {
             keys.wipe()
@@ -575,49 +765,63 @@ internal class PairingResponder(
             keys.wipe()
             return reply(session.connection, PairingStatus.REJECTED, true)
         }
-        val currentStatus = status()
-        val currentCredentials = credentials()
-        if (currentStatus == null || currentCredentials == null ||
-            currentStatus.host != currentCredentials.host
-        ) {
+        // The trust check, the credential snapshot, the status snapshot, and
+        // the sealed answer are one decision. A concurrent Forget is ordered
+        // before this check or after the answer is sealed; it cannot remove
+        // trust between the check and the status build.
+        return trustGate.decision {
+            if (!trust.contains(session.lS)) {
+                plaintext.fill(0)
+                keys.wipe()
+                return@decision reply(session.connection, PairingStatus.REJECTED, true)
+            }
+            val currentCredentials = credentials()
+            if (currentCredentials == null) {
+                plaintext.fill(0)
+                keys.wipe()
+                return@decision reply(session.connection, PairingStatus.REJECTED, true)
+            }
+            val currentStatus = statusFor?.invoke(currentCredentials) ?: status()
+            if (currentStatus == null || currentStatus.host != currentCredentials.host) {
+                plaintext.fill(0)
+                keys.wipe()
+                return@decision reply(session.connection, PairingStatus.REJECTED, true)
+            }
+            val message = try {
+                PairingProtocol.encodeStatus(currentStatus, plaintext.copyOfRange(0, 16))
+            } catch (failure: Exception) {
+                plaintext.fill(0)
+                keys.wipe()
+                throw failure
+            }
             plaintext.fill(0)
+            val nonce = identity.nonce()
+            if (nonce.size != 12 || session.nonces.any { it.contentEquals(nonce) } ||
+                session.nonces.size >= MAX_SESSION_NONCES
+            ) {
+                nonce.fill(0)
+                keys.wipe()
+                throw PairingException(PairingError.IDENTITY)
+            }
+            val ciphertext = try {
+                PairingProtocol.sealMessage(keys, nonce, message)
+            } catch (failure: Exception) {
+                nonce.fill(0)
+                keys.wipe()
+                throw failure
+            }
+            val payload = ByteArray(1 + 12 + ciphertext.size)
+            payload[0] = PairingProtocol.MSG_STATUS.toByte()
+            nonce.copyInto(payload, 1)
+            ciphertext.copyInto(payload, 13)
             keys.wipe()
-            return reply(session.connection, PairingStatus.REJECTED, true)
+            PairingOutput(
+                session.connection,
+                listOf(PairingProtocol.frame(payload)),
+                true,
+                null,
+            )
         }
-        val message = try {
-            PairingProtocol.encodeStatus(currentStatus, plaintext.copyOfRange(0, 16))
-        } catch (failure: Exception) {
-            plaintext.fill(0)
-            keys.wipe()
-            throw failure
-        }
-        plaintext.fill(0)
-        val nonce = identity.nonce()
-        if (nonce.size != 12 || session.nonces.any { it.contentEquals(nonce) } ||
-            session.nonces.size >= MAX_SESSION_NONCES
-        ) {
-            nonce.fill(0)
-            keys.wipe()
-            throw PairingException(PairingError.IDENTITY)
-        }
-        val ciphertext = try {
-            PairingProtocol.sealMessage(keys, nonce, message)
-        } catch (failure: Exception) {
-            nonce.fill(0)
-            keys.wipe()
-            throw failure
-        }
-        val payload = ByteArray(1 + 12 + ciphertext.size)
-        payload[0] = PairingProtocol.MSG_STATUS.toByte()
-        nonce.copyInto(payload, 1)
-        ciphertext.copyInto(payload, 13)
-        keys.wipe()
-        return PairingOutput(
-            session.connection,
-            listOf(PairingProtocol.frame(payload)),
-            true,
-            null,
-        )
     }
 
     private fun expire(session: Session, now: Long): PairingOutput {
@@ -644,15 +848,19 @@ internal class PairingResponder(
         recent.add(now)
         if (recent.size >= FAILURES_FOR_LOCKOUT) {
             lockouts.entries.removeAll { now >= it.value }
-            if (lockouts.containsKey(peer) || lockouts.size < MAX_TRACKED_PEERS) {
-                lockouts[peer] = now + LOCKOUT_MILLIS
+            if (!lockouts.containsKey(peer) && lockouts.size >= MAX_TRACKED_PEERS) {
+                evictSoonestLockout()
             }
+            lockouts[peer] = now + LOCKOUT_MILLIS
             unknownBudget.remove(peer)
             recent.clear()
         }
         if (recent.isEmpty()) {
             failures.remove(peer)
-        } else if (failures.containsKey(peer) || failures.size < MAX_TRACKED_PEERS) {
+        } else {
+            if (!failures.containsKey(peer) && failures.size >= MAX_TRACKED_PEERS) {
+                evictOldestFailure()
+            }
             failures[peer] = recent
         }
         return reply(connection, pairingStatus, true)
@@ -660,16 +868,23 @@ internal class PairingResponder(
 
     private fun bad(connection: ConnectionId, peer: String, now: Long): PairingOutput {
         pruneInvalid(now)
-        if (invalidBudget.containsKey(peer) || invalidBudget.size < MAX_TRACKED_PEERS) {
-            val budget = invalidBudget.getOrPut(peer) { InvalidBudget() }
-            budget.failures.removeAll { now - it >= INVALID_WINDOW_MILLIS }
-            budget.failures.add(now)
-            if (budget.failures.size >= MAX_INVALID_FAILURES) {
-                val seconds = 1L shl budget.level.coerceAtMost(MAX_BACKOFF_LEVEL)
-                budget.until = now + seconds * 1000
-                budget.level = (budget.level + 1).coerceAtMost(MAX_BACKOFF_LEVEL)
-                budget.failures.clear()
+        val budget = invalidBudget[peer] ?: run {
+            if (invalidBudget.size >= MAX_TRACKED_PEERS) {
+                // The map is full. Evict the record that expires first, so the
+                // new peer still gets its own budget. Do not drop the record
+                // for the new peer: that would let one address rotate its
+                // peers and keep the fast path open.
+                evictOldestInvalid()
             }
+            InvalidBudget().also { invalidBudget[peer] = it }
+        }
+        budget.failures.removeAll { now - it >= INVALID_WINDOW_MILLIS }
+        budget.failures.add(now)
+        if (budget.failures.size >= MAX_INVALID_FAILURES) {
+            val seconds = 1L shl budget.level.coerceAtMost(MAX_BACKOFF_LEVEL)
+            budget.until = now + seconds * 1000
+            budget.level = (budget.level + 1).coerceAtMost(MAX_BACKOFF_LEVEL)
+            budget.failures.clear()
         }
         return reply(connection, PairingStatus.REJECTED, true)
     }
@@ -678,6 +893,7 @@ internal class PairingResponder(
         connection: ConnectionId,
         pairingStatus: PairingStatus,
         log: Boolean,
+        tokenCommitFailed: Boolean = false,
     ): PairingOutput {
         clearDecision(connection)
         return PairingOutput(
@@ -685,6 +901,7 @@ internal class PairingResponder(
             listOf(PairingProtocol.frame(PairingProtocol.encodeResultStatus(pairingStatus))),
             true,
             if (log) pairingStatus else null,
+            tokenCommitFailed,
         )
     }
 
@@ -710,27 +927,86 @@ internal class PairingResponder(
     }
 
     private fun pruneChallenges(now: Long) {
-        unknownChallenges.entries.removeAll { (_, challenges) ->
-            challenges.removeAll { now - it >= CHALLENGE_WINDOW_MILLIS }
-            challenges.isEmpty()
+        for (map in listOf(unknownChallenges, knownChallenges)) {
+            map.entries.removeAll { (_, challenges) ->
+                challenges.removeAll { now - it.at >= CHALLENGE_WINDOW_MILLIS }
+                challenges.isEmpty()
+            }
         }
     }
 
-    private fun challengeBudgetUsed(peer: String): Boolean {
-        val peerCount = unknownChallenges[peer]?.size ?: 0
-        val total = unknownChallenges.values.sumOf { it.size }
-        return peerCount >= MAX_PEER_CHALLENGES || total >= MAX_UNKNOWN_CHALLENGES
+    /**
+     * True when the source address or the whole responder has no challenge
+     * budget left for the current window. A claimed trusted key uses its own
+     * budget. Call [pruneChallenges] first.
+     */
+    private fun challengeBudgetUsed(peer: String, known: Boolean): Boolean {
+        val map = if (known) knownChallenges else unknownChallenges
+        val peerLimit = if (known) MAX_KNOWN_PEER_CHALLENGES else MAX_PEER_CHALLENGES
+        val globalLimit = if (known) MAX_KNOWN_CHALLENGES else MAX_UNKNOWN_CHALLENGES
+        val peerCount = map[peer]?.size ?: 0
+        val total = map.values.sumOf { it.size }
+        return peerCount >= peerLimit || total >= globalLimit
     }
 
-    private fun chargeChallenge(peer: String, now: Long) {
-        unknownChallenges.getOrPut(peer) { mutableListOf() }.add(now)
+    /**
+     * Charge one challenge and return its identifier. The caller stores the
+     * identifier in the session that the charge paid for. The budget check runs
+     * first, so the map never holds more than its global limit.
+     */
+    private fun chargeChallenge(peer: String, now: Long, known: Boolean): Long {
+        val id = nextChallengeId
+        nextChallengeId += 1
+        val map = if (known) knownChallenges else unknownChallenges
+        map.getOrPut(peer) { mutableListOf() }.add(ChallengeCharge(id, now))
+        return id
+    }
+
+    /**
+     * Return one known-challenge charge after a verified proof. The caller
+     * passes the identifier that the proven session recorded, so the refund
+     * cannot return a later unproven charge for the same address. A charge that
+     * already expired is a no-op. A target device that holds the claimed key is
+     * not limited by its own presence checks.
+     */
+    private fun refundKnownChallenge(peer: String, charge: Long) {
+        val charges = knownChallenges[peer] ?: return
+        val index = charges.indexOfFirst { it.id == charge }
+        if (index < 0) return
+        charges.removeAt(index)
+        if (charges.isEmpty()) knownChallenges.remove(peer)
     }
 
     private fun pruneInvalid(now: Long) {
         invalidBudget.entries.removeAll { (_, budget) ->
             budget.failures.removeAll { now - it >= INVALID_WINDOW_MILLIS }
-            now < budget.until || budget.failures.isNotEmpty()
+            now >= budget.until && budget.failures.isEmpty()
         }
+    }
+
+    /** Remove the invalid-message budget that expires first. */
+    private fun evictOldestInvalid() {
+        val oldest = invalidBudget.entries.minWithOrNull(
+            compareBy(
+                { it.value.until },
+                { it.value.failures.minOrNull() ?: Long.MAX_VALUE },
+            ),
+        ) ?: return
+        invalidBudget.remove(oldest.key)
+    }
+
+    /** Remove the oldest prompt-failure record. */
+    private fun evictOldestFailure() {
+        val oldest = failures.entries.minWithOrNull(
+            compareBy({ it.value.minOrNull() ?: Long.MAX_VALUE }),
+        ) ?: return
+        failures.remove(oldest.key)
+    }
+
+    /** Remove the lockout that ends first. */
+    private fun evictSoonestLockout() {
+        val soonest = lockouts.entries.minWithOrNull(compareBy { it.value }) ?: return
+        lockouts.remove(soonest.key)
     }
 
     private fun pruneAll() {
@@ -804,6 +1080,8 @@ internal class PairingResponder(
         const val MAX_SESSION_NONCES = 4
         const val MAX_UNKNOWN_CHALLENGES = 8
         const val MAX_PEER_CHALLENGES = 4
+        const val MAX_KNOWN_PEER_CHALLENGES = 8
+        const val MAX_KNOWN_CHALLENGES = 16
         const val CHALLENGE_WINDOW_MILLIS = 60_000L
         val NEXT_PROMPT_ID = AtomicLong(1)
     }

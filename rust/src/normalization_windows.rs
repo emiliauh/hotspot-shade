@@ -14,6 +14,7 @@
 //! The tunnel relay uses these helpers in source device proxy mode. A live
 //! Windows tunnel test is still needed. The Windows CI job tests the helpers
 //! on loopback.
+pub use crate::normalized_udp::NormalizedUdpSocket;
 use std::ffi::CString;
 use std::io;
 use std::mem;
@@ -36,6 +37,8 @@ const AF_INET: i32 = 2;
 const AF_INET6: i32 = 23;
 const SOCK_STREAM: i32 = 1;
 const SOCK_DGRAM: i32 = 2;
+const WSA_FLAG_OVERLAPPED: u32 = 0x01;
+const WSA_FLAG_NO_HANDLE_INHERIT: u32 = 0x80;
 const IPPROTO_IP: i32 = 0;
 const IPPROTO_IPV6: i32 = 41;
 const IPPROTO_TCP: i32 = 6;
@@ -191,8 +194,17 @@ fn fd_set(raw: RawSocket) -> FdSet {
 extern "system" {
     fn WSAStartup(version: u16, data: *mut WsaData) -> i32;
     fn WSAGetLastError() -> i32;
-    fn socket(family: i32, kind: i32, protocol: i32) -> RawSocket;
+    fn WSASocketW(
+        family: i32,
+        kind: i32,
+        protocol: i32,
+        protocol_info: *mut std::ffi::c_void,
+        group: u32,
+        flags: u32,
+    ) -> RawSocket;
     fn connect(socket: RawSocket, name: *const u8, name_len: i32) -> i32;
+    fn bind(socket: RawSocket, name: *const u8, name_len: i32) -> i32;
+    fn listen(socket: RawSocket, backlog: i32) -> i32;
     fn setsockopt(socket: RawSocket, level: i32, option: i32, value: *const u8, length: i32)
         -> i32;
     fn getsockopt(
@@ -381,8 +393,20 @@ fn get_int(socket: RawSocket, level: i32, option: i32) -> io::Result<i32> {
     if rc == SOCKET_ERROR {
         Err(last_wsa_error())
     } else {
-        Ok(value)
+        checked_int_option(value, length)
     }
+}
+
+// The options read by get_int are documented as four-byte integers. This
+// guards against an unexpected successful short or oversized provider result.
+fn checked_int_option(value: i32, length: i32) -> io::Result<i32> {
+    if length != mem::size_of::<i32>() as i32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "socket option returned an invalid length",
+        ));
+    }
+    Ok(value)
 }
 
 fn set_nonblocking(socket: RawSocket, enabled: bool) -> io::Result<()> {
@@ -396,8 +420,10 @@ fn set_nonblocking(socket: RawSocket, enabled: bool) -> io::Result<()> {
 
 /// Return the `IP_UNICAST_IF` or `IPV6_UNICAST_IF` option value.
 ///
-/// Microsoft documents a network byte order index for IPv4 and a host byte
-/// order index for IPv6. Do not use one order for both options.
+/// Microsoft documents a network byte order index when setting the IPv4
+/// option and a host byte order index when setting the IPv6 option. A read
+/// of either option returns the index in host byte order. Do not decode an
+/// IPv4 read with the byte order used for the write.
 fn unicast_if_value(v6: bool, index: u32) -> [u8; 4] {
     if v6 {
         index.to_ne_bytes()
@@ -420,7 +446,18 @@ fn new_socket(v6: bool, kind: i32, iface: Option<u32>, audit: &Audit) -> io::Res
     } else {
         IPPROTO_UDP
     };
-    let raw = unsafe { socket(family, kind, protocol) };
+    // Set non-inheritance at creation so another thread cannot inherit the
+    // outer socket between creation and a separate handle-flag update.
+    let raw = unsafe {
+        WSASocketW(
+            family,
+            kind,
+            protocol,
+            std::ptr::null_mut(),
+            0,
+            WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+        )
+    };
     if raw == INVALID_SOCKET {
         return Err(last_wsa_error());
     }
@@ -812,7 +849,18 @@ fn wait_for_connect(
     }
 }
 
+fn reject_mapped(ip: IpAddr) -> io::Result<()> {
+    if matches!(ip, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "IPv4-mapped IPv6 addresses must be passed as IPv4",
+        ));
+    }
+    Ok(())
+}
+
 /// Start a nonblocking connection to a numeric address.
+/// IPv4-mapped IPv6 addresses are rejected; pass the IPv4 address instead.
 ///
 /// The returned stream is nonblocking in every case. An in-progress connection
 /// is not an error, so the stream can be pending. The caller must wait until
@@ -824,6 +872,7 @@ fn wait_for_connect(
 /// Use `tcp_connect` or `tcp_connect_cancellable` when the caller needs a
 /// blocking stream or a deadline.
 pub fn tcp_start(addr: SocketAddr, iface: Option<u32>, audit: &Audit) -> io::Result<TcpStream> {
+    crate::normalized_udp::validate_destination(addr)?;
     let owned = new_socket(addr.is_ipv6(), SOCK_STREAM, iface, audit)?;
     let raw = owned.as_raw_socket();
     set_nonblocking(raw, true)?;
@@ -833,6 +882,7 @@ pub fn tcp_start(addr: SocketAddr, iface: Option<u32>, audit: &Audit) -> io::Res
 }
 
 /// Connect to a numeric address. Hostname resolution is never used.
+/// IPv4-mapped IPv6 addresses are rejected; pass the IPv4 address instead.
 pub fn tcp_connect(
     addr: SocketAddr,
     iface: Option<u32>,
@@ -863,6 +913,7 @@ pub fn tcp_connect_cancellable(
             "connection cancelled",
         ));
     }
+    crate::normalized_udp::validate_destination(addr)?;
     let started = Instant::now();
     let owned = new_socket(addr.is_ipv6(), SOCK_STREAM, iface, audit)?;
     // The guard owns the socket for the whole attempt. Every early return
@@ -884,10 +935,19 @@ pub fn tcp_connect_cancellable(
 }
 
 /// Create an unconnected normalized datagram socket for a numeric address family.
-pub fn udp_socket(ip: IpAddr, iface: Option<u32>, audit: &Audit) -> io::Result<UdpSocket> {
+/// IPv4-mapped IPv6 addresses are rejected; pass the IPv4 address instead.
+pub fn udp_socket(
+    ip: IpAddr,
+    iface: Option<u32>,
+    audit: &Audit,
+) -> io::Result<NormalizedUdpSocket> {
+    reject_mapped(ip)?;
     let owned = new_socket(ip.is_ipv6(), SOCK_DGRAM, iface, audit)?;
     let raw = owned.into_raw_socket();
-    Ok(unsafe { UdpSocket::from_raw_socket(raw) })
+    Ok(NormalizedUdpSocket::new(
+        unsafe { UdpSocket::from_raw_socket(raw) },
+        ip.is_ipv6(),
+    ))
 }
 
 /// Enable TCP keepalive on an existing TCP outer socket and verify the kernel
@@ -1082,9 +1142,105 @@ fn keepalive_ms(value: Duration, name: &str) -> io::Result<u32> {
     Ok(millis as u32)
 }
 
+/// `SO_EXCLUSIVEADDRUSE` is `~SO_REUSEADDR` in winsock2.h.
+const SO_EXCLUSIVEADDRUSE: i32 = !0x0004;
+const SOMAXCONN: i32 = 0x7fff_ffff;
+
+/// Bind the local control listener on `127.0.0.1` with `SO_EXCLUSIVEADDRUSE`.
+///
+/// This is not an outer socket. It sets no TTL and no interface pin, and it
+/// carries no tethered traffic. Without the option, another socket of the same
+/// user can bind the same address and port with `SO_REUSEADDR` and receive new
+/// loopback connections, including a request that carries the per-launch
+/// bearer secret. The socket is created non-inheritable, so a child process
+/// cannot keep the port open.
+pub fn exclusive_loopback_listener(
+    address: std::net::SocketAddrV4,
+) -> io::Result<std::net::TcpListener> {
+    if !address.ip().is_loopback() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the control listener must use a loopback address",
+        ));
+    }
+    ensure_winsock()?;
+    let raw = unsafe {
+        WSASocketW(
+            AF_INET,
+            SOCK_STREAM,
+            IPPROTO_TCP,
+            std::ptr::null_mut(),
+            0,
+            WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+        )
+    };
+    if raw == INVALID_SOCKET {
+        return Err(last_wsa_error());
+    }
+    // Own the socket before any operation that can fail.
+    let owned = unsafe { OwnedSocket::from_raw_socket(raw) };
+    set_int(raw, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1)?;
+    let name = SockaddrIn {
+        family: AF_INET as u16,
+        port: address.port().to_be(),
+        addr: u32::from_ne_bytes(address.ip().octets()),
+        zero: [0; 8],
+    };
+    let rc = unsafe {
+        bind(
+            raw,
+            (&name as *const SockaddrIn).cast(),
+            mem::size_of_val(&name) as i32,
+        )
+    };
+    if rc != 0 {
+        return Err(last_wsa_error());
+    }
+    if unsafe { listen(raw, SOMAXCONN) } != 0 {
+        return Err(last_wsa_error());
+    }
+    Ok(unsafe { std::net::TcpListener::from_raw_socket(owned.into_raw_socket()) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integer_option_read_rejects_incomplete_or_invalid_lengths() {
+        assert_eq!(checked_int_option(65, 4).unwrap(), 65);
+        for length in [-1, 0, 1, 2, 3, 5, 8] {
+            let error = checked_int_option(0, length).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetHandleInformation(handle: *mut std::ffi::c_void, flags: *mut u32) -> i32;
+    }
+
+    fn assert_not_inheritable(socket: RawSocket) {
+        let mut flags = 0;
+        let result = unsafe { GetHandleInformation(socket as *mut std::ffi::c_void, &mut flags) };
+        assert_ne!(result, 0, "{}", io::Error::last_os_error());
+        assert_eq!(flags & 1, 0, "socket handle is inheritable");
+    }
+
+    #[test]
+    fn normalized_tcp_and_udp_handles_are_not_inheritable() {
+        let audit = Audit::default();
+        for v6 in [false, true] {
+            for kind in [SOCK_STREAM, SOCK_DGRAM] {
+                let socket = new_socket(v6, kind, None, &audit).unwrap();
+                assert_not_inheritable(socket.as_raw_socket());
+            }
+            let ip = if v6 { "::1" } else { "127.0.0.1" };
+            let udp = udp_socket(ip.parse().unwrap(), None, &audit).unwrap();
+            assert_not_inheritable(udp.raw_handle());
+        }
+        assert_eq!(audit.snapshot(), (6, 0));
+    }
 
     const WSAECONNREFUSED: i32 = 10061;
     const WSAETIMEDOUT: i32 = 10060;
@@ -1202,12 +1358,12 @@ mod tests {
         let audit = Audit::default();
         let v4 = udp_socket("127.0.0.1".parse().unwrap(), Some(1), &audit).unwrap();
         assert_eq!(
-            get_int(v4.as_raw_socket(), IPPROTO_IP, IP_UNICAST_IF).unwrap(),
+            get_int(v4.raw_handle(), IPPROTO_IP, IP_UNICAST_IF).unwrap(),
             1
         );
         let v6 = udp_socket("::1".parse().unwrap(), Some(1), &audit).unwrap();
         assert_eq!(
-            get_int(v6.as_raw_socket(), IPPROTO_IPV6, IPV6_UNICAST_IF).unwrap(),
+            get_int(v6.raw_handle(), IPPROTO_IPV6, IPV6_UNICAST_IF).unwrap(),
             1
         );
         assert_eq!(audit.snapshot(), (2, 0));
@@ -1600,7 +1756,7 @@ mod tests {
             65
         );
         assert_eq!(
-            get_int(udp.as_raw_socket(), IPPROTO_IPV6, IPV6_UNICAST_HOPS).unwrap(),
+            get_int(udp.raw_handle(), IPPROTO_IPV6, IPV6_UNICAST_HOPS).unwrap(),
             65
         );
         assert_eq!(audit.snapshot(), (2, 0));
@@ -1731,5 +1887,67 @@ mod tests {
         // `SIO_KEEPALIVE_VALS` is documented for TCP sockets. A UDP socket
         // must not report a successful keepalive setting.
         assert!(set_tcp_keepalive_socket(raw, TcpKeepalive::SOURCE_DEVICE).is_err());
+    }
+
+    #[test]
+    fn exclusive_loopback_listener_refuses_a_shared_bind() {
+        let listener = exclusive_loopback_listener(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::LOCALHOST,
+            0,
+        ))
+        .unwrap();
+        let local = listener.local_addr().unwrap();
+        assert_eq!(local.ip(), IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        assert_ne!(local.port(), 0);
+        assert_not_inheritable(listener.as_raw_socket());
+
+        // A second socket that asks for SO_REUSEADDR must not share the port.
+        const SO_REUSEADDR: i32 = 0x0004;
+        let raw = unsafe {
+            WSASocketW(
+                AF_INET,
+                SOCK_STREAM,
+                IPPROTO_TCP,
+                std::ptr::null_mut(),
+                0,
+                WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+            )
+        };
+        assert_ne!(raw, INVALID_SOCKET);
+        let second = unsafe { OwnedSocket::from_raw_socket(raw) };
+        set_int(second.as_raw_socket(), SOL_SOCKET, SO_REUSEADDR, 1).unwrap();
+        let name = SockaddrIn {
+            family: AF_INET as u16,
+            port: local.port().to_be(),
+            addr: u32::from_ne_bytes(std::net::Ipv4Addr::LOCALHOST.octets()),
+            zero: [0; 8],
+        };
+        let rc = unsafe {
+            bind(
+                second.as_raw_socket(),
+                (&name as *const SockaddrIn).cast(),
+                mem::size_of_val(&name) as i32,
+            )
+        };
+        assert_ne!(
+            rc, 0,
+            "a SO_REUSEADDR bind must not share the listener port"
+        );
+
+        // The listener still accepts a plain loopback connection.
+        let client = std::net::TcpStream::connect(local).unwrap();
+        let (accepted, peer) = listener.accept().unwrap();
+        assert_eq!(peer, client.local_addr().unwrap());
+        drop(accepted);
+    }
+
+    #[test]
+    fn exclusive_loopback_listener_refuses_a_non_loopback_address() {
+        let error = exclusive_loopback_listener(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::UNSPECIFIED,
+            0,
+        ))
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

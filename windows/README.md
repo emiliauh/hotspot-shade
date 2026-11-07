@@ -1,499 +1,446 @@
-# HotspotShade for Windows (WinUI 2 prototype)
+# HotspotShade for Windows (WinUI 2)
 
-> **Status: user interface prototype. Not production ready.**
+> **Status: release candidate for the first real test. It is not production ready.**
 >
-> This directory contains a native WinUI 2 user interface prototype. It has no
-> engine connection, tunnel, routes, service, network listener, or credentials.
-> All displayed data is simulated. Do not attach it to the Rust engine.
+> The WinUI 2 app is wired to the real engine. It has no demo mode and no
+> simulated data. It has not been built or run on Windows yet: the first build
+> and the first live test happen on the owner's PC with
+> [BUILD_AND_TEST_ON_PC.md](BUILD_AND_TEST_ON_PC.md). Features that are not
+> built for Windows are not offered and are listed in
+> [Not available on Windows](#not-available-on-windows).
 
-This is an isolated prototype. It does not claim Windows tunnel support. The
-macOS arm64 tunnel remains the only verified tunnel.
+The macOS arm64 tunnel remains the only verified tunnel. The root platform
+status is in [../README.md](../README.md). The UI translation status is in
+[PARITY.md](PARITY.md).
 
-The Rust command-line engine now has a source device proxy start path on
-Windows. This WinUI app does not use it. The Windows target still needs a
-protected service boundary, a live hotspot test, and a signed package before
-production. The root platform status is in [../README.md](../README.md).
+## Architecture
 
-## What this is
+```text
+UWP window (AppContainer, standard user)
+  |  in-process app service "hotspotshade.engine", fixed operations only
+  v
+Broker\HotspotShade.WinUI2.Broker.exe (full trust, standard user, medium integrity)
+  |-- user engine:  Engine\hotspotshade.exe gui --token-fd --parent-fd --handoff-fd
+  |                 started at app open, never elevated
+  |
+  |   Turn on only: ShellExecuteEx "runas" -> one UAC prompt
+  v
+Elevate\HotspotShade.WinUI2.Elevate.exe (administrator, exits after the start)
+  |-- elevated engine: Engine\hotspotshade.exe gui --token-fd --parent-fd --credentials-fd
+                       loads Engine\wintun.dll, owns the adapter and the routes
+```
 
-- A UWP app with WinUI 2.8.7 controls. The window has a native title bar, a
-  native in-window menu bar, and a `NavigationView` with Dashboard, Activity,
-  and Settings.
-- A translation of the macOS target app states: Dashboard, pairing, Activity,
-  Settings, attention lines, status freshness, ping text, recent failures, and
-  simulated reports.
-- A labeled demo. A persistent `InfoBar` says that all data is simulated. The
-  Dashboard, Activity, Settings, recent failures, and reports repeat the label.
-- A pure state machine in `src/HotspotShade.WinUI2.Core` with a deterministic
-  clock and no Windows UI dependency.
-- A dependency-free test runner. It checks the state machine and static
-  contracts. It needs no test framework package.
+### Window
 
-## What this is not
+`src/HotspotShade.WinUI2` is a UWP app with WinUI 2.8.7 controls. It runs in
+an AppContainer and cannot reach the loopback engine, so it never holds a
+bearer secret. At launch it starts the packaged broker with
+`FullTrustProcessLauncher`, which asks for no administrator approval. The
+broker opens the app service; the window accepts the connection only when
+`CallerPackageFamilyName` is its own package family. The window sends its
+process id in `hello`, then fixed operations: `status`, `pair_status`, `pair`,
+`pair_cancel`, `forget`, `probe`, `logs`, `diagnostics`, `failures`,
+`turn_on`, and `turn_off` (`BrokerProtocol.cs`). Every value is a short
+string; unknown operations and fields are refused.
 
-- It is not a tunnel. It creates no adapter, route, socket, or listener.
-- It is not a service client. It has no HTTP client, no loopback API, no IPC,
-  and no engine bearer secret.
-- It is not a source device app. It never contacts a phone.
-- It is not production ready. It has no signed package, installer, update path,
-  crash reporting, localization, or support lifecycle.
-- It is not proof that a Windows tunnel works.
+All window logic is in the Core library (`src/HotspotShade.WinUI2.Core/App`),
+so it is tested without Windows:
 
-## Architecture decision
+- `JsonValue` is a bounded JSON reader (size, depth, duplicate keys).
+- `EngineSnapshot.cs` reads `/api/status`, `/api/phone/pair`, `/api/logs`, and
+  `/api/failures` in the shape that the Rust engine writes.
+- `DashboardPresenter` is a port of the macOS derive table, screen
+  presentation, and card content (`AppModel.derive`, `ScreenPresentation`,
+  `DashboardContent`). It computes every title, subtitle, action, card,
+  attention line, and the enablement and reason of Turn on, Turn off, Pair,
+  Cancel, and Forget.
+- `AppSession` holds the window state: freshness (stale after 3 seconds,
+  unavailable after 10), pairing polls, Forget, Turn on, Turn off, Turn off and
+  forget, Activity, Recent failures, and Copy diagnostics. `WindowState` is
+  the bindable view of one session.
 
-The prototype uses **UWP with WinUI 2.8.7**. This is the supported WinUI 2 app
-model that Microsoft documents for a self-contained native app:
+### Broker
 
-- Microsoft documents WinUI 2 for UWP apps and for desktop apps that use XAML
-  Islands.
-- Microsoft documents XAML Islands for WPF and Windows Forms as supported only
-  in apps that target .NET Core 3.x. .NET Core 3.1 is out of support. The
-  Community Toolkit host control is archived. WinUI controls in an unpackaged
-  island also need MSIX or dynamic dependencies. That path is not a viable base
-  for a new app.
-- WinUI 3 is a different framework and is outside the user choice for this
-  prototype.
+`src/HotspotShade.WinUI2.Broker` is a full-trust `WinExe` in the package. It
+requires package identity and one instance per session, accepts no
+command-line argument, and lives as long as the window process. A suspended
+window that closes the app-service connection does not stop a tunnel; on resume
+the window starts the broker again, and the second copy only signals the first
+one to reconnect. When the window process ends, the broker stops the elevated
+tunnel, closes every parent-liveness pipe, and waits for the engines to exit.
+It never terminates an engine.
 
-UWP has critical tradeoffs for this product. The prototype stops at the user
-interface because those tradeoffs cannot be solved inside the UI process:
+The broker starts the user engine with `Win32EngineHost`: three anonymous
+pipes, one explicit inherited-handle list, no shell, and the bearer secret on
+the token pipe only. Before every request it reads the IPv4 and IPv6 listener
+tables and sends only when the launched engine alone holds the port; then it
+sends one fixed request to `127.0.0.1` with WinHTTP, no proxy, and no
+redirects (`LauncherHttp.cs` and `ListenerTable.cs`, shared with the console
+launcher). It removes the log copy from status answers and trims the logs so
+each reply fits the app-service message budget.
 
-| Area | UWP limit | Consequence for this product |
-|---|---|---|
-| Process | The app runs in an AppContainer at low integrity. | It cannot create a Wintun adapter, change routes, or install a Windows service. |
-| Privilege | A UWP process cannot elevate. | The privileged engine must live in a separate full-trust process or service. It is not implemented. |
-| Loopback | An AppContainer blocks loopback by default. | The app cannot use the macOS loopback service API. A future bridge needs an app service or another supported boundary. `CheckNetIsolation` is a development workaround, not a shipping design. |
-| Lifecycle | UWP is suspended when minimized and may be terminated. | A tunnel cannot live in the UI process. The prototype runs only a short UI timer. |
-| Engine | The package has no engine and no service. | Every value is simulated. There is no hidden real mode. |
-| Notifications | Toast notifications need package identity and a manifest declaration. | Not implemented. The app does not request permission. |
-| Startup | Launch at login needs a startup task declaration. | Not implemented. The setting is disabled and explained. |
-| Windows | UWP has no global menu bar and no tray icon. | The app uses a WinUI 2 `MenuBar` in the window. There is no menu bar extra. |
-| Windows | UWP `ApplicationView.SetPreferredMinSize` caps the preferred minimum at 500 by 500. | The app sets 500 by 500. It cannot enforce the macOS minimum of 780 by 560. |
-| Settings | A second UWP view adds lifecycle and activation complexity. | Settings is a page in the main window. This also matches the native `NavigationView` pattern. |
-| Theme | `Application.RequestedTheme` cannot change at runtime. | The page changes `FrameworkElement.RequestedTheme`. Menu flyouts and dialogs can keep the system theme. Verify this on the target host. |
-| Packaging | No certificate is included and signing is disabled. | Local deployment from Visual Studio is the intended test path. A signed MSIX is not produced. |
+### Turn on, the only elevation
 
-### Why this is not the final Windows architecture
+Turn on is the only operation that asks Windows for administrator approval
+(`ElevationPolicy`). The broker:
 
-WinUI 2 can draw the UI, but it cannot hold the privileged engine. A production
-Windows app needs a separate design:
+1. Checks that the user engine is paired and has no tunnel, that the starter,
+   the engine, and `wintun.dll` are in the package, and that the package is
+   installed in a WindowsApps package store (`Program Files\WindowsApps` or
+   `X:\WindowsApps` on another volume).
+2. Creates the token pipe and the parent-liveness pipe (not inheritable) and a
+   one-instance named pipe with a random 128-bit name, `PIPE_REJECT_REMOTE_CLIENTS`,
+   and an access list that admits only elevated Administrators and SYSTEM and
+   limits the owner to READ_CONTROL (OWNER RIGHTS), so a same-user process
+   cannot rewrite it.
+3. Starts `Elevate\HotspotShade.WinUI2.Elevate.exe <token>` with
+   `ShellExecuteEx` and the `runas` verb, on its own STA thread. Windows
+   shows one UAC prompt, owned by the app window.
+4. Accepts the pipe client only when its process id is the one that
+   `ShellExecuteEx` returned.
+5. Asks the user engine for the pairing handoff (`POST /api/pairing/handoff`).
+   The user engine writes one frame into the handoff pipe. The broker never
+   reads it.
+6. Sends the three pipe handle values and the port.
 
-1. A full-trust broker or Windows service that owns Wintun, routes, DNS, and
-   cleanup.
-2. A protected boundary between the UI and the broker. A loopback socket is not
-   available to an AppContainer without an exemption.
-3. A packaging and signing decision, an installer, and a Windows host test with
-   a real source device.
+The starter is published with NativeAOT. It has no .NET host, so no
+`DOTNET_STARTUP_HOOKS`, profiler, or `DOTNET_ROOT` value that a medium
+process writes into the user environment can load code into the elevated
+process. It checks elevation with the token's `TokenElevation` value,
+refuses to run unelevated, opens the pipe with
+identification-level impersonation only, checks that the pipe server is the
+packaged broker by image path, duplicates the three handles into itself,
+checks that each one is a pipe, and starts the packaged engine with a fixed
+argument list, `--credentials-fd`, an explicit inherited-handle list, and a
+fixed environment block (`SystemRoot`, `windir`, `PATH`, `TEMP`, and a few
+system values from `GetWindowsDirectoryW`), never the user environment. It
+answers with the engine process id and exits. It never reads the secret or
+the pairing frame. The broker opens the engine process, checks its image path,
+waits for its listener, writes a new bearer secret, keeps the parent-liveness
+write end, and sends `POST /api/start` with `mode` `phone` and the Let ping
+work choice.
 
-A packaged full-trust helper started with `FullTrustProcessLauncher` and an app
-service connection is one documented direction. It is not implemented here.
-Do not invent it in the UI prototype. If the product requires the engine inside
-a WinUI 2 process, stop: that shape is not supported by the documented UWP
-model.
+This mirrors the macOS credential handoff: the user engine passes the pairing
+on a private inherited descriptor, the privileged side passes the descriptor
+and never reads it, and the root (here, elevated) engine imports it.
+
+### Turn off and quit
+
+Turn off sends `POST /api/stop` to the elevated engine. The stop is confirmed
+only when the engine then reports `running` false with a normal service state
+and no cleanup block. The broker then closes the parent-liveness pipe, waits
+for the engine to exit, and returns to the user engine, which kept the
+pairing. Any other outcome keeps the elevated engine as the status source and
+shows "HotspotShade could not confirm that the tunnel stopped", with Turn off
+available again and Turn on, Pair, and Forget disabled. An elevated engine
+that exits without a stop that the broker asked for is a final mark: the app
+says the routes are not verified and keeps Turn on disabled until HotspotShade
+restarts. Quit stops the tunnel the same way.
+
+### Security limits
+
+- The bearer secret never appears on a command line, in the environment, in an
+  app-service message, or in a log. The source device token never leaves the
+  engines.
+- The listener check is repeated before every request but is not atomic. The
+  engine listener uses `SO_EXCLUSIVEADDRUSE`.
+- A process that runs as the same user at medium integrity can already act as
+  that user. The design does not defend the broker against such a process.
+- Approval with another account is refused, because the starter must open the
+  signed-in broker to duplicate its handles.
+- The v1 source device token crosses the hotspot link in cleartext.
+- No part of this design has run on Windows. It needs the owner's PC test and
+  an independent review on a Windows host.
+
+## Engine dependency
+
+The app programs against the engine HTTP API that macOS and Linux use:
+`/api/status`, `/api/phone/pair`, `/api/phone/pair/cancel`,
+`/api/phone/forget`, `/api/phone/probe`, `/api/start`, `/api/stop`,
+`/api/diagnostics`, `/api/failures`, `/api/logs`, and
+`/api/pairing/handoff`. The Windows engine implements all of them with the
+macOS and Linux JSON (2026-11-06). None of it has run on a Windows host.
+
+Launch flags:
+
+- `gui --token-fd N --parent-fd N [--port N] [--port-file PATH] [--wintun PATH]`
+  starts the real engine. Both handles are inherited anonymous pipe read
+  ends.
+- `--handoff-fd N` gives the user engine the write end of the pairing handoff
+  pipe. `--credentials-fd N` gives the elevated engine the read end. One
+  engine accepts only one of the two. Each handle must be a pipe that is not
+  the token, parent, or a standard handle, and not the same pipe object as
+  the token or parent handle. The engine clears its inherit flag at launch.
+  The elevated engine reads the newest complete frame that is already queued
+  before it binds its listener. An empty or malformed pipe ends the launch
+  with "The pairing handoff is not valid."
+
+Pairing and handoff answers:
+
+| Request | Answer |
+|---|---|
+| `POST /api/phone/pair` with `{}` | Starts pairing with the discovered hotspot gateway; the client never names a host. Returns the pairing view. A second start returns HTTP 400 "A pairing is already running." |
+| `GET /api/phone/pair` | `state` (`idle`, `connecting`, `confirm`, `paired`, `failed`), `code` (the code to compare during `confirm`, else null), `host`, `port`, `error` (fixed text or null). |
+| `POST /api/phone/pair/cancel` with `{}` | Cancels a pairing in progress and returns the view. |
+| `POST /api/phone/forget` with `{}` | Clears the pairing, sends up to three best-effort FORGET requests, probes once, and returns `{"ok":true}`. HTTP 409 "Turn off the tunnel first." while a tunnel runs or a start is in progress. |
+| `POST /api/pairing/handoff` with `{}` | User engine only. Writes one frame to the `--handoff-fd` pipe and returns `{"ok":true}`. HTTP 409 with `tunnel_running`, `handoff_unavailable` (no pipe, or the write did not finish in 2 seconds), `handoff_busy` (an earlier write is still blocked), or `not_paired`. |
+
+Status fields: `paired`, `phone_host`, `phone_port`, `api` (1), `forget`
+(`state` is `none`, `pending`, `confirmed`, or `not_delivered`, plus
+`attempts`), `last_stop`, `last_stop_message`, and `phone` with `state`,
+`message`, `port_changed`, `connections`, `checked_at`, and
+`trusted_by_source`.
+
+`POST /api/start` with `{"mode":"phone","options":{}}` uses the last typed
+target that passed `POST /api/phone/check`, or else the paired credentials. A
+new pairing or a forget clears the typed target. Only `phone` mode exists on
+Windows.
+
+The token gate: before each use of the source device token, and about every 2
+seconds during a run, the engine checks that the source device is the default
+gateway of the physical Ethernet or Wi-Fi adapter that the tunnel pins to. A
+VPN, a split default route, a virtual adapter, or an unclear read fails the
+check. A start or check then fails with HTTP 400 "The source device must be
+the default gateway of a physical hotspot adapter. Turn off any VPN, connect
+to the source device hotspot, then try again." A failure during a run turns
+the tunnel off with `last_stop.reason` `hotspot_lost`. The check does not
+prove that the gateway is the person's source device, and the v1 token
+crosses the hotspot link in cleartext.
+
+The C# source-contract check in `windows/tests` now requires the gate
+(`require_token_destination_proof`, `observe_token_destination`, and the
+fixed `TOKEN_DESTINATION_REFUSED` refusal) instead of the old closed guard.
+
+### Automatic stop
+
+The engine turns the tunnel off on the first refused gateway check during a
+run, with `last_stop.reason` `hotspot_lost`, and after 90 seconds of sustained
+source device silence, with `last_stop.reason` `source_device_gone` (see
+Engine dependency and `rust/src/autostop.rs`). The elevated engine then
+reports `running` false with a normal state. The broker treats that as a
+confirmed stop: it closes the elevated engine, returns to the user engine, and
+keeps the elevated engine's `last_stop` and `last_stop_message` in the status
+answers, so the Connection card shows "Last stop: The hotspot turned off, so
+HotspotShade turned the tunnel off." or "Last stop: The source device stopped
+answering, so HotspotShade turned the tunnel off." and Turn on works again.
+This path has not run on Windows.
+
+## Not available on Windows
+
+These features are not built for Windows. The app does not offer them and does
+not simulate them. Settings, General, and the Help dialog name the four that
+a person may look for: notifications, launch at login, a notification area
+icon, and direct mode.
+
+| Feature | Why |
+|---|---|
+| Direct mode without the source device app | Gated closed in the engine. The macOS app offers the proxy only as well. |
+| Notifications | Not implemented. |
+| Launch at login | Not implemented. |
+| Notification area icon | UWP has no tray icon. |
+| Wi-Fi advice | The window does not read the Wi-Fi band or signal. |
+| Automatic pairing at launch | The person presses Pair. |
+| Turn on from a Visual Studio loose-file deployment | Its folder is user-writable, so an elevated engine must not load `wintun.dll` from it. |
 
 ## Layout
 
 ```text
 windows/
+  BUILD_AND_TEST_ON_PC.md        prerequisites, build, install, live test, cleanup
   HotspotShade.WinUI2.sln
-  NuGet.config
-  README.md
   PARITY.md
+  SERVICE_BOUNDARY.md            the separate service foundation, not used by the app
   src/
-    HotspotShade.WinUI2/              UWP app, WinUI 2.8.7
-      App.xaml, App.xaml.cs
-      MainPage.xaml, MainPage.xaml.cs
-      Package.appxmanifest
-      Assets/                        tile logos copied from assets/logo
-      Converters/ValueConverters.cs
-      Properties/Default.rd.xml
-      Properties/AssemblyInfo.cs
-      Services/ClipboardService.cs
-      Services/LocalSettingsStore.cs
-      ViewModels/DemoViewModel.cs
-      ViewModels/Rows.cs
-    HotspotShade.WinUI2.Core/         netstandard2.0 pure state
-      DemoEnums.cs
-      DemoModels.cs
-      DemoReports.cs
-      DemoScenarios.cs
-      DemoSession.cs
-      DemoText.cs
+    HotspotShade.WinUI2/         UWP window: App, MainPage, MainViewModel,
+                                 BrokerConnection, WindowHandle, Rows
+    HotspotShade.WinUI2.Core/    netstandard2.0 window core: App/ state,
+                                 presenter, JSON, and protocols; Engine/
+                                 launch rules, older broker and service
+                                 foundations, and the release-probe report
+    HotspotShade.WinUI2.Broker/  full-trust broker: app service, user engine,
+                                 Turn on starter, Turn off, and quit
+    HotspotShade.WinUI2.Elevate/ NativeAOT elevated starter; runs once and
+                                 exits after it starts the elevated engine
+    HotspotShade.WinUI2.ReleaseProbe/  read-only x64 probe of version and
+                                 probe output
+    HotspotShade.WinUI2.Service/ unapproved SCM service executable; not
+                                 installed and not wired to the app
+    HotspotShade.WinUI2.ServiceHost/  unapproved named-pipe service host
+                                 foundation; not wired to the app
+    HotspotShade.WinUI2.TestLauncher/  console diagnostic fallback that talks
+                                 to the real engine
   tests/
-    HotspotShade.WinUI2.Core.Tests/   net8.0 console test runner
+    HotspotShade.WinUI2.Core.Tests/  hermetic checks for the window core, the
+                                 broker rules, and the release probe
+    HotspotShade.WinUI2.ServiceHost.Tests/  hermetic checks for the service
+                                 host foundation
   tools/
-    check_csharp_balance.mjs
-    check_static_contract.sh
+    stage_payload.ps1            builds windows/out/payload for the package
+    check_static_contract.sh     checks the package contract, docs, and ASCII
+    check_csharp_balance.mjs     checks C# delimiters
 ```
 
-The app project is an old-style UWP project. It lists every XAML and C# file
-explicitly. The test runner checks that the list is complete.
+The UWP project packages `windows/out/payload` (`Broker\`, `Elevate\`,
+`Engine\hotspotshade.exe`, `Engine\wintun.dll`) and fails the build with a
+clear error when the broker, the starter, or the engine is missing. The
+repository does not bundle `wintun.dll`; `stage_payload.ps1 -Wintun PATH`
+checks its WireGuard signature and x64 machine type before it copies it.
+
+The older `Engine/EngineBrokerService.cs`, `EngineBoundary`, `EngineSession`,
+and `Engine/Service/` code is the earlier version 1 broker contract and the
+service foundation. The app does not use them. Their hermetic tests still run.
 
 ## Dependencies
 
 | Dependency | Version | Reason |
 |---|---|---|
-| `Microsoft.UI.Xaml` | 2.8.7 | WinUI 2 controls: `MenuBar`, `NavigationView`, `InfoBar`, `ProgressRing`. |
+| `Microsoft.UI.Xaml` | 2.8.7 | WinUI 2 controls: `MenuBar`, `NavigationView`, `ProgressBar`, `ProgressRing`. |
 | `Microsoft.NETCore.UniversalWindowsPlatform` | 6.2.15 | UWP runtime and build support. |
-| .NET SDK | 8.0.100 or later (8.0.x) | Builds the core library and the console test runner. |
-| Windows 11 SDK | 10.0.22621.0 | UWP target platform for the app project. |
-| Visual Studio 2022 | 17.10 or later | UWP workload, XAML compiler, deployment. |
+| Windows Desktop Extensions for the UWP | the target SDK | `FullTrustProcessLauncher`. |
+| .NET SDK | 8.0.100 or later (8.0.x) | Builds the Core library, the broker, the starter, and the test runner. |
+| Windows 11 SDK | 10.0.22621.0 | UWP target platform. |
+| Visual Studio 2022 | 17.10 or later | UWP workload, XAML compiler, packaging. |
 
-The package versions are exact pins. The app has no other NuGet package and no
-Tauri, WinUI 3, Windows App SDK, Rust, or Node dependency. Node is used only for
-an optional local delimiter check.
-
-A NuGet lock file is not committed because this host cannot restore the UWP
-graph. The package versions are exact pins. Generate and review a lock file on
-the Windows test host before a production change. Do not invent lock file
-contents.
-
-## Build prerequisites
-
-Test on a Windows 10 or Windows 11 x64 host.
-
-1. Install Visual Studio 2022 version 17.10 or later.
-2. In the Visual Studio Installer, select **WinUI application development**.
-   In the installation details, select **Universal Windows Platform tools** for
-   C#. On Visual Studio 17.10 to 17.12 the workload is called **Windows
-   application development**.
-3. Install Windows 11 SDK **10.0.22621.0**. The project targets that version by
-   default. To build with another installed SDK, pass for example
-   `/p:HotspotShadeSdkVersion=10.0.26100.0` to MSBuild. This property changes
-   only the app project's target SDK. It does not change the minimum Windows
-   version. Use a version installed on the host.
-4. Install the .NET SDK **8.0.100 or later**. It builds the core library and the
-   test runner.
-5. Turn on **Developer Mode** in Windows Settings, System, For developers. It is
-   needed for local UWP deployment.
-6. Allow NuGet access to `https://api.nuget.org/v3/index.json`. No other feed is
-   used.
-7. Do not install WinUI 3 or the Windows App SDK for this prototype. Do not
-   install a certificate. The project includes no signing material.
+The package versions are exact pins. The broker and the starter use the Windows
+SDK projection and kernel32, advapi32, shell32, winhttp, and iphlpapi through
+P/Invoke, loaded from System32 only. They add no NuGet package. No NuGet lock
+file is committed because this Mac cannot restore the UWP graph; generate and
+review one on the Windows build PC.
 
 ## Build and test
 
-Run these commands from the repository root on Windows.
+The exact steps are in [BUILD_AND_TEST_ON_PC.md](BUILD_AND_TEST_ON_PC.md). In
+short, on Windows:
 
 | Command | Expected result |
 |---|---|
-| `dotnet run --project windows/tests/HotspotShade.WinUI2.Core.Tests/HotspotShade.WinUI2.Core.Tests.csproj -c Release` | Prints `ALL WINUI2 PROTOTYPE CHECKS PASSED` and exits 0. |
-| `dotnet build windows/src/HotspotShade.WinUI2.Core/HotspotShade.WinUI2.Core.csproj -c Release` | Builds the pure state library. This also works on macOS and Linux with the .NET SDK. |
-| `msbuild windows/HotspotShade.WinUI2.sln /restore /p:Configuration=Debug /p:Platform=x64 /m` | Builds the app and the core library. Run it from a Developer Command Prompt for Visual Studio 2022. It does not deploy or run the app. |
-| `node windows/tools/check_csharp_balance.mjs windows` | Prints `C# delimiter check passed for 18 files`. Node is optional. |
-| `bash windows/tools/check_static_contract.sh` | Prints `STATIC CONTRACT CHECK PASSED`. It needs `bash` and `xmllint`. Use Git Bash or WSL on Windows. |
+| `dotnet run --project windows/tests/HotspotShade.WinUI2.Core.Tests/HotspotShade.WinUI2.Core.Tests.csproj -c Release` | Every check passes, then `ALL WINUI2 PROTOTYPE CHECKS PASSED` and exit 0. |
+| `powershell -ExecutionPolicy Bypass -File windows\tools\stage_payload.ps1 -Wintun PATH` | Builds the engine, publishes the broker and the starter, fills `windows\out\payload`. |
+| `msbuild windows\src\HotspotShade.WinUI2\HotspotShade.WinUI2.csproj /restore /p:Configuration=Release /p:Platform=x64 ...` | Builds and signs the sideload package with your local test certificate. |
+| `sh windows/tools/check_static_contract.sh` | `STATIC CONTRACT CHECK PASSED`. Needs `sh` and `xmllint`. |
+| `node windows/tools/check_csharp_balance.mjs windows` | `C# delimiter check passed`. |
 
-`dotnet build` and `dotnet test` cannot build the UWP app project. Use Visual
-Studio or MSBuild for the app.
+On 2026-11-06 the Core test runner makes 250 `Check` calls and the
+ServiceHost test runner makes 250. `check_static_contract.sh` reports 15 XML
+files, and the C# delimiter check reports 125 C# files. These are source
+counts. No Windows host has run the checks.
 
-For a test host with Microsoft.NET.Native.Framework 2.2 already installed, an
-isolated Release preview can use the explicit `HotspotShadeTestUwp6214`
-override. This selects UWP 6.2.14 only for that build. The default stays
-6.2.15. The command below also selects .NET Native. It does not sign or deploy
-the package.
-
-```powershell
-msbuild windows/src/HotspotShade.WinUI2/HotspotShade.WinUI2.csproj /restore /p:Configuration=Release /p:Platform=x64 /p:HotspotShadeSdkVersion=10.0.26100.0 /p:HotspotShadeTestUwp6214=true /p:UseDotNetNativeToolchain=true /p:AppxPackageSigningEnabled=false /p:GenerateAppxPackageOnBuild=false
-```
-
-On the Windows Server 2025 test host, this native configuration activated the
-simulated app. The managed Debug configuration failed during startup. Its
-underlying exception is not yet known. A loose unsigned package needs an
-appropriate development deployment policy. The EXE is an AppContainer entry
-point and is not a standalone desktop executable.
-
-### Deploy and run
-
-1. Open `windows/HotspotShade.WinUI2.sln` in Visual Studio 2022.
-2. Set `HotspotShade.WinUI2` as the startup project.
-3. Select `Debug` and `x64`.
-4. Press F5. Visual Studio builds and deploys a loose debug package.
-5. If Visual Studio asks to create a temporary developer certificate, use a
-   local-only certificate. Do not commit it. This project sets
-   `AppxPackageSigningEnabled` to false and contains no certificate.
-6. The window title is `HotspotShade (simulated)`. The top banner says that all
-   data is simulated.
-
-If deployment fails, read the Visual Studio Output window. Do not switch to
-WinUI 3 or add a certificate to the repository to work around a missing UWP
-workload.
+`dotnet build` cannot build the UWP project. Use MSBuild from a Developer
+Command Prompt or Developer PowerShell for VS 2022.
 
 ## What the UI does
 
-### Main window
+- Native title bar and window controls. A WinUI 2 `MenuBar` with HotspotShade
+  (Turn on, Turn off, Pair, Cancel pairing, Settings, Quit), View (sections,
+  Refresh status F5, Check source device now Ctrl+K, appearance), and Help.
+- A `NavigationView` with Dashboard and Activity and the built-in Settings item.
+  Ctrl+1, Ctrl+2, and Ctrl+3 select them.
+- Dashboard: status dot, title (a polite live region with the full status as
+  its accessible name), subtitle, checked time, one primary action, one
+  secondary action, the line "Windows asks for administrator approval when you
+  turn on the tunnel." before Turn on, the
+  Source device and Connection cards, and the Needs attention list with inline
+  actions.
+- Pairing replaces the cards: a waiting ring, then the six digits in two groups
+  (read digit by digit by Narrator), three steps, Copy code, and Cancel (Esc).
+- Activity: the engine log, newest first, with a Details toggle for the level
+  and the sequence number, Refresh, and loading, empty, and unavailable states.
+  It refreshes every 2 seconds while visible.
+- Settings `Pivot`: General (Let ping work, stored locally and sent on the next
+  Turn on; Appearance; the not-available list), Pairing (state, Pair, Cancel,
+  Forget or Turn off and forget with a confirmation), and Advanced (Recent
+  failures with Refresh and Copy report, App details with the engine role and
+  Copy diagnostics, and the read-only destination privacy card).
+- The status polls every second while the window is visible and every 5
+  seconds while it is hidden.
+- Light, dark, and high contrast come from theme dictionaries. The appearance
+  choice changes the page theme at once.
 
-- Native title bar and native window controls.
-- A WinUI 2 menu bar with View, Demo, and Help.
-- A `NavigationView` with Dashboard and Activity. The built-in Settings item is
-  at the bottom.
-- A persistent `InfoBar` above the page content:
-  "Demo mode. All data is simulated." and "No tunnel, routes, network listener,
-  or credentials. This prototype is not production ready."
-- Dashboard and Activity share a maximum content width of 720. Settings uses the
-  same width.
-- The settings page uses a `Pivot` with General, Pairing, and Advanced.
+## Manual test checklist
 
-### Demo behavior
+Use section 7 of BUILD_AND_TEST_ON_PC.md for the live test. Also check:
 
-All values are local and simulated. The only timed work is one
-`DispatcherTimer` of 900 ms in the page. It completes the visible loading state.
-It stops when the page unloads. No work continues in the background.
+1. No UAC prompt at launch, at pairing, at Forget, or in Settings.
+2. Exactly one UAC prompt at Turn on; Cancel on it shows "The administrator
+   prompt was cancelled, so the tunnel did not start." and Try again.
+3. Keyboard only: Tab reaches every control in order; Esc cancels pairing;
+   the menu accelerators work.
+4. Narrator reads the status title, the cards, the pairing code, and the
+   attention lines.
+5. Light, dark, and high contrast; 200 percent text scale; a narrow window.
+6. Minimize the window for a minute while On, then restore it: the tunnel stays
+   on and the status comes back.
 
-1. The app starts unpaired. The primary action is **Pair with source device**.
-2. Pair shows the pairing panel with a waiting spinner.
-3. After 900 ms, the code `482 193` appears.
-4. **Copy code** copies the simulated code. **Simulate approval** completes the
-   pairing. **Simulate a failed pairing** shows the pairing error state.
-5. Ready has **Turn on**. Turn on shows a loading state, then On.
-6. On shows the ping line, three active connections, the last check time, and
-   **Turn off**.
-7. Forget while the tunnel runs is blocked. The app offers **Turn off and
-   forget**.
-8. Activity has a loaded list, details, refresh loading, an empty state, and an
-   unavailable state.
-9. Recent failures need the simulated tunnel. Refresh loads three simulated
-   groups. The panel also has an empty state and a clear action.
-10. The Demo lab and the Demo menu switch among 14 states. Reset returns to
-    Unpaired.
+## Release probe (read-only x64 evidence)
 
-Every action changes only the local demo session. The app does not send a
-request, open a socket, or read a real status.
+`src/HotspotShade.WinUI2.ReleaseProbe` is a separate console tool for a Windows
+x64 test PC. It runs only two engine commands, `--version` and `probe`,
+validates the answer, and writes a redacted report. It starts no tunnel, creates
+no adapter or route, and uses no credential.
 
-### States that the prototype covers
+The shared parser, policy, and report writer are in
+`src/HotspotShade.WinUI2.Core/Engine/Release/`. The core test runner covers them.
+The console tool is not in the solution, the app package, or CI.
 
-| State | How to reach it |
-|---|---|
-| Unpaired | Start, Demo lab, or Reset |
-| Pairing starting | Select Pair |
-| Pairing code | Wait 900 ms |
-| Pairing failed | Select Simulate a failed pairing |
-| Not trusted | Demo lab |
-| Waiting for source device | Demo lab |
-| Ready | Approve the simulated pairing, or Demo lab |
-| On | Turn on, or Demo lab |
-| On, source device stopped | Demo lab |
-| On, not trusted | Demo lab |
-| On, stale status | Demo lab |
-| Status unavailable | Demo lab |
-| Error | Demo lab |
-| Activity empty | Demo lab |
-| Activity loading | Refresh on Activity |
-| Activity unavailable | Status unavailable scenario, then Activity |
-| After forget | Forget, or Demo lab |
-| Recent failures loading | Turn on, then Refresh in Advanced |
-| Recent failures empty | Turn on, Refresh, then Clear simulated failures |
-| Forget blocked | Turn on, then Forget |
+Run it from the repository root on the Windows test PC:
 
-The recent failure unavailable and read error states exist in the core enum but
-are not reachable from the UI. There is no engine that can return those errors.
-They are not faked.
+```text
+dotnet run --project windows/src/HotspotShade.WinUI2.ReleaseProbe/HotspotShade.WinUI2.ReleaseProbe.csproj -c Release -- --engine C:\path\to\hotspotshade.exe --out release-probe.json
+```
 
-## Menu and keyboard
+- `--engine PATH` is required when the engine is not next to the tool. It must
+  be an absolute path that ends in `hotspotshade.exe`. A relative path, a dot
+  segment, or another file name is refused before a process starts.
+- `--json` prints the report as JSON instead of text.
+- `--out PATH` also writes the JSON report to that path.
+- Exit codes: 0 pass, 2 warning, 1 failure, 3 usage, 4 harness error.
 
-| Command | Shortcut | Notes |
-|---|---|---|
-| Dashboard | Ctrl+1 | Shows the Dashboard |
-| Activity | Ctrl+2 | Shows Activity |
-| Settings | Ctrl+3 | Shows the Settings page |
-| Refresh status | F5 | Runs the simulated Check now flow |
-| Check source device now | Ctrl+K | Runs the simulated Check now flow |
-| Use system setting, Light appearance, Dark appearance | none | Changes the page theme at once |
-| Demo, Scenarios | none | Applies one simulated state |
-| Demo, Reset demo | none | Asks for confirmation, then resets |
-| Help, Demo limitations | none | Opens a `ContentDialog` with the limits |
-| Help, About HotspotShade | none | Opens a `ContentDialog` with the version |
+The tool targets `net8.0`. The test PC needs the .NET 8 runtime. A
+self-contained win-x64 publish needs the win-x64 runtime pack on the publishing
+host. The probe also needs a real `hotspotshade.exe`. CI publishes no Windows
+binary, so build one with the engine instructions in the root `README.md`.
 
-The menu is inside the window. UWP has no global menu bar and no tray icon. The
-shortcuts are page-level `KeyboardAccelerator` objects, so they work while the
-window is active.
+The tool checks:
 
-## Light, dark, and accessibility
+1. The host is Windows and 64-bit. A non-Windows host is a warning. A 32-bit
+   operating system is a failure. A process architecture other than x64 is a
+   warning.
+2. The engine file exists, has a non-zero length, and has a SHA-256. The report
+   holds the file name, length, and hash, not the full path.
+3. `--version` prints exactly one `hotspotshade <version>` line.
+4. `probe` prints the administrator value, one default interface with a
+   positive index, the UDP TTL, the audit count, and the fixed privilege line.
+5. The UDP TTL is exactly 65 and the audit count is 0.
 
-- The app follows the Windows theme by default. Settings, General, Appearance
-  can force Light or Dark for the page content. The native title bar follows
-  the Windows theme.
-- All custom colors are in `App.xaml` theme dictionaries for Default (dark),
-  Light, and HighContrast. Components use theme resources only.
-- Menu flyouts and `ContentDialog` windows can keep the system theme because
-  UWP cannot change `Application.RequestedTheme` at runtime. Verify this on the
-  target host.
-- The dashboard title is a level 1 heading. Card titles are level 2 headings.
-  The dashboard title and the Settings pairing state are polite live regions.
-- Status marks are decorative and hidden from assistive technology. The state
-  text always sits next to the mark.
-- Text uses native text styles and wrapping. It respects the Windows text size
-  setting. There are no fixed-height text blocks.
-- Interactive controls use the default WinUI focus visuals. There are no custom
-  focus outlines and no focus suppression.
-- The app uses no custom storyboards. A `ProgressRing` is the only motion. Check
-  reduced motion behavior on the host.
-- Narrator has not been tested. This is a required manual check.
+The TTL and audit checks are the first real evidence for the Windows
+normalization path. A pass does not prove an adapter, a route, a tunnel, DNS,
+IPv6 policy, source device pairing, or a live hotspot. Both Windows start modes
+still fail closed in the engine.
 
-## Manual test checklist for the Windows host
+The tool runs each command with no shell, removes inherited `HOTSPOTSHADE_*`
+variables, uses a fixed argument, and bounds the answer. It refuses any other
+command, so it cannot run `tun`, `gui`, a source device probe, or a token
+prompt. It kills only the read-only probe command when that command exceeds its
+time limit.
 
-Run this checklist before anyone calls the prototype reviewed. A build is not a
-visual or accessibility test.
+The tool runs the file you name with your own rights. It does not elevate and it
+passes no credential, so name a file you trust. A malformed or hostile engine
+file is outside this tool's model.
 
-### Launch and frame
+The report format is version 1. `schema` is
+`hotspotshade.windows.release-probe/1`. The JSON writer is deterministic and
+ASCII only, refuses no value silently, and never writes an engine error stream
+to the report. A missing hash or version is an empty string in JSON and `none`
+or `unknown` in text. A file that is missing, an answer that is malformed, a
+non-zero exit, a timeout, or an answer above 16384 characters is a failure.
 
-1. Deploy and start the app.
-2. Check the title bar text `HotspotShade (simulated)` and the native window
-   controls.
-3. Check the persistent demo banner on every page.
-4. Resize to 1000 by 720 and to 780 by 560. Check for clipping, horizontal
-   scroll bars, and overlapping buttons. UWP may allow a smaller window; check a
-   narrow size and record the result.
-5. Minimize, restore, and close. Confirm that no process and no background task
-   remain. The app has no tray icon.
+## Service boundary foundation
 
-### Dashboard and pairing
-
-1. Start at Unpaired. Check the title, subtitle, cards, and Pair action.
-2. Select Pair. Check the waiting spinner and the "Waiting for the code." text.
-3. Wait for `482 193`. Select Copy code and paste into Notepad.
-4. Select Cancel. Check the calm Unpaired state.
-5. Pair again. Select Simulate a failed pairing. Check the attention state and
-   Pair again.
-6. Pair again. Select Simulate approval. Check Ready and Turn on.
-7. Turn on. Check the loading state, then On. Check "Ping is on.", three active
-   connections, and the check time.
-8. Open Settings, General, and set Let ping work to Off. Turn off, then on.
-   Check "Ping is off.".
-9. Turn off. Check Ready and the last stop line.
-10. Turn on. Open Dashboard, select Forget. Check the blocked line and Turn off
-    and forget. Use it. Check the forgotten state.
-11. Use Settings, Pairing, to pair again. Use Forget while the tunnel is off.
-    Check the forgotten text.
-
-### Scenarios and failure states
-
-1. Open the Demo menu and apply each of the 14 scenarios. Check the title,
-   subtitle, action, cards, and attention list for each.
-2. Open Settings, Advanced, Demo lab. Apply the same scenarios from the picker.
-   Check the description text.
-3. Select Status unavailable. Check that the app does not claim On or Off, and
-   that both cards say the status is unavailable.
-4. Select Error. Check Try again. Use Check now from the menu. Check recovery.
-5. Select On, stale status. Check the stale line and Check now. Check recovery.
-6. Select On, source device stopped. Check the attention line.
-7. Select Activity empty. Open Activity. Check the empty state and Refresh.
-8. Select Status unavailable. Open Activity. Check the unavailable state.
-9. Apply Ready. Turn on. In Settings, Advanced, Recent failures, select Refresh.
-   Check the loading state and three rows. Select Copy report and paste it.
-   Check that the report says simulated and contains example addresses.
-10. Select Clear simulated failures. Check the empty state.
-
-### Settings and reports
-
-1. General: check Let ping work and the two ToggleSwitch states. Check the
-   notifications text and the disabled Launch at login control.
-2. Appearance: select System, Light, Dark. Check every page and every card after
-   each change. Then open a menu and a dialog and record whether the popup
-   follows the page theme.
-3. Pairing: check the state, Pair, Cancel while pairing, Forget, and Turn off
-   and forget.
-4. Advanced: check Wi-Fi empty text, app details, Copy diagnostics, and the
-   Demo lab.
-5. Paste the diagnostics report. Check that it says simulated, no engine, no
-   route, and no credential.
-6. Check **Prototype limits** text.
-
-### Menus and keyboard
-
-1. Use the View menu for Dashboard, Activity, Settings, Refresh status, Check
-   source device now, and the three appearance choices.
-2. Use Ctrl+1, Ctrl+2, Ctrl+3, F5, and Ctrl+K.
-3. Use the Demo menu for every scenario and Reset demo. Confirm the reset dialog.
-4. Use the Help menu for Demo limitations and About.
-5. Use the keyboard only: Tab through the sidebar, page actions, Settings
-   controls, and dialogs. Check that focus is always visible and that the
-   binding order is sensible.
-6. Use the arrow keys in the sidebar and in the Settings `Pivot`.
-7. Close a dialog with Escape. Check that focus returns to a sensible control.
-
-### Accessibility and display
-
-1. Start Narrator. Read the demo banner, the dashboard heading, the subtitle,
-   the cards, the attention lines, and the action buttons.
-2. Confirm that the dashboard title is announced when the state changes.
-3. Confirm that status marks are not announced as separate controls.
-4. Check the pairing code announcement. It should read the digits, not only
-   "code".
-5. Check the Activity list with Details on and off.
-6. Check the failures table header and rows.
-7. Set Windows text size to 200 percent. Check every page for clipping.
-8. Turn on a high contrast theme. Check text, borders, buttons, focus, and
-   status marks.
-9. Turn on reduced motion. Check the progress rings and page changes.
-10. Check the app in Light, Dark, and high contrast at 1000 by 720 and 780 by
-    560.
-
-### Isolation checks
-
-1. Open Resource Monitor or Process Monitor. Confirm that the app opens no TCP
-   or UDP endpoint and makes no external connection.
-2. Open `Package.appxmanifest`. Confirm that it has no `Capabilities` element.
-3. Confirm that no `wintun.dll`, certificate, token, or source device data is in
-   the package or the repository.
-4. Confirm that the copy actions contain only simulated data and documentation
-   addresses.
-
-## Security and isolation
-
-- The package declares no capabilities. It cannot use the internet, a private
-  network, location, a microphone, or a camera.
-- The app has no `System.Net`, `Windows.Networking`, socket, process, service,
-  or tunnel API. The test runner checks this.
-- The app has no engine, no loopback call, no IPC, and no credential.
-- The clipboard is used only after a person selects Copy code, Copy report, or
-  Copy diagnostics.
-- Local settings hold only the theme, the ping choice, and the Activity details
-  choice. They hold no source device data.
-- Reports use documentation addresses: `example.com`, `dns.example`,
-  `192.0.2.0/24`, and `2001:db8::/32`.
-- There is no fake service. The simulated state machine is local and is named
-  `DemoSession`. It has no transport and no hidden real mode.
-
-## Incomplete parity
-
-See `PARITY.md` for the area-by-area comparison with the macOS target app.
-The main gaps are:
-
-- No engine, tunnel, routes, DNS, IPv6 policy, or automatic stop.
-- No automatic pairing, status polling, or source device presence check.
-- No notifications, launch at login, tray icon, or separate Settings window.
-- No menu bar extra. The menu is inside the window.
-- No real recent failures or diagnostics. The reports are simulated.
-- No signed package, installer, updates, localization, or ARM64 build. CI
-  runs the demo state and source contract checks and builds the unsigned x64
-  UWP demo. It does not deploy the demo or verify its appearance.
-- Narrator, high contrast, text scaling, reduced motion, and theme behavior in
-  popups need the manual checks above.
-
-## Local verification in this change
-
-Performed on the macOS development host:
-
-- `xmllint --noout` on every XAML, project, manifest, config, and XML file:
-  pass.
-- `node windows/tools/check_csharp_balance.mjs windows`: pass for 18 C# files.
-- `bash windows/tools/check_static_contract.sh`: pass. It checks XML, package
-  capabilities, signing material, forbidden APIs, simulated labels, pinned
-  versions, assets, project includes, docs, and ASCII punctuation.
-- The .NET SDK and MSBuild were not used on the macOS host.
-
-Performed on the Windows test host:
-
-- The pure state-model tests passed in a scratch .NET 10 harness. The harness
-  omitted the source-contract checks.
-- The solution built in Debug x64 with Visual Studio Community 2026 and
-  `HotspotShadeSdkVersion=10.0.26100.0`. Signing and package generation were
-  disabled. The scratch copy used placeholder images. It did not verify the
-  final artwork.
-- No UWP deployment, Narrator session, or live tunnel test ran.
-
-The Windows host must run the test runner, the MSBuild build, the Visual Studio
-deployment, and the manual checklist. Report the exact results. Do not describe
-this prototype as production ready or as Windows tunnel support.
+The separate service boundary foundation, its ServiceHost transport, and the
+unapproved SCM service project are described in
+[SERVICE_BOUNDARY.md](SERVICE_BOUNDARY.md) and the project READMEs. They are
+not installed, not in the app package, and not used by the window or the
+broker.
 
 ## References
 

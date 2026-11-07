@@ -1,0 +1,29 @@
+    name: Rust (macOS) type check, test, build
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: github.ref_type != 'tag'
+        with:
+          workspaces: rust
+      - name: Type check (all targets)
+        working-directory: rust
+        run: cargo check --all-targets --locked
+      - name: Test
+        working-directory: rust
+        run: cargo test --locked
+      - name: Test the source snapshot helper
+        run: bash scripts/tests/source_snapshot_test.sh
+      - name: Test adversarial source snapshot cases
+        run: bash scripts/tests/source_snapshot_adversarial_test.sh
+      - name: Build release binary
+        working-directory: rust
+        run: cargo build --release --locked
+      - name: GUI smoke test (demo backend)
+        run: scripts/gui_smoke.sh rust/target/release/hotspotshade
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hotspotshade-macos-arm64
+          path: rust/target/release/hotspotshade
+          retention-days: 14

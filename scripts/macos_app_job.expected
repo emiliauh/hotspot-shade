@@ -1,0 +1,31 @@
+    name: macOS app tests and unsigned app
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: github.ref_type != 'tag'
+        with:
+          workspaces: rust
+      - name: Build demo engine
+        run: cargo build --release --locked --manifest-path rust/Cargo.toml
+      - name: Swift package tests
+        run: HS_TEST_DEMO_BINARY="$PWD/rust/target/release/hotspotshade" swift test --package-path macos/HotspotShadeKit
+      - name: Installer tests
+        run: swift test --package-path macos/Installer
+      - name: Local preview installer tests
+        run: swift test --package-path macos/Installer -Xswiftc -DHOTSPOTSHADE_LOCAL_PREVIEW
+      - name: Local system-preview candidate tests
+        run: swift test --package-path macos/Installer -Xswiftc -DHOTSPOTSHADE_LOCAL_PREVIEW -Xswiftc -DHOTSPOTSHADE_SYSTEM_PREVIEW_CANDIDATE
+      - name: Local preview preparation tests
+        run: |
+          bash scripts/tests/build_mac_local_preview_test.sh
+          bash scripts/tests/mac_local_preview_delivery_test.sh
+          bash scripts/tests/mac_coordinator_cli_test.sh
+      - name: Build unsigned app
+        run: scripts/build_mac_app.sh build/HotspotShade-unsigned.zip
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: HotspotShade-macos-unsigned
+          path: build/HotspotShade-unsigned.zip
+          retention-days: 14

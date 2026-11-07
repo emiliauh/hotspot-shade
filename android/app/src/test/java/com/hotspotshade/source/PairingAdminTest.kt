@@ -14,6 +14,14 @@ class PairingAdminTest {
     private val secondKey = ByteArray(32) { 0x22 }
 
     @Test
+    fun confirmationTextDescribesOnlyLocalConfirmation() {
+        assertEquals("Confirmed in this app session", targetConfirmationMessage(TargetConfirmation.CONFIRMED))
+        assertEquals("Confirmation required when pairing", targetConfirmationMessage(TargetConfirmation.REQUIRED))
+        assertEquals("Confirmation status unknown", targetConfirmationMessage(TargetConfirmation.UNKNOWN))
+        assertEquals(TargetConfirmation.UNKNOWN, TrustedTarget("id", "label").confirmation)
+    }
+
+    @Test
     fun targetsShowShortLabelsThatHideTheKey() {
         val trust = MemoryPairingTrustStore()
         trust.add(firstKey)
@@ -120,6 +128,30 @@ class PairingAdminTest {
         assertEquals(64, first.length)
         assertTrue(first.all { it in "0123456789abcdef" })
         assertNotEquals(first, second)
+    }
+
+    @Test
+    fun trustActionsReportAFailedStore() {
+        val failing = object : PairingTrustAdmin {
+            override fun targets(): List<TrustedTarget> =
+                throw IllegalStateException("The trust list cannot be read.")
+
+            override fun forget(id: String): Boolean =
+                throw IllegalStateException("The trust list cannot be read.")
+
+            override fun forgetAll() {
+                throw IllegalStateException("The trust list cannot be written.")
+            }
+        }
+        val admin = PairingAdmin(
+            trust = failing,
+            tokenStore = TokenWriter { },
+            tokenFactory = { "new-token-value" },
+            isProxyActive = { false },
+        )
+
+        assertFalse(admin.forget("target"))
+        assertFalse(admin.forgetAll())
     }
 
     private fun base64(key: ByteArray): String = Base64.getEncoder().encodeToString(key)

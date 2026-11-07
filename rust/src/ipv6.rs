@@ -33,6 +33,7 @@ pub fn verify_ipv6_route(expected_interface: Option<&str>, timeout: Duration) ->
     }
     let mut command = Command::new("/sbin/route");
     command.args(["-n", "get", "-inet6", "2606:4700:4700::1111"]);
+    command.env_remove(crate::secret_env::PHONE_TOKEN_ENV);
     let output = bounded_output(&mut command, timeout.min(Duration::from_secs(2)))?;
     if !output.status.success()
         || !route_matches(&String::from_utf8_lossy(&output.stdout), expected_interface)
@@ -111,7 +112,10 @@ fn route_matches(output: &str, expected_interface: Option<&str>) -> bool {
 struct SystemRunner;
 impl CommandRunner for SystemRunner {
     fn run(&self, program: &str, args: &[String]) -> io::Result<()> {
-        let result = Command::new(program).args(args).output()?;
+        let result = Command::new(program)
+            .args(args)
+            .env_remove(crate::secret_env::PHONE_TOKEN_ENV)
+            .output()?;
         if result.status.success() {
             Ok(())
         } else {
@@ -347,5 +351,25 @@ mod tests {
         let error = bounded_output(&mut command, Duration::from_millis(60)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod phone_token_env_tests {
+    use super::*;
+
+    #[test]
+    fn system_runner_child_does_not_inherit_the_phone_token() {
+        // The shell exits non-zero when the variable is set, so a successful
+        // run proves the child did not inherit it.
+        std::env::set_var(crate::secret_env::PHONE_TOKEN_ENV, "public-test-token");
+        let result = SystemRunner.run(
+            "/bin/sh",
+            &[
+                "-c".to_string(),
+                "test -z \"${HOTSPOTSHADE_PHONE_TOKEN+x}\"".to_string(),
+            ],
+        );
+        assert!(result.is_ok(), "child inherited the token: {result:?}");
     }
 }

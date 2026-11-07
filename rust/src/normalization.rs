@@ -1,4 +1,5 @@
 //! Create every outer socket with a TTL audit and interface binding.
+pub use crate::normalized_udp::NormalizedUdpSocket;
 use std::ffi::CString;
 use std::io;
 use std::mem;
@@ -8,6 +9,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub const OUTER_TTL: i32 = 65;
+
+fn reject_mapped(ip: IpAddr) -> io::Result<()> {
+    if matches!(ip, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "IPv4-mapped IPv6 addresses must be passed as IPv4",
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Default)]
 pub struct Audit {
@@ -59,11 +70,24 @@ fn set_int(fd: RawFd, level: i32, option: i32, value: i32) -> io::Result<()> {
 
 fn new_socket(v6: bool, kind: i32, iface: Option<u32>, audit: &Audit) -> io::Result<OwnedFd> {
     let family = if v6 { libc::AF_INET6 } else { libc::AF_INET };
-    let raw = unsafe { libc::socket(family, kind, 0) };
+    #[cfg(target_os = "linux")]
+    let socket_kind = kind | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let socket_kind = kind;
+    let raw = unsafe { libc::socket(family, socket_kind, 0) };
     if raw < 0 {
         return Err(io::Error::last_os_error());
     }
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // Darwin has no atomic SOCK_CLOEXEC. Set the flag before publishing the
+    // descriptor; a concurrent process spawn can still race this operation.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+        if flags < 0 || unsafe { libc::fcntl(raw, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
     let (level, opt) = if v6 {
         (libc::IPPROTO_IPV6, libc::IPV6_UNICAST_HOPS)
     } else {
@@ -181,7 +205,9 @@ fn connect_raw(raw: RawFd, addr: SocketAddr) -> io::Result<bool> {
 
 /// Start a nonblocking connection to a numeric address. Check SO_ERROR after
 /// the socket becomes writable. An in-progress connection is not an error.
+/// IPv4-mapped IPv6 addresses are rejected; pass the IPv4 address instead.
 pub fn tcp_start(addr: SocketAddr, iface: Option<u32>, audit: &Audit) -> io::Result<TcpStream> {
+    crate::normalized_udp::validate_destination(addr)?;
     let fd = new_socket(addr.is_ipv6(), libc::SOCK_STREAM, iface, audit)?;
     let raw = fd.as_raw_fd();
     let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
@@ -193,6 +219,7 @@ pub fn tcp_start(addr: SocketAddr, iface: Option<u32>, audit: &Audit) -> io::Res
 }
 
 /// Connect to a numeric address. Hostname resolution is never used.
+/// IPv4-mapped IPv6 addresses are rejected; pass the IPv4 address instead.
 pub fn tcp_connect(
     addr: SocketAddr,
     iface: Option<u32>,
@@ -223,6 +250,7 @@ pub fn tcp_connect_cancellable(
             "connection cancelled",
         ));
     }
+    crate::normalized_udp::validate_destination(addr)?;
     let started = Instant::now();
     let fd = new_socket(addr.is_ipv6(), libc::SOCK_STREAM, iface, audit)?;
     let raw = fd.as_raw_fd();
@@ -279,9 +307,15 @@ pub fn tcp_connect_cancellable(
 }
 
 /// Create an unconnected normalized datagram socket for a numeric address family.
-pub fn udp_socket(ip: IpAddr, iface: Option<u32>, audit: &Audit) -> io::Result<UdpSocket> {
+/// IPv4-mapped IPv6 addresses are rejected; pass the IPv4 address instead.
+pub fn udp_socket(
+    ip: IpAddr,
+    iface: Option<u32>,
+    audit: &Audit,
+) -> io::Result<NormalizedUdpSocket> {
+    reject_mapped(ip)?;
     let fd = new_socket(ip.is_ipv6(), libc::SOCK_DGRAM, iface, audit)?;
-    Ok(UdpSocket::from(fd))
+    Ok(NormalizedUdpSocket::new(UdpSocket::from(fd), ip.is_ipv6()))
 }
 
 /// Bounded TCP keepalive values for a normalized outer socket.
@@ -488,6 +522,13 @@ mod tests {
         assert_eq!(audit.snapshot(), (1, 0));
     }
     #[test]
+    fn udp_socket_is_close_on_exec() {
+        let socket = udp_socket("127.0.0.1".parse().unwrap(), None, &Audit::default()).unwrap();
+        let flags = unsafe { libc::fcntl(socket.raw_handle(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    }
+    #[test]
     fn invalid_interface_fails_closed() {
         let audit = Audit::default();
         assert!(udp_socket("127.0.0.1".parse().unwrap(), Some(u32::MAX), &audit).is_err());
@@ -535,7 +576,7 @@ mod tests {
         .unwrap();
         let (_accepted, _) = server.accept().unwrap();
         let udp = udp_socket("::1".parse().unwrap(), None, &audit).unwrap();
-        for fd in [client.as_raw_fd(), udp.as_raw_fd()] {
+        for fd in [client.as_raw_fd(), udp.raw_handle()] {
             let mut hops: i32 = 0;
             let mut size = mem::size_of::<i32>() as libc::socklen_t;
             let rc = unsafe {

@@ -17,30 +17,111 @@ The product name is HotspotShade. Some internal identifiers keep the old name: t
 3. In Xcode settings, add your Apple ID under Accounts. A free Apple ID can use a Personal Team.
 4. Select the HotspotProxy target. Open Signing & Capabilities. Select your team and enable automatic signing. Change the bundle identifier to a unique value if signing requires it.
 5. Connect the source device to the build machine with a cable. Unlock it and trust the build machine when prompted. Enable Developer Mode on the source device if Xcode requests it. Follow the device prompts and restart if required.
-6. Select the source device as the run destination. Click Run. Trust the developer certificate on the source device if iOS requests it.
+6. Select the source device as the run destination. Choose the Release build configuration (Product > Scheme > Edit Scheme, then Run > Info > Build Configuration), then click Run. A Debug build is for the Simulator or the host harness. Trust the developer certificate on the source device if iOS requests it.
 7. Enable cellular data and Personal Hotspot on the source device. Connect the target device to the hotspot. Open HotspotShade on the source device.
-8. Tap Start. Allow Local Network access if iOS asks. Allow Location if iOS asks, so the app can stay awake.
-9. On the target device, pair HotspotShade with this app. See "Pair with a target device" below. For other SOCKS5 clients, open Settings, then Advanced. Configure an authenticated SOCKS5 proxy with the hotspot IPv4 address of this source device and the proxy port. Use `hotspotshade` as the username. Tap Show token to see the password. The token hides again after 30 seconds. Enable remote DNS or use a `socks5h` proxy URL.
-10. Keep the app open in the foreground and keep the screen on, or use the background keep-awake mode below. Tap Stop when finished.
+8. Tap Start. Allow Local Network access if iOS asks. Allow Location when iOS asks, so the app can stay awake.
+9. On the target device, pair HotspotShade with this app. See "Pair with a target device" below. For other SOCKS5 clients, open Settings, then Manual connection. It shows the SOCKS5 username, the hotspot address, and the proxy port. Tap Copy connection details to copy those three values; the copy holds no token. Set the password to the source token: open Advanced, tap Show token, and read it. The token hides again after 30 seconds. Enable remote DNS or use a `socks5h` proxy URL. The app does not need a paired target device for this path.
+
+10. Keep the app open in the foreground and keep the screen on, or turn on "Help keep running in the background" below. Tap Stop when finished.
 
 A free Personal Team has provisioning and device limits. Its development provisioning profile expires after seven days, so you may need to build and install the app again. Apple can change these limits.
 
-The app looks for `172.20.10.1` on `bridge100` and binds the listener to that IPv4 address. It does not listen on other addresses. Enable Personal Hotspot and connect the target device before starting the proxy. If iOS does not expose that interface and address to the app, startup fails. The interface name and address can differ across iOS versions or hotspot configurations. This app does not support those configurations. A port conflict also appears in the Dashboard. Choose another port if it is in use.
+The app looks for exactly one active, non-loopback bridge with IPv4 address `172.20.10.1` and netmask `255.255.255.240`, and binds the listener to that address. The bridge name need not be `bridge100`. Discovery keeps the interface name with the address, because a replacement bridge can reuse the same address. A running proxy or pairing listener stops when a complete check names a different interface at the same address. Enable Personal Hotspot and connect the target device before starting the proxy. If the observation is missing, unsupported, unreadable, or ambiguous, startup fails. Apple does not provide a public API that identifies this link as Personal Hotspot, so the bridge and address are compatibility evidence, not proof. This check passed on one physical iPhone on 2026-11-06 (see "Physical device release check"); its behavior across iOS versions and devices remains under review. Configurations using a different address or prefix are not supported. A port conflict also appears in the Dashboard. Choose another port if it is in use.
+
+The listener reports Listening only after it reports `.ready`. While it reports `.waiting`, the app shows Starting and does not claim that it listens. One waiting episode has a 10 second bound. If it is still waiting when the bound is checked, the run ends with a plain message, and the app does not start a replacement listener. A ready state observed at that check wins, even if the bound passed while the app was suspended. When the app becomes active, it reads the listener state once: a ready, failed, or cancelled event that arrived with no callback is applied, and an active wait keeps its remaining bound. An intentional stop is not changed. See `ios/tests/ProxyListenerLifecycleTests.swift` for the fake-listener checks.
 
 ## Simulator test override
+
+For a simulator UI smoke test that uses Keychain, build with simulator code
+signing enabled. For example, use `xcodebuild` with
+`-scheme HotspotProxy -configuration Debug -sdk iphonesimulator` and
+`CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=-`. This produces an ad hoc signed
+simulator app and needs no developer certificate. The CI simulator compile uses
+`CODE_SIGNING_ALLOWED=NO`; that compile checks the build but is not a Keychain
+runtime test. On iOS 27.2 Simulator, a linker-signed build with signing disabled
+returned Keychain error `-34018` before token loading. Do not clear Keychain or
+replace a token to resolve a signing error. Preserve an existing installation
+and use a separate bundle identifier for an isolated smoke test.
+
+On 2026-11-06 an ad hoc signed Debug build with a separate bundle identifier
+opened on the iPhone 18 Pro iOS 27.2 Simulator. The Dashboard showed Off and
+Settings showed no paired target devices. The isolated test app was then
+uninstalled. This was a UI startup smoke check; it did not verify Keychain
+durability, proxy traffic, pairing, a hotspot, or a physical device.
 
 A Debug build can use a different hotspot interface and address. The app can then run in the iOS Simulator against a mimicked hotspot subnet.
 
 Set two UserDefaults keys:
 
 - `debug.hotspotInterface`: the interface name. It must match `[a-z]{1,8}[0-9]{0,3}`.
-- `debug.hotspotAddress`: an IPv4 address in 10.0.0.0/8, 172.16.0.0/12, or 192.168.0.0/16. The address 172.20.10.1 is valid only with `bridge100`.
+- `debug.hotspotAddress`: an IPv4 address in 10.0.0.0/8, 172.16.0.0/12, or 192.168.0.0/16. The address 172.20.10.1 is valid only with a `bridgeN` interface name.
 
-Both keys must hold a valid value. If one key is missing or invalid, the app uses `bridge100` and `172.20.10.1`. A Release build ignores both keys.
+The loopback pair `lo0` with `127.0.0.1` is also valid. It lets a test on the same Mac reach the listener without a mimicked hotspot interface. It never reaches another device.
 
-In Xcode, add launch arguments to the scheme: `-debug.hotspotInterface en0 -debug.hotspotAddress 10.1.2.3`. Do not use this override on a physical device.
+Both keys must hold a valid value. If one key is missing or invalid, the app uses the normal bridge discovery. A Release build ignores both keys.
 
-The Xcode Debug configuration must define the `DEBUG` compilation condition. The current project does not define it.
+A Debug Simulator build can also replace the cellular pin with the host network path. Set `debug.mockCellularPath` to `YES` and set the hotspot override. The mocked path needs both keys, and it exists only in a Debug build for the Simulator. The key alone does nothing. A Release build, a device build, and a normal Debug run keep the cellular pin.
+
+In Xcode, add launch arguments to the scheme:
+
+```
+-debug.hotspotInterface lo0 -debug.hotspotAddress 127.0.0.1 -debug.mockCellularPath YES
+```
+
+Or use `en0` and a private address from the list above for a mimicked hotspot. Do not set `debug.hotspotInterface` or `debug.hotspotAddress` on a device. Use a Release build on a phone; these overrides are for a Simulator or the host harness.
+
+The Xcode Debug configuration defines the `DEBUG` compilation condition. A Release build holds no code from the override section.
+
+`scripts/ios_source_proxy_flow_test.sh` compiles the same proxy sources on the build Mac and runs the real Rust target client through loopback TCP, a `localhost` domain target, and two UDP datagrams, plus a wrong-token check and a refused destination. It also checks that the pairing listener admits the real check while four silent sockets are held and closes a silent socket after 10 seconds. The script needs port 18090 free, sets no route, and creates no interface. It does not prove the Simulator network stack, carrier behavior, or a physical hotspot.
+
+On 2026-11-06 the expanded test also passed against the isolated Debug app on
+the iPhone 18 Pro Simulator with the loopback overrides: TCP, domain TCP, and
+UDP completed and the client reported `audit=(7, 0)`. The proxy was stopped,
+the test app was uninstalled, and port 18090 was free afterward. This does not
+verify a physical hotspot or cellular path.
+
+On 2026-11-06 a separately identified, ad hoc signed Debug app ran on the
+iPhone 18 Pro iOS 27.2 Simulator with the loopback and mock-cellular overrides.
+The real Rust client paired with the app after the simulator prompt was
+approved, sent traffic through its proxy to a loopback echo server, and
+checked wrong-token and refused-destination behavior. The client reported
+`IOS_SIM_PROXY_OK audit=(5, 0)`. A separate silent pairing socket closed after
+about 10.7 seconds. The app's proxy was stopped and the isolated app was
+uninstalled afterward. The simulator executable SHA-256 was
+`beecaf0c35e335a4a9a6c55fcdd9ca7b9a13fc24067ae8f10c6f65a9f4c7ecfd`;
+the non-ignored iOS file manifest before and after the run was
+`b07c743ad58e3ce14384a044afd2a8561d4145f906e0e4c8769827752187e46c`.
+The first attempt exposed a test assumption: an evicted silent socket can
+close with a reset instead of EOF. The test now accepts either closure. This
+was a dirty working-tree build, not complete build provenance. The override
+does not verify physical hotspot discovery, cellular binding, or carrier
+behavior.
+
+After the manual-connection screen was added, a fresh ad hoc Debug build was
+tested on the same simulator with the loopback overrides. The real Rust client
+paired after the matching code was approved and passed the proxy traffic,
+wrong-token, refused-destination, and silent-listener checks: two tests passed
+with `IOS_SIM_PROXY_OK audit=(5, 0)`. The simulator proxy was stopped, the
+separately identified test app was removed, and port 18090 was free afterward.
+The simulator executable SHA-256 was
+`963aca2f946da4b7912642dd0a8cef6bb53af2f1ecea609b4e757e29e24c51eb`.
+This was a working-tree build and does not verify a physical hotspot or carrier.
+
+## Physical device release check
+
+On 2026-11-06 the signed 0.1.0 (1) release candidate ran on a physical iPhone.
+Its proxy started, and the hotspot check accepted the real Personal Hotspot
+bridge at `172.20.10.1/28`. No tunnel test has run with this build yet, so this
+result covers app launch and hotspot discovery only. It does not prove relay
+traffic, cellular binding, carrier behavior, or throughput.
+
+## Manual connection
+
+Settings has a "Manual connection" section for a SOCKS5 client that does not use pairing. It shows the SOCKS5 username `hotspotshade`, the hotspot address, and the proxy port. "Copy connection details" copies those three values. The copied text holds no token.
+
+The password is the source token. It is in Settings, Advanced, behind Show token. The token hides again after 30 seconds. Use remote DNS, for example a `socks5h` proxy URL, so names resolve on the source device. A client that resolves a name itself sends that lookup outside the proxy.
+
+The port is the saved proxy port. Start the proxy before another device connects. The section says when the address is missing, when the port is not valid, and when the proxy is stopped. It never claims that a connection works while the proxy is off.
 
 ## Pair with a target device
 
@@ -53,11 +134,15 @@ HotspotShade on a target device can get the proxy port and token from this app. 
    the hotspot. The app limits unknown pairing challenges while it runs.
 4. Check that the target device shows the same code. Tap Allow. Tap Deny if the codes differ or if you did not start the pairing.
 
-The pairing listener uses TCP port 18090 and binds to the hotspot address only. It runs while the app is open and the hotspot interface is present. It runs when the proxy is stopped. The app checks the hotspot every 5 seconds while the proxy is stopped and every 2 seconds while the proxy runs. It does not poll the hotspot while the app is in the background. The listener stops after observed absence for 75 seconds while the proxy is stopped or 30 seconds while it runs. An unreadable check, a long gap between checks, or a change in scene activity resets the observation period. A starting or waiting listener gets 5 seconds to become ready while the app is active. A temporary wait does not immediately cancel the listener or its pairing sessions. If the wait continues, the app closes the listener and retries after at least 10 seconds. A bind failure appears in Recent activity.
+The pairing listener uses TCP port 18090 and binds to the hotspot address only. It runs while the app is open and the hotspot interface is present. It runs when the proxy is stopped. The app checks the hotspot every 5 seconds while the proxy is stopped and every 2 seconds while the proxy runs. It does not poll the hotspot while the app is in the background. The listener stops after observed absence for 75 seconds while the proxy is stopped or 30 seconds while it runs. An unreadable check, a long gap between checks, or a change in scene activity resets the observation period. A complete check that names a different interface at the same address is a link change, so the listener stops at once, closes its open pairing sockets, and does not treat the old link as still present. A hotspot address on a link type this build does not support also stops it. The next complete check may bind a new listener. The interface name is one local record. It does not prove that Personal Hotspot is on, and two links that reuse the same name and address cannot be told apart. A starting or waiting pairing listener gets 5 seconds to become ready while the app is active. A temporary wait does not immediately cancel the listener or its pairing sessions. If the wait continues, the app closes the listener and retries after at least 10 seconds. A bind failure appears in Recent activity, and the Dashboard pairing line and Settings row show that pairing is not available.
+
+Network.framework binds a listener to an address, not an interface name. It has no public initializer that turns an interface name into `NWInterface`, so the app cannot set `requiredInterface` from the discovered name. It checks the interface identity separately and stops the listener when the identity changes.
+
+The listener accepts at most 4 pairing sockets. A socket that sends no complete frame within 10 seconds is closed. When a new target device connects and every socket is in use, the app closes the oldest socket that has not sent a complete frame. It never closes the socket that owns the prompt the person is looking at. A socket that sent a complete frame is a pairing session, so the pairing state machine owns its deadline. That keeps the 120 second background prompt extension from being cut short by a separate socket timer. A final reply send has its own 5 second bound, so a stuck send cannot hold a slot after the state machine removed the session.
 
 iOS can stop the pairing listener while the app is suspended and send no error. When the app returns to the foreground and the hotspot is present, the app replaces a listener that is not ready. The app shows the prompt only while it is in the foreground. A pending decision gets 120 seconds when the app goes to the background. The pairing request expires if you do not answer in time. After 3 denied or failed pairings within 60 seconds, the app refuses pairings for 30 seconds.
 
-Settings shows the number of paired target devices. A paired target device gets the port and token without a prompt. The app stores only the public keys of paired target devices, in UserDefaults. Tap "Forget paired target devices" to remove them. The confirmation title is "Forget all target devices?" with the message "Each target device keeps its copy until it contacts this source device again." The destructive button is "Forget All". "Rotate token" does not change the paired target devices. A paired target device pairs again and gets the new token. The note under Rotate token says "Target devices that are already paired keep the old token. Pair them again after you rotate the token."
+Settings shows the number of paired target devices. A paired target device gets the port and token without a prompt. The app stores only their public keys in UserDefaults. "Forget paired target devices" removes the trust list, but does not revoke a saved token. A power loss before the trust change is durable can restore a forgotten entry. Token rotation is disabled pending review, so this build has no reviewed revocation path. A forgotten target device must pair again; a target device that is still trusted can pair again without a prompt.
 
 The pairing sends the token encrypted. The SOCKS5 control channel still sends the token in clear on the hotspot link. See "Pairing" in `PHONE_PROXY.md` for the protocol and the threat model.
 
@@ -73,6 +158,8 @@ The Dashboard and Settings read one state. The state has four values:
 | In use | "A target device is using the proxy now." | An authenticated session had traffic in the last 60 seconds. |
 
 The usage card title is "Target device connected" only in the in-use state. It is "Waiting for your target device." in the other states. Settings shows the pairing state while a pairing prompt is active. When no pairing is active and the trust list is empty, it says "No target devices are paired." The app has no separate ready state. A code without a ready listener is stale, so it does not claim that a pairing runs.
+
+When the pairing listener cannot bind or become ready, the Dashboard pairing line and the Settings row say "Pairing is not available. Another app may be using the pairing port. Close it and reopen HotspotShade." A timeout, a denial, or a 30 second lockout leaves one plain line for 60 seconds or until the next pairing event. The line names no code, address, or device.
 
 ## Recent activity and the connection counters
 
@@ -190,6 +277,7 @@ Settings, Advanced has "Copy diagnostics". It copies a plain-text report to the 
 - Low Power Mode
 - Thermal state
 - The keep-awake state
+- One line for each destination-privacy capability and a capability flags line
 
 The established relay line says "no observation" before a relay carries payload. Otherwise it counts TCP and UDP relay starts. A start is one destination connection that answered and then carried payload in either direction. A destination that only became ready is not an established relay. The end line counts clean ends, client socket errors, destination socket errors, idle ends, other ends, and UDP ends. A client error is on the connection to the target device. A destination error is on the cellular connection to the destination. An error is not proof of packet loss on the cellular path. A proxy stop or a listener failure records an established relay that was still open as other. The report keeps the side and the reason for a TCP end. It counts a UDP end only as a total, so the line says that the side and the reason are not kept.
 
@@ -197,23 +285,46 @@ The bucket line keeps the last 300 seconds in 10 second buckets. It lists the ne
 
 The report holds counts, states, and versions. It holds no address, host, port, token, pairing code, or website. The Settings note says this to the person.
 
+## Destination privacy
+
+Settings has a "Destination privacy" section. It is a report, not a control. No row turns a mechanism on, and the app sends no privacy setting to a target device:
+
+| Row | State | What it says |
+|---|---|---|
+| Byte relay | On | The app opens the destination connection and copies bytes in both directions. It forwards TLS bytes unchanged. |
+| Destination names | May be visible | The relay adds no concealment. The carrier can see the destination address and the traffic shape, and it may see the destination name of a TLS connection. An application that uses Encrypted Client Hello keeps its own name hidden. |
+| Encrypted Client Hello (ECH) | Not available | The relay opens no TLS session of its own, so it cannot add ECH to a flow. An application that supports ECH can still use it on its own. |
+| Server name override | Not available | The relay never parses or rewrites TLS, so the app cannot change the server name. |
+| Handshake shaping | Not available in this build | The relay does not re-frame the TLS handshake in this build, and there is no control for it. |
+| Relay lifetime | Not guaranteed | iOS can suspend the app in the background. The keep-awake option below uses location updates, and the app has no Network Extension, so a sustained relay in the background is not guaranteed. |
+| TLS termination | Not used | The app does not end TLS, present a certificate, or read the destination name. No certificate is installed on your target device. |
+
+The same rows appear in the diagnostics report, followed by one line that lists every capability flag as yes or no. This build reports every flag as no. The text holds no name, address, port, token, or key.
+
+The section does not claim that every destination name is visible. An application can conceal its own name. The relay adds no concealment either way, and the destination address and the traffic shape may stay visible.
+
 ## Background operation
 
-"Keep running in the background" is on by default. The app asks for the Location permission the first time you tap Start while keep-awake is on. The app requests location updates while the proxy runs. It asks for accuracy to the nearest ten meters and uses no distance filter. It does not pause the updates by itself. It discards the locations. The iOS location indicator appears and battery use is higher.
+"Help keep running in the background" is on by default. The app asks for the Location permission the first time you turn the setting on or tap Start while it is on. The app requests location updates while the proxy runs. It asks for accuracy to the nearest ten meters and uses no distance filter. It does not pause the updates by itself. It discards the locations. The iOS location indicator appears and battery use is higher.
 
-The keep-awake card tells the truth about the location updates:
+While the proxy runs and Location is allowed, the keep-awake card tells the
+truth about the location updates:
 
 | Last fix | Text |
 |---|---|
-| Less than 60 seconds ago | "The app stays awake while the proxy runs." |
+| Less than 60 seconds ago | "Location updates are active. iOS can still pause the app." |
 | 60 to 300 seconds ago | "Location updates stopped. Open HotspotShade to restart." |
 | More than 300 seconds ago, or no fix | "No location yet." |
+
+When the setting is off, the card says "Keep running in the background is off. Turn it on in Settings." Before the first Location answer it says "Allow Location when iOS asks, so the app can stay awake." Once Location is granted and the proxy is stopped, it says "Starts when the proxy starts."
 
 After a location error or a system pause, the app restarts the updates 2 seconds later. It allows at most 5 restarts in 10 minutes. After that it shows "Location updates keep stopping. Open HotspotShade to restart."
 
 When Location is denied, restricted, or off in Settings, or when an Allow Once permission expired, the app shows "Location is off, so iOS can pause the app. Open Settings to turn it on." with an Open Settings button.
 
-The app does not stop the proxy when it enters the background. When the setting is off or the permission is missing, nothing keeps the app awake, so iOS can suspend it. While iOS suspends the app, its timers do not run and the pairing listener cannot answer the target device. When the app runs again, it checks the hotspot and resumes listening if the interface is present. The Dashboard shows a plain warning in that case. After a pause, Recent activity reports a gap over one minute. If the app ended while listening, the Dashboard offers Start again. The app does not restart the proxy by itself.
+The app does not stop the proxy when it enters the background. When "Help keep running in the background" is off or the Location permission is missing, nothing keeps the app awake, so iOS can suspend it. While iOS suspends the app, its timers do not run and the pairing listener cannot answer the target device. When the app runs again, it checks the hotspot and resumes listening if the interface is present. The Dashboard shows a plain warning in that case. After a pause, Recent activity reports a gap over one minute. If the app ended while listening, the Dashboard offers Start again. The app does not restart the proxy by itself.
+
+The keep-awake option makes a suspension less likely. It is not a guarantee. iOS can still suspend the app in the background, and this app has no Network Extension. Settings reports the relay lifetime as "Not guaranteed" for that reason. Keep the app open while it relays.
 
 ## Last stop
 
@@ -223,7 +334,7 @@ The Dashboard shows one line with the last stop. The line survives an app restar
 Last stop: The app was closed by iOS. 14:32.
 ```
 
-The reasons are "You stopped it.", "The hotspot address was lost.", "The proxy stopped because of an error.", "Location turned off.", and "The app was closed by iOS." A new Start clears the line.
+The reasons are "You stopped it.", "The hotspot address was lost.", "The hotspot link changed.", "The hotspot link is not supported.", "The proxy stopped because of an error.", "Location turned off.", and "The app was closed by iOS." A new Start clears the line.
 
 ## Notifications
 
@@ -237,9 +348,9 @@ The app sends a stop notification only while the app is not active. It cannot se
 
 ## Automatic stop when the hotspot disconnects
 
-While the proxy runs, the app checks the hotspot network interface once a second. The proxy stops when observations show that its bound address (`172.20.10.1` on `bridge100`) is missing for at least 20 seconds. An unreadable interface list or hotspot address, a gap over 5 seconds, or a scene change starts a fresh observation window. This can delay a stop when the app is suspended or the system delays checks. The app cannot see the Personal Hotspot switch, so a missing address does not prove the switch is off. The app does not restart the proxy by itself. Start it again after the hotspot returns.
+While the proxy runs, the app checks for the supported bridge and address once a second. The proxy stops when observations show that the address is missing for at least 20 seconds. A complete check that names a different interface at the same address is a known link change, so the proxy stops at once. A hotspot address on a link type this build does not support also stops it. An unreadable interface list or hotspot address, a gap over 5 seconds, or a scene change starts a fresh observation window. This can delay a stop when the app is suspended or the system delays checks. The interface name is one local record. It does not prove that the Personal Hotspot switch is on, and two links that reuse the same name and address cannot be told apart. A missing address does not prove the switch is off either. The app does not restart the proxy by itself. Start it again after the hotspot returns.
 
-The app can see only its own network interfaces. It cannot see which clients are connected. If the hotspot stays on and the target device joins another network, the address stays present and the proxy keeps listening. The listener binds to the hotspot address only, so no other network can reach it.
+The app can see only its own network interfaces. It cannot see which clients are connected. If the hotspot stays on and the target device joins another network, the address stays present and the proxy keeps listening. The listener binds to the hotspot address only, so no other network can reach it. Network.framework has no public way to bind the listener to an interface name, so the app checks the interface identity separately.
 
 ## App Review note
 
@@ -247,7 +358,66 @@ The `location` background mode exists only to keep the app alive while the proxy
 
 ## Security and limits
 
-The token authenticates the target device to the source device. Settings hides the token. Tap Show token to see it for 30 seconds. The token hides again when the app leaves the foreground. The token and SOCKS5 control channel are not encrypted. Anyone who can observe the local link can learn the token. Rotate it after exposure. The token is stored in UserDefaults on the source device. Stop the proxy before rotating it. The listener accepts connections on the identified hotspot IPv4 address.
+Copy token writes a local-only item to the general pasteboard, with a
+system-managed 120-second expiration. It remains available after Hide or when
+the app leaves the foreground. Other local apps may read it, and clearing it
+cannot revoke a copy already read. When the token changes, the app clears the
+pasteboard if its change count still matches the recorded copy. These checks
+and writes are not atomic: another app's newer item can be cleared, or an
+interleaved write can leave the token copy untracked until it expires. A crash
+or app restart also loses the in-memory record.
+
+Copy connection details replaces any token copy on the pasteboard. It writes
+the address, port, and SOCKS5 username, and it holds no token. The app stops
+tracking the token copy at that point, so a later token change does not clear
+this item. The connection copy also uses a 120-second expiration, but it is not
+a secret.
+
+The token authenticates the target device to the source device. Settings hides the token. Tap Show token to see it for 30 seconds. The token hides again when the app leaves the foreground. The token and SOCKS5 control channel are not encrypted. Anyone who can observe the local link can learn the token. Token rotation is disabled pending review. This build has no reliable revocation path for an exposed token. A target device that is still in the trust list can pair again without a prompt, so Forget that device as well if it must be kept out. Its saved token can still authenticate until the credential changes. The listener accepts connections on the identified hotspot IPv4 address. The proxy compares the token in constant time to avoid a timing signal. That is hardening only: the token still crosses the hotspot link in cleartext.
+
+### Token storage
+
+The app keeps the token in one Keychain generic-password item. The service is `local.hotspotproxy.app` and the account is `proxyToken`. The item uses `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` and `synchronizable` is false. It does not sync through iCloud Keychain, and its device-bound protection prevents use on another device. Same-device backup and restore behavior has not been verified. The app never writes the token to UserDefaults, to a log, or to the diagnostics report.
+
+An earlier build saved the token in UserDefaults under `proxyToken`. When the Keychain is empty and the old value is valid, the app adds it to the Keychain and verifies the result. Normal migration retains the old plaintext copy, which can be included in backups; the reviewed rotation path that would remove it is disabled. If the two copies differ at any other time, the app keeps both, suspends pairing, and refuses to start the proxy. When a conflict or an unreadable Keychain leaves the app with no usable token at launch, the Dashboard shows Needs attention with the same plain storage message.
+
+
+A present empty or non-string old value is ambiguous. The app preserves it and does not generate a token. Restoring an older backup or downgrading the app can also restore an older credential. If that copy differs from the Keychain token, the app reports a conflict and uses neither value. It does not treat the restored copy as the current credential. If the Keychain item is also gone, a valid restored copy is migrated and used. That can reinstate an older token. The app cannot tell a legitimate upgrade copy from a restored backup with these stores alone. This build cannot revoke a token that an external process or an older build writes back later. The app either reports a conflict or, when the Keychain item is also gone, migrates the only remaining copy.
+
+### Token rotation and recovery
+
+Token rotation is disabled in this build. The Settings control is disabled, and its note says that rotation is unavailable pending review. Do not treat it as a revocation path. New rotations are dormant code behind a review gate and are not reachable until the gate is opened after an independent review. Recovery of an existing rotation record runs on launch and on a read retry. The dormant rotation path also runs it before an attempt and during its confirmation read after certain failures. Recovery can remove the observed old copy and clear the record. This build writes no new record.
+
+The person would need a stopped proxy, no pending start, a readable saved token, and no old-copy conflict. The app would suspend the pairing listener before it changes storage. A pairing reply already sent to the network cannot be recalled, and neither can a proxy session that the app already admitted. A token change decides what the app offers and accepts next. It does not end a session that is already running, and a target device keeps any token it already received until the proxy stops. That is why a rotation requires a stopped proxy and no pending start, and why the app suspends pairing before it changes storage.
+
+The dormant staged write uses the Keychain item `proxyToken.recoveryIntent` with the same after-first-unlock, this-device-only protection. The record holds a format version, a random transaction identifier, a stage, and SHA-256 digests of the old and new tokens. It never holds a token. The order is:
+
+1. Write and read back a `prepared` intent record.
+2. Re-read the old token.
+3. Write the new token to `proxyToken` and read it back.
+4. Write and read back a `committed` intent record.
+5. Remove the observed old UserDefaults copy, if any, and confirm it is gone.
+6. Delete the intent record and confirm it is absent.
+
+On launch, on a read retry, and before it starts a new rotation, the app resolves an existing intent before it reads the token. This recovery runs in this build. Only a new rotation is disabled:
+
+- `prepared` with the old token current: the rotation did not land. The app clears the intent, keeps the old token, and resumes pairing with it.
+- `prepared` or `committed` with the new token current: the rotation landed. The app removes a stale old copy that the intent names, clears the intent, and adopts the new token.
+- `committed` with the old token current, a missing or invalid token, a damaged or unknown intent version, or a third value: the app changes nothing, keeps the intent, and suspends pairing and the proxy. It does not create a replacement.
+- The new token is current but the old copy is a different value: the app keeps both, keeps the intent, and suspends pairing. It does not delete the unknown copy.
+- A legacy copy removal or intent delete fails: the app keeps the intent and reports a retryable failure. A later activation or restart retries. Pairing stays down until the state is confirmed.
+
+The staged rotation assumes one cooperating writer. The app would be the only process that writes these items, and the old UserDefaults key is written only by an earlier build that is not running at the same time. Keychain and UserDefaults have no compare-and-swap. A different process that changes an item between the app's last read and its write is not excluded, and this build has no conditional Keychain replacement. The app detects a changed value at every read boundary and fails closed, but a write-write race after the final check can still replace that value. Restoring a backup or downgrading the app can also reintroduce an older credential. The app detects some of those states as a conflict on the next launch. It cannot establish revocation across an external writer, a backup restore, or a downgrade. These limits are unverified on a device.
+
+The intent record and the token item are separate items, and the stores have no transaction across them. A power loss can lose the token write while the later intent delete survives. The next launch then finds no intent and an old Keychain item. If the old UserDefaults copy is gone or equal, the app silently reinstates that old token. It adopts the value with no conflict and no warning, and it uses a credential that the rotation was meant to replace. No record remains that would let the app detect the case. A read-back therefore does not prove that either item survives a crash or power loss.
+
+Repair of an invalid Keychain item remains unavailable. Validation does not identify the item for a conditional delete. The store keeps an invalid item and any valid old copy untouched. A rotation record that is short, damaged, or from an unknown version is rejected as unknown. The app never treats that as proof that no rotation is pending, so it blocks token use and creation across restarts. This build writes no such record, but a development build of this unreleased work, a restore, or an external writer can leave one. Contact support before removing saved data.
+
+For a fresh installation with no saved item, the app adds a new token and reads it back before use. A locked or unreadable Keychain blocks use. After an uncertain first load, same-launch retries only read and never create or migrate a token. If no token is found, the app reports `tokenUnavailableAfterFailure` and asks the person to reopen the app to retry setup. A fresh installation with a transient first read can therefore need a reopen. The app retries reads on activation or protected-data availability while the failure can clear. A conflict, a damaged rotation record, or a refused recovery is not re-read during the same launch, because the app has no automatic repair or delete for those states. Reopen the app to read the stores again. An external writer or a restore can change the saved bytes before that, and only a launch or a support step observes the new state. Forgetting paired target devices removes trust entries only; a target device that saved the token can still authenticate after you forget it, because the token did not change. This build has no reviewed rotation path to revoke it. A trusted target device can pair again without a prompt because trust survives.
+
+The lifecycle serializes launch, retry, start reservation, gated rotation, recovery, and pairing updates with one recursive lock. The proxy start reserves the token boundary across the token copy and the point where its start request becomes visible. Rotation is refused while that reservation or a proxy start is active, and the review gate is closed in this build. A failed rotation that does not invalidate the saved token re-reads the stores before the app keeps that token or resumes pairing. The confirmation read is a new store transaction after the rotation returns, so a store callback cannot start another transaction. The lifecycle suspends pairing before entering the store, and it holds no store transaction while calling the pairing listener.
+
+The storage tests use fakes. They do not prove crash durability, restore behavior, Keychain entitlement behavior, or exclusion of external writers on a device. The staged rotation and recovery matrix covers each simulated crash point in the test file, restart recovery, a changed old copy, a downgrade copy, a damaged intent, a failed intent delete, and a stored value that changes while the app runs. Those results do not enable a new rotation and do not prove a real Keychain transaction. Existing intent recovery still runs in this build. The token and SOCKS5 control channel travel in cleartext on the local link; avoid using the proxy on an untrusted hotspot.
 
 The hotspot Wi-Fi link does not provide end-to-end encryption to the destination. SOCKS5 forwards the application's own TLS traffic. Use TLS in each application. A later version can add TLS or WireGuard protection for the proxy control channel.
 

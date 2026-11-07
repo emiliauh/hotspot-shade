@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.hotspotshade.mac.helper</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/PrivilegedHelperTools/dev.hotspotshade.mac.helper</string>
+    </array>
+    <key>MachServices</key>
+    <dict>
+        <key>dev.hotspotshade.mac.helper</key>
+        <true/>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <!-- Give the helper time to stop its engine and reap it. The helper sends
+         SIGTERM and never SIGKILL. -->
+    <key>ExitTimeOut</key>
+    <integer>90</integer>
+</dict>
+</plist>

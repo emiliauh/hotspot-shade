@@ -20,17 +20,33 @@ import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.time.Duration
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.Callable
 import java.util.concurrent.CancellationException
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.Semaphore
+import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.ThreadFactory
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.LockSupport
+
+/**
+ * A real worker thread creation failure.
+ *
+ * The worker pool wraps every failure from the injected [ThreadFactory] in
+ * this Error, so a factory that throws `RejectedExecutionException` is not
+ * mistaken for a transient executor rejection at the thread ceiling. The
+ * server stops closed on this Error.
+ */
+private class WorkerCreationFailure(cause: Throwable) :
+    Error("The source worker thread could not start.", cause)
 
 /**
  * Resolve a destination name on the selected cellular network.
@@ -40,6 +56,322 @@ import java.util.concurrent.atomic.AtomicLong
  */
 internal fun interface SourceHostResolver {
     fun resolve(host: String): List<InetAddress>
+}
+
+/**
+ * Reframe the first TLS ClientHello on one relay direction.
+ *
+ * The relay carries opaque bytes. This shaper changes only the TLS record
+ * framing of the first ClientHello handshake message. It does not change one
+ * handshake byte, so the transcript hash is unchanged. A TLS peer reassembles
+ * handshake messages across records (RFC 8446 section 5.1), so small records
+ * are legal.
+ *
+ * It does not hide SNI, JA3/JA4, the destination address, DNS names, flow
+ * size, or timing. It does not change the TLS version: a byte relay cannot
+ * force the client's TLS version, and this shaper does not try. It does not
+ * control TCP segmentation; the writes are small, but the local stack and the
+ * network can coalesce them.
+ *
+ * The first record or records are buffered until the first ClientHello is
+ * complete. That message is written again as records with 1 to 8 payload
+ * bytes. Every later byte passes through unchanged. A non-TLS first byte, a
+ * record that is not a handshake record, a message that is not a ClientHello,
+ * a message above the cap, or a record count above the cap turns the whole
+ * flow into a plain pass-through, byte for byte.
+ *
+ * A byte that rules out a ClientHello is released as soon as it arrives, so a
+ * short request that waits for a reply is never held. The first byte decides
+ * the content type, the second decides the TLS major version, and the first
+ * payload byte of the first record decides the handshake type. An incomplete
+ * ClientHello stays buffered until it completes, the buffer cap is reached, or
+ * [finish] releases it unchanged at end of stream.
+ *
+ * This is a port of `rust/src/tls_shape.rs`, which has the real loopback
+ * handshake test. It holds no address, host name, or SNI value, and it must
+ * not log one. Shaping is off unless the caller passes it to the server.
+ */
+internal class SourceClientHelloShaper(
+    chunkLimit: Int = DEFAULT_MAX_CHUNK,
+    clientHelloLimit: Int = DEFAULT_MAX_CLIENT_HELLO,
+    recordLimit: Int = DEFAULT_MAX_RECORDS,
+    bufferLimit: Int = DEFAULT_MAX_BUFFERED,
+) {
+    internal enum class State { BUFFERING, REFRAMED, PASS_THROUGH }
+
+    private enum class RecordStep { NEED_MORE, PASS_THROUGH, PROGRESS }
+
+    internal companion object {
+        /** A TLS handshake record content type. */
+        const val HANDSHAKE_CONTENT_TYPE = 22
+
+        /** The TLS major version. A record that does not start with 3 is not TLS. */
+        const val TLS_MAJOR = 3
+
+        /** The handshake type of a ClientHello. */
+        const val CLIENT_HELLO_TYPE = 1
+
+        /** The largest record payload in TLS 1.2 and 1.3. */
+        const val MAX_RECORD_PAYLOAD = 16_384
+
+        /**
+         * The fixed part of a ClientHello: handshake header, version, random,
+         * and session id length.
+         */
+        const val MIN_CLIENT_HELLO_MESSAGE = 4 + 2 + 32 + 1
+
+        const val DEFAULT_MAX_CHUNK = 8
+        const val DEFAULT_MAX_CLIENT_HELLO = 16 * 1024
+        const val DEFAULT_MAX_RECORDS = 4096
+        const val DEFAULT_MAX_BUFFERED = 64 * 1024
+    }
+
+    /** The largest payload of one written record. */
+    val maxChunk = chunkLimit.coerceIn(1, DEFAULT_MAX_CHUNK)
+
+    /** The largest ClientHello message that is reshaped. */
+    val maxClientHello = clientHelloLimit.coerceAtLeast(MIN_CLIENT_HELLO_MESSAGE)
+
+    /** The most handshake records read while the ClientHello is shaped. */
+    val maxRecords = recordLimit.coerceAtLeast(1)
+
+    /** The most raw bytes buffered while the flow waits for a ClientHello. */
+    val maxBuffered = bufferLimit.coerceAtLeast(maxClientHello)
+
+    var state = State.BUFFERING
+        private set
+
+    private val raw = java.io.ByteArrayOutputStream()
+    private var rawView = ByteArray(0)
+    private val payload = java.io.ByteArrayOutputStream()
+    private var consumed = 0
+    private var records = 0
+    private var version = byteArrayOf(TLS_MAJOR.toByte(), 1)
+
+    /** The number of bytes held while the flow waits for a ClientHello. */
+    internal fun bufferedCount(): Int = rawView.size
+
+    /**
+     * Feed the next bytes from the client. The returned pieces go out in
+     * order. While the ClientHello is shaped, each piece is one complete TLS
+     * record. A pass-through piece is the unmodified input.
+     *
+     * A byte that rules out a ClientHello is returned in this call, unchanged.
+     * A prefix that still looks like TLS stays buffered until the message
+     * completes, [maxBuffered] is exceeded, or [finish] is called.
+     */
+    internal fun feed(
+        data: ByteArray,
+        offset: Int = 0,
+        length: Int = data.size,
+    ): List<ByteArray> {
+        if (state != State.BUFFERING) {
+            return if (length == 0) emptyList()
+            else listOf(data.copyOfRange(offset, offset + length))
+        }
+        if (length == 0) return emptyList()
+        raw.write(data, offset, length)
+        rawView = raw.toByteArray()
+        while (true) {
+            if (payload.size() == 0) {
+                when (takeRecord()) {
+                    RecordStep.NEED_MORE -> return waitForMore()
+                    RecordStep.PASS_THROUGH -> return passThrough()
+                    RecordStep.PROGRESS -> continue
+                }
+            }
+            val payloadView = payload.toByteArray()
+            if ((payloadView[0].toInt() and 0xFF) != CLIENT_HELLO_TYPE) return passThrough()
+            if (payloadView.size < 4) {
+                when (takeRecord()) {
+                    RecordStep.NEED_MORE -> return waitForMore()
+                    RecordStep.PASS_THROUGH -> return passThrough()
+                    RecordStep.PROGRESS -> continue
+                }
+            }
+            val declared = ((payloadView[1].toInt() and 0xFF) shl 16) or
+                ((payloadView[2].toInt() and 0xFF) shl 8) or
+                (payloadView[3].toInt() and 0xFF)
+            val messageLength = declared + 4
+            if (messageLength < MIN_CLIENT_HELLO_MESSAGE || messageLength > maxClientHello) {
+                return passThrough()
+            }
+            if (payloadView.size < messageLength) {
+                when (takeRecord()) {
+                    RecordStep.NEED_MORE -> return waitForMore()
+                    RecordStep.PASS_THROUGH -> return passThrough()
+                    RecordStep.PROGRESS -> continue
+                }
+            }
+            return reframe(messageLength)
+        }
+    }
+
+    /**
+     * Release the bytes still held, unchanged and in order, when the client
+     * ends the stream. Call it once, before the half-close.
+     *
+     * It returns at most one piece, which is the raw input in the order it
+     * arrived. A second call returns nothing, and no later byte is shaped.
+     */
+    internal fun finish(): List<ByteArray> {
+        if (state != State.BUFFERING) return emptyList()
+        val bytes = rawView
+        state = State.PASS_THROUGH
+        release()
+        return if (bytes.isEmpty()) emptyList() else listOf(bytes)
+    }
+
+    /**
+     * Read one handshake record from the raw buffer.
+     *
+     * Each header byte is checked as soon as it is available. A record that
+     * cannot be a handshake record is rejected without waiting for the rest of
+     * the header or the payload.
+     */
+    private fun takeRecord(): RecordStep {
+        val available = rawView.size - consumed
+        if (available == 0) return RecordStep.NEED_MORE
+        if ((rawView[consumed].toInt() and 0xFF) != HANDSHAKE_CONTENT_TYPE) {
+            return RecordStep.PASS_THROUGH
+        }
+        if (available < 2) return RecordStep.NEED_MORE
+        if ((rawView[consumed + 1].toInt() and 0xFF) != TLS_MAJOR) {
+            return RecordStep.PASS_THROUGH
+        }
+        if (available < 5) return RecordStep.NEED_MORE
+        val length = ((rawView[consumed + 3].toInt() and 0xFF) shl 8) or
+            (rawView[consumed + 4].toInt() and 0xFF)
+        if (length == 0 || length > MAX_RECORD_PAYLOAD) return RecordStep.PASS_THROUGH
+        // Check the first handshake bytes as soon as they are present, even
+        // when they straddle a record boundary. Only bytes inside the current
+        // record are handshake bytes: a byte after its payload is the next
+        // record header, not part of this message.
+        val inRecord = minOf(available - 5, length)
+        if (payload.size() < 4 && impossibleHandshakePrefix(inRecord)) {
+            return RecordStep.PASS_THROUGH
+        }
+        if (available - 5 < length) return RecordStep.NEED_MORE
+        if (records == 0) {
+            version = byteArrayOf(rawView[consumed + 1], rawView[consumed + 2])
+        }
+        payload.write(rawView, consumed + 5, length)
+        consumed += 5 + length
+        records += 1
+        if (records > maxRecords) return RecordStep.PASS_THROUGH
+        return RecordStep.PROGRESS
+    }
+
+    /**
+     * True when the first four handshake bytes are known and cannot start an
+     * accepted ClientHello. Bytes already in [payload] come before the next
+     * [availableInRecord] bytes of the current record. It returns false while
+     * more bytes are needed to decide, so a valid small request can wait for
+     * the rest of a ClientHello.
+     */
+    private fun impossibleHandshakePrefix(availableInRecord: Int): Boolean {
+        val held = payload.size()
+        if (held >= 4) return false
+        val have = held + availableInRecord
+        if (have < 1) return false
+        val heldBytes = if (held == 0) ByteArray(0) else payload.toByteArray()
+        val type = if (held > 0) heldBytes[0] else rawView[consumed + 5]
+        if ((type.toInt() and 0xFF) != CLIENT_HELLO_TYPE) return true
+        if (have < 4) return false
+        val header = ByteArray(4)
+        System.arraycopy(heldBytes, 0, header, 0, held)
+        var index = 0
+        while (held + index < 4) {
+            header[held + index] = rawView[consumed + 5 + index]
+            index += 1
+        }
+        val declared = ((header[1].toInt() and 0xFF) shl 16) or
+            ((header[2].toInt() and 0xFF) shl 8) or
+            (header[3].toInt() and 0xFF)
+        val messageLength = declared + 4
+        return messageLength < MIN_CLIENT_HELLO_MESSAGE || messageLength > maxClientHello
+    }
+
+    /**
+     * Wait for the next bytes unless the held prefix already exceeds the
+     * buffer cap. A complete ClientHello that arrives with a long tail is
+     * parsed instead of discarded. With a small custom cap, a split prefix
+     * may exceed the cap before the complete record arrives and pass through.
+     */
+    private fun waitForMore(): List<ByteArray> =
+        if (rawView.size > maxBuffered) passThrough() else emptyList()
+
+    /** Emit the ClientHello as small records, then the bytes after it. */
+    private fun reframe(messageLength: Int): List<ByteArray> {
+        val message = payload.toByteArray()
+        val leftoverBytes = message.size - messageLength
+        val leftoverRecords = (leftoverBytes + MAX_RECORD_PAYLOAD - 1) / MAX_RECORD_PAYLOAD
+        if (recordsFor(messageLength) + leftoverRecords > maxRecords) return passThrough()
+        val chunks = ArrayList<ByteArray>()
+        var offset = 0
+        var index = 0
+        while (offset < messageLength) {
+            val size = minOf(1 + (index % maxChunk), messageLength - offset)
+            chunks.add(frame(message, offset, size))
+            offset += size
+            index += 1
+        }
+        // Handshake bytes that followed the ClientHello in the same records
+        // stay in order and unchanged. Only their record framing is new.
+        var rest = messageLength
+        while (rest < message.size) {
+            val size = minOf(MAX_RECORD_PAYLOAD, message.size - rest)
+            chunks.add(frame(message, rest, size))
+            rest += size
+        }
+        // Bytes after the records that carried the ClientHello were never
+        // touched. They go out exactly as they arrived.
+        if (consumed < rawView.size) {
+            chunks.add(rawView.copyOfRange(consumed, rawView.size))
+        }
+        state = State.REFRAMED
+        release()
+        return chunks
+    }
+
+    /** Build one handshake record. */
+    private fun frame(message: ByteArray, offset: Int, size: Int): ByteArray {
+        val out = ByteArray(5 + size)
+        out[0] = HANDSHAKE_CONTENT_TYPE.toByte()
+        out[1] = version[0]
+        out[2] = version[1]
+        out[3] = ((size ushr 8) and 0xFF).toByte()
+        out[4] = (size and 0xFF).toByte()
+        System.arraycopy(message, offset, out, 5, size)
+        return out
+    }
+
+    /** Give up shaping and release every buffered byte unchanged. */
+    private fun passThrough(): List<ByteArray> {
+        val bytes = rawView
+        state = State.PASS_THROUGH
+        release()
+        return if (bytes.isEmpty()) emptyList() else listOf(bytes)
+    }
+
+    private fun release() {
+        raw.reset()
+        rawView = ByteArray(0)
+        payload.reset()
+        consumed = 0
+        records = 0
+    }
+
+    /** The number of records that a split of [length] bytes needs. */
+    private fun recordsFor(length: Int): Int {
+        var count = 0
+        var offset = 0
+        while (offset < length) {
+            offset += 1 + (count % maxChunk)
+            count += 1
+        }
+        return count
+    }
 }
 
 /**
@@ -75,17 +407,47 @@ internal fun interface SourceHostResolver {
  * values through the Java socket API.
  *
  * The server holds at most [maximumRelays] relay sessions and [setupReserve]
- * extra setup sessions. It never closes an open TCP relay to make room. A
+ * extra setup sessions. The constructor rejects a relay cap above
+ * [MAXIMUM_RELAYS], a reserve above [SETUP_RESERVE], or a total above
+ * [MAXIMUM_SESSIONS]. It never closes an open TCP relay to make room. A
  * refused relay request gets code 1. A new connection beyond the total bound
  * closes the most overdue stale session first. It closes the client before the
  * greeting when no session is stale.
  *
+ * The server also bounds its worker threads. One worker serves one session,
+ * and one extra worker pumps each open relay. The bound follows the session
+ * and relay limits, so it still serves every documented flow. The session
+ * worker runs one relay direction and the pump worker runs the other. A new
+ * connection that cannot get a worker is closed before the greeting. A relay
+ * request that cannot get a pump worker gets code 1. A worker that cannot
+ * start stops the server closed instead of leaving a listener that accepts
+ * nothing. A transient executor rejection at the ceiling refuses that one
+ * flow instead of stopping the server: the executor has no free thread for
+ * one instant, but it is still alive. Only a real thread creation failure or
+ * a shutdown pool stops the server.
+ *
+ * Name lookups use at most [resolverLimit] workers and a queue of the same
+ * bound. A lookup that cannot enter the queue is refused at once. A resolver
+ * call that ignores the caller deadline keeps its worker until the call
+ * returns; the server cannot replace that thread. [resolverStatus] reports
+ * the abandoned count and [ResolverStatus.exhausted], so a caller can tell
+ * that names cannot resolve again without a new server.
+ *
  * A persistent echo session holds one of 16 echo slots and no relay slot. Its
  * request has a 5 second bound. Its idle window is 30 seconds. Its lifetime is
- * 300 seconds.
+ * 300 seconds. A one-shot echo request also has one absolute 5 second bound
+ * for the whole frame, so a slow trickle cannot hold a session slot.
  *
- * [stop] closes the listener and every session. It is idempotent. A stopped
- * server cannot start again. The caller must pass the hotspot address.
+ * An explicit [tlsShape] reframes the first TLS ClientHello of a TCP relay into
+ * records with 1 to 8 payload bytes. It is off by default. It changes only TLS
+ * record framing and never one handshake byte. It does not hide SNI, JA3/JA4,
+ * the destination, DNS names, or flow shape, and it does not control TCP
+ * segmentation. See [SourceClientHelloShaper].
+ *
+ * [stop] closes the listener and every session. It is idempotent. A stop that
+ * runs while another stop is cleaning up waits for that cleanup for a bounded
+ * time and then reports [stopWasIncomplete]. A stopped server cannot start
+ * again. The caller must pass the hotspot address.
  */
 internal class SourceSocksServer(
     private val cellular: CellularSession,
@@ -105,6 +467,17 @@ internal class SourceSocksServer(
     private val echoAttemptTimeout: Duration = Duration.ofSeconds(3),
     private val persistentEchoLimit: Int = SourceSocksCapacity.MAXIMUM_PERSISTENT_ECHO_SESSIONS,
     private val housekeepingInterval: Duration = Duration.ofMillis(500),
+    private val tlsShape: Boolean = false,
+    private val workerThreadFactory: ThreadFactory? = null,
+    private val resolverLimit: Int = SourceSocksCapacity.resolverThreads(
+        maximumRelays + setupReserve,
+    ),
+    private val stopWaitTimeout: Duration = Duration.ofMillis(DEFAULT_STOP_WAIT_MILLIS),
+    // Test seams. Production leaves these null. They select no address and
+    // hold no secret.
+    private val workerLimitOverride: Int? = null,
+    private val listenerFactory: (() -> ServerSocket)? = null,
+    private val workerExecutorFactory: ((Int, ThreadFactory) -> ThreadPoolExecutor)? = null,
 ) : Closeable {
     internal companion object {
         /** The relay slots that the source device proxy gives to open flows. */
@@ -119,6 +492,9 @@ internal class SourceSocksServer(
         /** The most persistent echo sessions that the server grants. */
         const val MAXIMUM_PERSISTENT_ECHO_SESSIONS =
             SourceSocksCapacity.MAXIMUM_PERSISTENT_ECHO_SESSIONS
+
+        /** The username accepted by the source proxy and shown in Settings. */
+        internal const val SOCKS_USERNAME = "hotspotshade"
 
         private const val SOCKS_VERSION = 5
         private const val AUTH_VERSION = 1
@@ -140,20 +516,86 @@ internal class SourceSocksServer(
         private const val MAX_DATAGRAM = 1472
         private const val CLIENT_BUFFER = 16 * 1024
         private const val ACCEPT_SLICE_MILLIS = 1_000
-        private val USERNAME = "hotspotshade".toByteArray(StandardCharsets.US_ASCII)
+
+        /** The attempts for the narrow idle-worker timeout race. */
+        private const val MAXIMUM_WORKER_START_ATTEMPTS = 3
+
+        /** The wait between those attempts. It is short and bounded. */
+        private const val WORKER_START_RETRY_NANOS = 1_000_000L
+
+        /** The most that a concurrent stop waits for the cleanup in progress. */
+        private const val DEFAULT_STOP_WAIT_MILLIS = 5_000L
+
+        /** The wait for the housekeeping thread on every stop. */
+        private const val KEEPER_JOIN_MILLIS = 1_000L
+
+        /** The wait for the worker pool to drain on every stop. */
+        private const val WORKER_DRAIN_MILLIS = 2_000L
+
+        /** The wait for the accept thread on every stop. */
+        private const val ACCEPT_JOIN_MILLIS = 1_000L
+
+        private val USERNAME = SOCKS_USERNAME.toByteArray(StandardCharsets.US_ASCII)
         private val EMPTY = ByteArray(0)
     }
 
     private enum class State { NEW, RUNNING, STOPPED }
 
+    /**
+     * The resolver view of one run. It holds counts only.
+     *
+     * [exhausted] is the recovery limit: every resolver worker is inside a
+     * call whose caller already gave up. Android cannot interrupt a resolver
+     * that ignores the interrupt, so those workers stay gone. A new server is
+     * the only recovery.
+     */
+    internal data class ResolverStatus(
+        val threads: Int,
+        val queueLimit: Int,
+        val active: Int,
+        val queued: Int,
+        val rejections: Long,
+        val abandoned: Int,
+    ) {
+        /** The lookups that are running or queued. */
+        val outstanding: Int get() = active + queued
+
+        /** True when no name lookup can finish without a new server. */
+        val exhausted: Boolean get() = threads > 0 && abandoned >= threads
+    }
+
     private val tokenBytes = token.toByteArray(StandardCharsets.UTF_8)
+    private val tokenLock = Any()
     private val lifecycleLock = Any()
     private val sessionLock = Any()
     private val sessions = LinkedHashSet<Session>()
     private val sessionIds = AtomicLong()
     private val relayTotal = AtomicLong()
     private val persistentEchoCount = AtomicInteger()
+    private val resolverActive = AtomicInteger()
+    private val resolverOutstanding = AtomicInteger()
+    private val resolverRejections = AtomicLong()
+    private val resolverAbandoned = AtomicInteger()
     private val sessionLimit = maximumRelays + setupReserve
+
+    /**
+     * True on a worker task of this run. Stop reads it after the pool field is
+     * gone, so a worker never waits for the pool that contains it.
+     */
+    private val inWorkerThread = ThreadLocal.withInitial { false }
+
+    /**
+     * The worker thread bound of this run. It is one session worker plus one
+     * relay pump worker, with the eviction overlap.
+     */
+    val workerLimit: Int = workerLimitOverride ?: SourceSocksCapacity.workerLimit(
+        sessions = sessionLimit,
+        relays = maximumRelays,
+    )
+
+    private val stopWaitMillis = stopWaitTimeout.toMillis().coerceAtLeast(1)
+    private val stopDone = CountDownLatch(1)
+
     private val policy = SourceSocksCapacity.Policy(
         handshakeMillis = handshakeTimeout.toMillis().coerceAtLeast(1),
         connectMillis = (connectTimeout.toMillis() * 2).coerceAtLeast(1),
@@ -174,53 +616,91 @@ internal class SourceSocksServer(
     private var resolverExecutor: ExecutorService? = null
 
     @Volatile
+    private var workers: SourceWorkerPool? = null
+
+    @Volatile
     private var state = State.NEW
+
+    @Volatile
+    private var failure: String? = null
 
     @Volatile
     private var boundPort = 0
 
+    /** True while one stop call is closing the listener and every session. */
+    @Volatile
+    private var stopping = false
+
+    /** True when a stop returned before the cleanup it waited for finished. */
+    @Volatile
+    private var stopIncomplete = false
+
     init {
-        require(!bindAddress.isAnyLocalAddress) {
-            "The source listener needs an explicit address."
-        }
-        require(port in 0..65_535) {
-            "The source listener port is out of range."
-        }
-        require(token.isNotEmpty()) {
-            "The source token must not be empty."
-        }
-        require(maximumRelays in 1..65_535) {
-            "The relay limit is out of range."
-        }
-        require(setupReserve in 0..65_535) {
-            "The setup reserve is out of range."
-        }
-        require(!connectTimeout.isZero && !connectTimeout.isNegative) {
-            "The connect timeout must be positive."
-        }
-        require(!handshakeTimeout.isZero && !handshakeTimeout.isNegative) {
-            "The handshake timeout must be positive."
-        }
-        require(!udpIdleTimeout.isZero && !udpIdleTimeout.isNegative) {
-            "The UDP idle timeout must be positive."
-        }
-        require(!echoRequestTimeout.isZero && !echoRequestTimeout.isNegative) {
-            "The echo request timeout must be positive."
-        }
-        require(!echoIdleTimeout.isZero && !echoIdleTimeout.isNegative) {
-            "The echo idle timeout must be positive."
-        }
-        require(!echoLifetime.isZero && !echoLifetime.isNegative) {
-            "The echo lifetime must be positive."
-        }
-        require(!echoAttemptTimeout.isZero && !echoAttemptTimeout.isNegative) {
-            "The echo attempt timeout must be positive."
-        }
-        require(persistentEchoLimit in 1..255) {
-            "The persistent echo limit is out of range."
-        }
-        require(!housekeepingInterval.isZero && !housekeepingInterval.isNegative) {
-            "The housekeeping interval must be positive."
+        try {
+            require(!bindAddress.isAnyLocalAddress) {
+                "The source listener needs an explicit address."
+            }
+            require(port in 0..65_535) {
+                "The source listener port is out of range."
+            }
+            require(token.isNotEmpty()) {
+                "The source token must not be empty."
+            }
+            require(maximumRelays in 1..MAXIMUM_RELAYS) {
+                "The relay limit is out of range."
+            }
+            require(setupReserve in 0..SETUP_RESERVE) {
+                "The setup reserve is out of range."
+            }
+            require(sessionLimit <= MAXIMUM_SESSIONS) {
+                "The session limit is above the declared cap."
+            }
+            require(resolverLimit in 1..SourceSocksCapacity.MAXIMUM_RESOLVER_THREADS) {
+                "The resolver limit is out of range."
+            }
+            require(resolverLimit <= sessionLimit) {
+                "The resolver limit is above the session cap."
+            }
+            require(workerLimitOverride == null ||
+                workerLimitOverride in 1..SourceSocksCapacity.workerLimit(sessionLimit, maximumRelays)
+            ) {
+                "The worker limit override is out of range."
+            }
+            require(!stopWaitTimeout.isZero && !stopWaitTimeout.isNegative) {
+                "The stop wait must be positive."
+            }
+            require(!connectTimeout.isZero && !connectTimeout.isNegative) {
+                "The connect timeout must be positive."
+            }
+            require(!handshakeTimeout.isZero && !handshakeTimeout.isNegative) {
+                "The handshake timeout must be positive."
+            }
+            require(!udpIdleTimeout.isZero && !udpIdleTimeout.isNegative) {
+                "The UDP idle timeout must be positive."
+            }
+            require(!echoRequestTimeout.isZero && !echoRequestTimeout.isNegative) {
+                "The echo request timeout must be positive."
+            }
+            require(!echoIdleTimeout.isZero && !echoIdleTimeout.isNegative) {
+                "The echo idle timeout must be positive."
+            }
+            require(!echoLifetime.isZero && !echoLifetime.isNegative) {
+                "The echo lifetime must be positive."
+            }
+            require(!echoAttemptTimeout.isZero && !echoAttemptTimeout.isNegative) {
+                "The echo attempt timeout must be positive."
+            }
+            require(persistentEchoLimit in 1..255) {
+                "The persistent echo limit is out of range."
+            }
+            require(!housekeepingInterval.isZero && !housekeepingInterval.isNegative) {
+                "The housekeeping interval must be positive."
+            }
+        } catch (failure: Exception) {
+            // The object is unusable. Clear the token copy before the error
+            // leaves the constructor.
+            tokenBytes.fill(0)
+            throw failure
         }
     }
 
@@ -228,7 +708,20 @@ internal class SourceSocksServer(
     val localPort: Int get() = boundPort
 
     /** True between a successful start and the first stop. */
-    val isRunning: Boolean get() = state == State.RUNNING
+    val isRunning: Boolean
+        get() = state == State.RUNNING && acceptThread?.isAlive == true
+
+    /** True when the in-memory token copy has been cleared. A test uses this. */
+    internal fun tokenCopyIsCleared(): Boolean =
+        synchronized(tokenLock) { tokenBytes.all { it == 0.toByte() } }
+
+    /**
+     * A fixed label for a failure that stopped the server, or null.
+     *
+     * The label is a word such as `worker_start`, never an address, host,
+     * token, or exception text. A normal stop leaves it null.
+     */
+    internal val failureReason: String? get() = failure
 
     /** The relay cap of this run. It follows the open-file limit. */
     val relayLimit: Int get() = maximumRelays
@@ -252,6 +745,62 @@ internal class SourceSocksServer(
      */
     val totalConnections: Long get() = relayTotal.get()
 
+    /** The worker permits that are free right now. A test reads this. */
+    internal val availableWorkers: Int get() = workers?.availablePermits ?: 0
+
+    /**
+     * True when the stop cleanup finished. A concurrent stop waits for this
+     * value for a bounded time.
+     */
+    internal val stopFinished: Boolean get() = stopDone.count == 0L
+
+    /** True when a stop returned before the cleanup it waited for finished. */
+    internal val stopWasIncomplete: Boolean get() = stopIncomplete
+
+    /**
+     * The resolver counters of this run. The value holds no host or address.
+     *
+     * A caller that exposes health reads [ResolverStatus.exhausted] to learn
+     * that name lookups cannot recover until a new server exists.
+     */
+    internal fun resolverStatus(): ResolverStatus = ResolverStatus(
+        threads = resolverLimit,
+        queueLimit = resolverLimit,
+        active = resolverActive.get(),
+        queued = maxOf(0, resolverOutstanding.get() - resolverActive.get()),
+        rejections = resolverRejections.get(),
+        abandoned = resolverAbandoned.get(),
+    )
+
+    /**
+     * One health report for the controller. It holds fixed labels and counts
+     * only: no address, host, token, or key.
+     *
+     * The controller can poll this value after a start. `failureReason != null`
+     * means the listener stopped because of a background failure, not a person.
+     * `resolver.exhausted` means the listener still serves numeric targets but
+     * name lookups cannot recover without a new server.
+     */
+    internal data class Health(
+        val running: Boolean,
+        val failureReason: String?,
+        val stopFinished: Boolean,
+        val stopIncomplete: Boolean,
+        val resolver: ResolverStatus,
+    ) {
+        /** True when the listener cannot serve every kind of flow. */
+        val degraded: Boolean get() = failureReason != null || resolver.exhausted
+    }
+
+    /** Take one health snapshot. */
+    internal fun health(): Health = Health(
+        running = isRunning,
+        failureReason = failure,
+        stopFinished = stopFinished,
+        stopIncomplete = stopIncomplete,
+        resolver = resolverStatus(),
+    )
+
     /**
      * Bind the listener and accept sessions. Call this method once.
      *
@@ -262,32 +811,53 @@ internal class SourceSocksServer(
     fun start() {
         synchronized(lifecycleLock) {
             check(state == State.NEW) { "The source server cannot restart." }
-            val server = ServerSocket()
-            try {
-                server.reuseAddress = false
-                server.bind(InetSocketAddress(bindAddress, port))
-                server.soTimeout = ACCEPT_SLICE_MILLIS
+            val server = try {
+                createListener()
             } catch (_: Exception) {
-                closeQuietly(server)
                 state = State.STOPPED
+                boundPort = 0
+                tokenBytes.fill(0)
+                stopDone.countDown()
                 throw IOException("The source listener could not bind.")
             }
             listener = server
             boundPort = server.localPort
-            resolverExecutor = Executors.newCachedThreadPool(daemonFactory("source-resolve"))
+            try {
+                workers = SourceWorkerPool(
+                    limit = workerLimit,
+                    threadFactory = workerThreadFactory ?: daemonFactory("source-worker"),
+                    executorFactory = workerExecutorFactory,
+                )
+            } catch (_: Throwable) {
+                cleanupFailedStart(server)
+                throw IOException("The source worker pool could not start.")
+            }
+            try {
+                // A fixed worker set with a bounded queue. A full queue
+                // refuses the lookup at once. The earlier unbounded queue
+                // could collect one dead entry for every waiting flow.
+                val threads = resolverLimit
+                resolverExecutor = ThreadPoolExecutor(
+                    threads,
+                    threads,
+                    0L,
+                    TimeUnit.MILLISECONDS,
+                    ArrayBlockingQueue(threads),
+                    daemonFactory("source-resolve"),
+                    ThreadPoolExecutor.AbortPolicy(),
+                )
+            } catch (_: Throwable) {
+                cleanupFailedStart(server)
+                throw IOException("The source resolver pool could not start.")
+            }
             state = State.RUNNING
             val worker = Thread({ acceptLoop(server) }, "source-accept")
             worker.isDaemon = true
             acceptThread = worker
             try {
                 worker.start()
-            } catch (_: Exception) {
-                state = State.STOPPED
-                listener = null
-                acceptThread = null
-                resolverExecutor?.shutdownNow()
-                resolverExecutor = null
-                closeQuietly(server)
+            } catch (_: Throwable) {
+                cleanupFailedStart(server)
                 throw IOException("The source listener could not start.")
             }
             val keeper = Thread({ housekeepingLoop() }, "source-capacity")
@@ -295,17 +865,56 @@ internal class SourceSocksServer(
             housekeepingThread = keeper
             try {
                 keeper.start()
-            } catch (_: Exception) {
-                state = State.STOPPED
-                listener = null
-                closeQuietly(server)
-                acceptThread?.interrupt()
-                acceptThread = null
-                resolverExecutor?.shutdownNow()
-                resolverExecutor = null
+            } catch (_: Throwable) {
+                cleanupFailedStart(server)
                 throw IOException("The source capacity thread could not start.")
             }
         }
+    }
+
+    /** Create and bind the listener. A fake listens in a test. */
+    private fun createListener(): ServerSocket {
+        val server = listenerFactory?.invoke() ?: ServerSocket()
+        try {
+            server.reuseAddress = false
+            server.bind(InetSocketAddress(bindAddress, port))
+            server.soTimeout = ACCEPT_SLICE_MILLIS
+            return server
+        } catch (failure: Exception) {
+            closeQuietly(server)
+            throw failure
+        }
+    }
+
+    /**
+     * Close everything that a failed start created. The caller holds
+     * [lifecycleLock]. The server becomes unusable and the token copy is
+     * cleared.
+     */
+    private fun cleanupFailedStart(server: ServerSocket) {
+        val accept = acceptThread
+        val keeper = housekeepingThread
+        state = State.STOPPED
+        listener = null
+        acceptThread = null
+        housekeepingThread = null
+        boundPort = 0
+        closeQuietly(server)
+        accept?.interrupt()
+        keeper?.interrupt()
+        resolverExecutor?.shutdownNow()
+        resolverExecutor = null
+        val active = synchronized(sessionLock) { sessions.toList() }
+        for (session in active) {
+            session.close()
+        }
+        val pool = workers
+        workers = null
+        pool?.shutdownAndAwait(KEEPER_JOIN_MILLIS)
+        joinQuietly(accept, KEEPER_JOIN_MILLIS)
+        joinQuietly(keeper, KEEPER_JOIN_MILLIS)
+        clearToken()
+        stopDone.countDown()
     }
 
     /**
@@ -316,75 +925,169 @@ internal class SourceSocksServer(
      */
     override fun close() = stop()
 
-    /** Close the listener and every session. This method is idempotent. */
+    /**
+     * Close the listener and every session. This method is idempotent.
+     *
+     * One call owns the cleanup. A concurrent call waits for that cleanup for
+     * at most [stopWaitMillis] and then returns; [stopWasIncomplete] reports
+     * that the wait expired. A call on a worker thread never waits for the
+     * pool that contains it.
+     */
     fun stop() {
+        var server: ServerSocket? = null
         var active: List<Session> = emptyList()
         var acceptWorker: Thread? = null
         var keeper: Thread? = null
+        var resolver: ExecutorService? = null
+        var pool: SourceWorkerPool? = null
+        var owner = false
         synchronized(lifecycleLock) {
-            if (state == State.STOPPED) return
-            state = State.STOPPED
-            val server = listener
-            listener = null
+            if (state == State.STOPPED) {
+                // A failed start also needs a cleared copy, and a later stop
+                // must still clear it even when the object never bound.
+                clearToken()
+            } else {
+                owner = true
+                state = State.STOPPED
+                stopping = true
+                // The server cannot restart, so no later authentication needs
+                // the token bytes. The state check under the same lock rejects
+                // a comparison that is already in flight.
+                clearToken()
+                server = listener
+                listener = null
+                acceptWorker = acceptThread
+                acceptThread = null
+                keeper = housekeepingThread
+                housekeepingThread = null
+                resolver = resolverExecutor
+                resolverExecutor = null
+                pool = workers
+                workers = null
+                synchronized(sessionLock) {
+                    active = sessions.toList()
+                }
+            }
+        }
+        if (!owner) {
+            awaitConcurrentStop()
+            return
+        }
+        var drained = true
+        try {
+            // Close the listener outside the lifecycle lock, so a concurrent
+            // stop can read the stopping state and wait on the latch. The
+            // accept loop sees STOPPED and does not report a failure.
             closeQuietly(server)
-            acceptWorker = acceptThread
-            acceptThread = null
-            keeper = housekeepingThread
-            housekeepingThread = null
-            resolverExecutor?.shutdownNow()
-            resolverExecutor = null
-            synchronized(sessionLock) {
-                active = sessions.toList()
+            // Stop the phase loop before the sessions close, so it does not
+            // race the close of the same session.
+            keeper?.interrupt()
+            drained = joinQuietly(keeper, KEEPER_JOIN_MILLIS) && drained
+            for (session in active) {
+                session.close()
+            }
+            resolver?.shutdownNow()
+            // Every worker task is a daemon. Close the session sockets first,
+            // then shut the bounded pool once. Waiting for each session in
+            // turn could take one second per session.
+            drained = (pool?.shutdownAndAwait(WORKER_DRAIN_MILLIS) ?: true) && drained
+            drained = joinQuietly(acceptWorker, ACCEPT_JOIN_MILLIS) && drained
+            if (!drained) stopIncomplete = true
+        } finally {
+            synchronized(lifecycleLock) { stopping = false }
+            stopDone.countDown()
+        }
+    }
+
+    /**
+     * Wait for a cleanup that another thread owns. The wait is bounded. A
+     * worker thread does not wait for the pool that contains it.
+     */
+    private fun awaitConcurrentStop() {
+        if (!stopping || stopDone.count == 0L) return
+        if (inWorkerThread.get() == true) return
+        val finished = try {
+            stopDone.await(stopWaitMillis, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        if (!finished) stopIncomplete = true
+    }
+
+    /**
+     * Stop the server because a background thread failed. The label is fixed
+     * and holds no address, host, or token.
+     */
+    private fun failStop(reason: String) {
+        val shouldStop = synchronized(lifecycleLock) {
+            if (state != State.RUNNING) {
+                false
+            } else {
+                failure = reason
+                true
             }
         }
-        if (keeper != null && keeper !== Thread.currentThread()) {
-            keeper.interrupt()
-            try {
-                keeper.join(1_000)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-            }
+        if (shouldStop) stop()
+    }
+
+    /** Return true when the thread is gone after the bounded join. */
+    private fun joinQuietly(thread: Thread?, millis: Long): Boolean {
+        if (thread == null || thread === Thread.currentThread()) return true
+        try {
+            thread.join(millis)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return false
         }
-        for (session in active) {
-            session.close()
-        }
-        for (session in active) {
-            val worker = session.workerThread ?: continue
-            if (worker === Thread.currentThread()) continue
-            worker.interrupt()
-            try {
-                worker.join(1_000)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-            }
-        }
-        if (acceptWorker != null && acceptWorker !== Thread.currentThread()) {
-            try {
-                acceptWorker.join(1_000)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-            }
-        }
+        return !thread.isAlive
+    }
+
+    private fun clearToken() {
+        synchronized(tokenLock) { tokenBytes.fill(0) }
     }
 
     override fun toString(): String = "SourceSocksServer"
 
+    /**
+     * Accept sessions until a normal stop closes the listener.
+     *
+     * An accept error while the server is running is a server failure, not a
+     * normal stop. The loop reports it through [failStop], so the server never
+     * stays in RUNNING with a dead accept thread.
+     */
     private fun acceptLoop(server: ServerSocket) {
-        while (state == State.RUNNING) {
-            val client = try {
-                server.accept()
-            } catch (_: SocketTimeoutException) {
-                continue
-            } catch (_: Exception) {
-                break
+        var failureLabel: String? = null
+        try {
+            while (state == State.RUNNING) {
+                val client = try {
+                    server.accept()
+                } catch (_: SocketTimeoutException) {
+                    continue
+                } catch (_: Exception) {
+                    if (state == State.RUNNING) failureLabel = "accept"
+                    break
+                }
+                if (state != State.RUNNING) {
+                    closeQuietly(client)
+                    break
+                }
+                val session = try {
+                    admit(client)
+                } catch (_: Throwable) {
+                    closeQuietly(client)
+                    failureLabel = "accept"
+                    break
+                }
+                if (session == null) {
+                    closeQuietly(client)
+                }
             }
-            if (state != State.RUNNING) {
-                closeQuietly(client)
-                break
-            }
-            val session = admit(client)
-            if (session == null) {
-                closeQuietly(client)
+        } catch (_: Throwable) {
+            if (state == State.RUNNING) failureLabel = "accept"
+        } finally {
+            if (failureLabel != null) {
+                failStop(failureLabel)
             }
         }
     }
@@ -394,36 +1097,40 @@ internal class SourceSocksServer(
      * closed for silence. A control session is bounded by the echo timers.
      */
     private fun housekeepingLoop() {
-        val interval = housekeepingInterval.toMillis().coerceAtLeast(1)
-        while (state == State.RUNNING) {
-            try {
-                Thread.sleep(interval)
-            } catch (_: InterruptedException) {
-                return
-            }
-            if (state != State.RUNNING) return
-            val active = synchronized(sessionLock) { sessions.toList() }
-            val now = System.nanoTime()
-            for (session in active) {
-                if (session.isClosed) continue
-                if (session.echoIdleExpired(now) || session.echoLifetimeExpired(now)) {
-                    session.close()
-                    continue
+        try {
+            val interval = housekeepingInterval.toMillis().coerceAtLeast(1)
+            while (state == State.RUNNING) {
+                try {
+                    Thread.sleep(interval)
+                } catch (_: InterruptedException) {
+                    return
                 }
-                if (session.isControlActive()) continue
-                val view = session.phaseSession(now)
-                when (
-                    SourceSocksCapacity.idleAction(
-                        phase = view.phase,
-                        phaseMillis = view.phaseMillis,
-                        idleMillis = view.idleMillis,
-                        policy = policy,
-                    )
-                ) {
-                    is SourceSocksCapacity.IdleAction.Close -> session.close()
-                    is SourceSocksCapacity.IdleAction.Rearm -> Unit
+                if (state != State.RUNNING) return
+                val active = synchronized(sessionLock) { sessions.toList() }
+                val now = System.nanoTime()
+                for (session in active) {
+                    if (session.isClosed) continue
+                    if (session.echoIdleExpired(now) || session.echoLifetimeExpired(now)) {
+                        session.close()
+                        continue
+                    }
+                    if (session.isControlActive()) continue
+                    val view = session.phaseSession(now)
+                    when (
+                        SourceSocksCapacity.idleAction(
+                            phase = view.phase,
+                            phaseMillis = view.phaseMillis,
+                            idleMillis = view.idleMillis,
+                            policy = policy,
+                        )
+                    ) {
+                        is SourceSocksCapacity.IdleAction.Close -> session.close()
+                        is SourceSocksCapacity.IdleAction.Rearm -> Unit
+                    }
                 }
             }
+        } catch (_: Throwable) {
+            failStop("housekeeping")
         }
     }
 
@@ -445,10 +1152,19 @@ internal class SourceSocksServer(
             sessions.add(session)
         }
         evicted?.close()
-        val worker = Thread({ session.run() }, "source-session-${session.id}")
-        worker.isDaemon = true
-        session.attach(worker)
-        worker.start()
+        val started = try {
+            workers?.tryStart { session.run() } ?: false
+        } catch (_: Throwable) {
+            session.close()
+            failStop("worker_start")
+            return null
+        }
+        if (!started) {
+            // The worker pool is full. This is a capacity refusal, not a
+            // server failure: close the client before the greeting.
+            session.close()
+            return null
+        }
         return session
     }
 
@@ -523,23 +1239,16 @@ internal class SourceSocksServer(
         private var echoIdleAtNanos = 0L
         private var echoLifetimeAtNanos = 0L
         private var persistentSlot = false
+        private var udpReaderGate: CountDownLatch? = null
 
         @Volatile
         private var closed = false
-
-        @Volatile
-        private var worker: Thread? = null
 
         @Volatile
         private var hasRelay = false
 
         val isClosed: Boolean get() = closed
         val relayGranted: Boolean get() = hasRelay
-        val workerThread: Thread? get() = worker
-
-        fun attach(thread: Thread) {
-            worker = thread
-        }
 
         fun noteRelayGranted() {
             hasRelay = true
@@ -573,6 +1282,10 @@ internal class SourceSocksServer(
                 }
             } catch (_: Exception) {
                 // The finally block closes the session. Do not log a message.
+            } catch (_: Throwable) {
+                // A worker that cannot start is a server failure, not one
+                // closed flow. Stop every other worker and report closed.
+                failStop("session")
             } finally {
                 close()
             }
@@ -580,18 +1293,30 @@ internal class SourceSocksServer(
 
         fun close() {
             val releaseEcho: Boolean
+            val readerGate: CountDownLatch?
             synchronized(closeLock) {
                 if (closed) return
                 closed = true
                 releaseEcho = persistentSlot
                 persistentSlot = false
+                readerGate = udpReaderGate
+                udpReaderGate = null
+                val tcp = tcpFlow
+                val udp = udpFlow
+                // Shut down both directions before the close. A relay pump
+                // that is blocked in a write must return even if the peer
+                // never reads. Without this, an evicted session can keep its
+                // worker permit indefinitely.
+                abortSocket(client)
+                if (tcp != null) abortSocket(tcp.socket)
                 closeQuietly(client)
-                closeFlow(tcpFlow)
-                closeFlow(udpFlow)
+                closeFlow(tcp)
+                closeFlow(udp)
                 tcpFlow = null
                 udpFlow = null
             }
             if (releaseEcho) persistentEchoCount.decrementAndGet()
+            readerGate?.countDown()
             sessionClosed(this)
         }
 
@@ -734,6 +1459,21 @@ internal class SourceSocksServer(
             }
         }
 
+        private fun trackUdpReader(gate: CountDownLatch): Boolean = synchronized(closeLock) {
+            if (closed) {
+                false
+            } else {
+                udpReaderGate = gate
+                true
+            }
+        }
+
+        private fun untrackUdpReader(gate: CountDownLatch) {
+            synchronized(closeLock) {
+                if (udpReaderGate === gate) udpReaderGate = null
+            }
+        }
+
         private fun readHandshake(input: InputStream, output: OutputStream): Request? {
             val deadline = System.nanoTime() + handshakeTimeout.toNanos()
             val greeting = readExactly(input, 2, deadline)
@@ -759,7 +1499,13 @@ internal class SourceSocksServer(
             }
             val password = readExactly(input, passwordLength, deadline)
             val userOk = MessageDigest.isEqual(USERNAME, user)
-            val tokenOk = MessageDigest.isEqual(tokenBytes, password)
+            // The comparison always runs, so the timing does not reveal which
+            // field failed. A stop clears the bytes under the same lock and
+            // rejects a comparison that is already in flight.
+            val tokenOk = synchronized(tokenLock) {
+                val matches = MessageDigest.isEqual(tokenBytes, password)
+                matches && state == State.RUNNING
+            }
             password.fill(0)
             val valid = userOk && tokenOk
             writeSmallReply(output, AUTH_VERSION, if (valid) 0 else 1)
@@ -944,15 +1690,71 @@ internal class SourceSocksServer(
                 writeFailureReply(output, REPLY_GENERAL_FAILURE)
                 return
             }
+            val destination = flow.socket
+            val destinationInput = try {
+                destination.getInputStream()
+            } catch (_: Exception) {
+                writeFailureReply(output, REPLY_GENERAL_FAILURE)
+                return
+            }
+            val destinationOutput = try {
+                destination.getOutputStream()
+            } catch (_: Exception) {
+                writeFailureReply(output, REPLY_GENERAL_FAILURE)
+                return
+            }
+            // Start the pump before the success reply. A pump that cannot
+            // start must not report a relay that is not running. The session
+            // worker pumps the other direction, so one relay uses two workers.
+            val upDone = CountDownLatch(1)
+            val pumpStarted = try {
+                workers?.tryStart {
+                    try {
+                        pump(
+                            input,
+                            destinationOutput,
+                            destinationWriteLock,
+                            shape = tlsShape,
+                            onEnd = {
+                                noteHalfClose()
+                                shutdownOutputQuietly(destination)
+                            },
+                        )
+                    } finally {
+                        upDone.countDown()
+                    }
+                } ?: false
+            } catch (_: Throwable) {
+                writeFailureReply(output, REPLY_GENERAL_FAILURE)
+                failStop("worker_start")
+                return
+            }
+            if (!pumpStarted) {
+                writeFailureReply(output, REPLY_GENERAL_FAILURE)
+                return
+            }
             beginReply()
             try {
                 writeReply(output, REPLY_SUCCEEDED)
-            } catch (failure: Exception) {
-                throw failure
             } finally {
                 finishReply()
             }
-            relayTcp(flow.socket, input, output)
+            pump(
+                destinationInput,
+                output,
+                clientWriteLock,
+                shape = false,
+                onEnd = {
+                    noteHalfClose()
+                    shutdownOutputQuietly(client)
+                },
+            )
+            try {
+                upDone.await()
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                close()
+            }
         }
 
         private fun connectTcp(target: Target, destinationPort: Int): CellularFlow<Socket> {
@@ -1039,42 +1841,72 @@ internal class SourceSocksServer(
                 writeFailureReply(output, REPLY_GENERAL_FAILURE)
                 return
             }
+            // Start the datagram reader before the success reply, but hold its
+            // first read until the reply is on the wire. The session worker
+            // reads the client direction, so one UDP relay uses two workers.
+            val readerGate = CountDownLatch(1)
+            if (!trackUdpReader(readerGate)) {
+                untrackUdp(flow)
+                closeFlow(flow)
+                writeFailureReply(output, REPLY_GENERAL_FAILURE)
+                return
+            }
+            val readerStarted = try {
+                workers?.tryStart { udpReader(socket, output, readerGate) } ?: false
+            } catch (_: Throwable) {
+                untrackUdpReader(readerGate)
+                readerGate.countDown()
+                writeFailureReply(output, REPLY_GENERAL_FAILURE)
+                failStop("worker_start")
+                return
+            }
+            if (!readerStarted) {
+                untrackUdpReader(readerGate)
+                readerGate.countDown()
+                untrackUdp(flow)
+                closeFlow(flow)
+                writeFailureReply(output, REPLY_GENERAL_FAILURE)
+                return
+            }
             beginReply()
             try {
                 writeReply(output, REPLY_SUCCEEDED)
             } finally {
                 finishReply()
+                readerGate.countDown()
             }
-            startUdpReader(socket, output)
             readUdpFrames(input, socket)
         }
 
-        private fun startUdpReader(socket: DatagramSocket, output: OutputStream) {
-            val reader = Thread({
-                try {
-                    val buffer = ByteArray(MAX_DATAGRAM + 1)
-                    while (!closed) {
-                        val packet = DatagramPacket(buffer, buffer.size)
-                        socket.receive(packet)
-                        touch()
-                        if (packet.length > MAX_DATAGRAM) {
-                            close()
-                            break
-                        }
-                        val payload = packet.data.copyOfRange(
-                            packet.offset,
-                            packet.offset + packet.length,
-                        )
-                        writeDatagram(output, payload)
+        private fun udpReader(
+            socket: DatagramSocket,
+            output: OutputStream,
+            gate: CountDownLatch,
+        ) {
+            try {
+                gate.await()
+                if (closed) return
+                val buffer = ByteArray(MAX_DATAGRAM + 1)
+                while (!closed) {
+                    val packet = DatagramPacket(buffer, buffer.size)
+                    socket.receive(packet)
+                    touch()
+                    if (packet.length > MAX_DATAGRAM) {
+                        close()
+                        break
                     }
-                } catch (_: Exception) {
-                    // A closed socket or a stopped session ends the reader.
-                } finally {
-                    close()
+                    val payload = packet.data.copyOfRange(
+                        packet.offset,
+                        packet.offset + packet.length,
+                    )
+                    writeDatagram(output, payload)
                 }
-            }, "source-udp-in")
-            reader.isDaemon = true
-            reader.start()
+            } catch (_: Exception) {
+                // A closed socket, an interrupted stop, or a stopped session
+                // ends the reader.
+            } finally {
+                close()
+            }
         }
 
         private fun writeDatagram(output: OutputStream, payload: ByteArray) {
@@ -1083,6 +1915,7 @@ internal class SourceSocksServer(
                 payload.size.toByte(),
             )
             synchronized(clientWriteLock) {
+                if (closed) return
                 output.write(header)
                 output.write(payload)
                 output.flush()
@@ -1107,62 +1940,54 @@ internal class SourceSocksServer(
             }
         }
 
-        private fun relayTcp(destination: Socket, clientInput: InputStream, clientOutput: OutputStream) {
-            val destinationInput = destination.getInputStream()
-            val destinationOutput = destination.getOutputStream()
-            val up = Thread({
-                pump(
-                    clientInput,
-                    destinationOutput,
-                    destinationWriteLock,
-                    onEnd = {
-                        noteHalfClose()
-                        shutdownOutputQuietly(destination)
-                    },
-                )
-            }, "source-relay-up")
-            up.isDaemon = true
-            val down = Thread({
-                pump(
-                    destinationInput,
-                    clientOutput,
-                    clientWriteLock,
-                    onEnd = {
-                        noteHalfClose()
-                        shutdownOutputQuietly(client)
-                    },
-                )
-            }, "source-relay-down")
-            down.isDaemon = true
-            up.start()
-            down.start()
-            try {
-                up.join()
-                down.join()
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-                close()
-            }
-        }
-
         private fun pump(
             input: InputStream,
             output: OutputStream,
             writeLock: Any,
+            shape: Boolean = false,
             onEnd: () -> Unit,
         ) {
+            var shaper: SourceClientHelloShaper? = if (shape) SourceClientHelloShaper() else null
             try {
                 val buffer = ByteArray(CLIENT_BUFFER)
                 while (!closed) {
                     val read = input.read(buffer)
                     if (read < 0) {
+                        // Release a partial ClientHello before the half-close.
+                        // The shaper holds bytes only while they still look
+                        // like TLS, and the destination must see them.
+                        val current = shaper
+                        if (current != null) {
+                            synchronized(writeLock) {
+                                if (closed) return
+                                for (chunk in current.finish()) {
+                                    output.write(chunk)
+                                }
+                                shaper = null
+                                output.flush()
+                            }
+                        }
                         onEnd()
                         return
                     }
                     if (read == 0) continue
                     touch()
                     synchronized(writeLock) {
-                        output.write(buffer, 0, read)
+                        // Do not start a new write after the session closed.
+                        // A write already in the socket is aborted by
+                        // Session.close through shutdownOutput.
+                        if (closed) return
+                        val current = shaper
+                        if (current == null) {
+                            output.write(buffer, 0, read)
+                        } else {
+                            for (chunk in current.feed(buffer, 0, read)) {
+                                output.write(chunk)
+                            }
+                            if (current.state != SourceClientHelloShaper.State.BUFFERING) {
+                                shaper = null
+                            }
+                        }
                         output.flush()
                     }
                 }
@@ -1198,14 +2023,17 @@ internal class SourceSocksServer(
             input: InputStream,
             output: OutputStream,
         ) {
-            client.soTimeout = millisFrom(echoRequestTimeout.toNanos())
-            val header = readFully(input, 2)
+            // One absolute bound covers the whole frame, header and payload.
+            // A timeout per read would let a client that sends one byte just
+            // inside every timeout hold a session slot indefinitely.
+            val deadline = System.nanoTime() + echoRequestTimeout.toNanos()
+            val header = readExactly(input, 2, deadline)
             val length = ((header[0].toInt() and 0xFF) shl 8) or (header[1].toInt() and 0xFF)
             if (length > SourceEchoWire.MAXIMUM_PAYLOAD) {
                 writeEchoResponse(output, EchoStatus.FAILED, EMPTY)
                 return
             }
-            val payload = if (length == 0) EMPTY else readFully(input, length)
+            val payload = if (length == 0) EMPTY else readExactly(input, length, deadline)
             touch()
             val result = echo?.send(target, payload, echoAttemptTimeout.toMillis())
                 ?: EchoResult(EchoStatus.FAILED)
@@ -1267,8 +2095,125 @@ internal class SourceSocksServer(
             frame[2] = (payload.size and 0xFF).toByte()
             payload.copyInto(frame, 3)
             synchronized(clientWriteLock) {
+                if (closed) return
                 output.write(frame)
                 output.flush()
+            }
+        }
+    }
+
+    /**
+     * A bounded daemon worker pool for sessions and relay pumps.
+     *
+     * A pool thread runs a blocking socket loop. The permit count bounds the
+     * active tasks, so a task is never queued behind another task. The caller
+     * decides between a capacity refusal and a failure before a task starts.
+     * The pool never creates more than [limit] threads. A thread that cannot
+     * start is reported to the caller before the task begins.
+     */
+    private inner class SourceWorkerPool(
+        val limit: Int,
+        threadFactory: ThreadFactory,
+        executorFactory: ((Int, ThreadFactory) -> ThreadPoolExecutor)?,
+    ) {
+        private val permits = Semaphore(limit)
+        private val executor: ThreadPoolExecutor = run {
+            val guarded = ThreadFactory { runnable ->
+                try {
+                    threadFactory.newThread(runnable)
+                } catch (failure: Throwable) {
+                    // A real thread creation failure must reach the caller as
+                    // an Error, not as a transient executor rejection. The
+                    // executor itself only rejects when it is at its ceiling
+                    // or shut down.
+                    throw WorkerCreationFailure(failure)
+                }
+            }
+            executorFactory?.invoke(limit, guarded)
+                ?: ThreadPoolExecutor(
+                    0,
+                    limit,
+                    30L,
+                    TimeUnit.SECONDS,
+                    SynchronousQueue(),
+                    guarded,
+                )
+        }
+
+        /** The permits that no worker task holds right now. */
+        val availablePermits: Int get() = permits.availablePermits()
+
+        /**
+         * Reserve one worker and start [task] on it. Return false when every
+         * worker is busy. A thread that cannot start throws before [task]
+         * runs, and the reserved permit is released.
+         *
+         * A rejection from a live executor is a capacity refusal, not a
+         * server failure. The executor can reject while a finished worker
+         * is still leaving its thread, even though the caller holds a
+         * permit. Retry that narrow window a bounded number of times; then
+         * refuse this one flow and leave every other session running. A
+         * rejection from a shut-down executor still throws. A real thread
+         * creation failure arrives as [WorkerCreationFailure] and also
+         * throws.
+         */
+        fun tryStart(task: () -> Unit): Boolean {
+            if (!permits.tryAcquire()) return false
+            val wrapped = Runnable {
+                try {
+                    inWorkerThread.set(true)
+                    task()
+                } catch (failure: Throwable) {
+                    // An error on a pump or reader task is not one closed
+                    // flow. Stop the listener and every other session.
+                    if (failure !is Exception) failStop("session")
+                } finally {
+                    inWorkerThread.remove()
+                    permits.release()
+                }
+            }
+            var attempts = 0
+            while (true) {
+                try {
+                    executor.execute(wrapped)
+                    return true
+                } catch (failure: RejectedExecutionException) {
+                    if (executor.isShutdown) {
+                        permits.release()
+                        throw failure
+                    }
+                    attempts += 1
+                    if (attempts >= MAXIMUM_WORKER_START_ATTEMPTS) {
+                        permits.release()
+                        return false
+                    }
+                    LockSupport.parkNanos(WORKER_START_RETRY_NANOS)
+                } catch (failure: Throwable) {
+                    permits.release()
+                    throw failure
+                }
+            }
+        }
+
+        /** True on a thread of this pool. A stop on it must not wait for itself. */
+        fun isWorkerThread(): Boolean = inWorkerThread.get() == true
+
+        /**
+         * Interrupt and stop the pool, then wait up to [millis].
+         *
+         * A caller on a pool thread does not wait, because it is the worker
+         * that must exit. It returns true: no bounded wait expired, and the
+         * pool drains after this worker returns. Return false only when the
+         * wait expired with a worker still running.
+         */
+        fun shutdownAndAwait(millis: Long): Boolean {
+            executor.shutdownNow()
+            if (isWorkerThread()) return true
+            return try {
+                executor.awaitTermination(millis, TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
             }
         }
     }
@@ -1306,27 +2251,110 @@ internal class SourceSocksServer(
         val remaining = deadline - System.nanoTime()
         if (remaining <= 0) throw ConnectFailure(REPLY_GENERAL_FAILURE)
         val executor = resolverExecutor ?: throw ConnectFailure(REPLY_GENERAL_FAILURE)
+        val lookup = ResolverLookup(host)
+        resolverOutstanding.incrementAndGet()
         val future = try {
-            executor.submit(Callable { resolver.resolve(host) })
+            executor.submit(lookup)
         } catch (_: RejectedExecutionException) {
+            resolverOutstanding.decrementAndGet()
+            // A full queue or a stopped pool refuses this lookup at once. It
+            // is a capacity result for one flow, never a server failure.
+            if (state == State.RUNNING && !executor.isShutdown) {
+                resolverRejections.incrementAndGet()
+            }
             throw ConnectFailure(REPLY_GENERAL_FAILURE)
         }
         val addresses = try {
             future.get(remaining, TimeUnit.NANOSECONDS)
         } catch (_: TimeoutException) {
+            lookup.abandon()
             future.cancel(true)
             throw ConnectFailure(REPLY_GENERAL_FAILURE)
         } catch (_: InterruptedException) {
+            lookup.abandon()
             future.cancel(true)
             Thread.currentThread().interrupt()
             throw ConnectFailure(REPLY_GENERAL_FAILURE)
         } catch (_: ExecutionException) {
             throw ConnectFailure(REPLY_GENERAL_FAILURE)
         } catch (_: CancellationException) {
+            lookup.abandon()
             throw ConnectFailure(REPLY_GENERAL_FAILURE)
         }
         if (addresses.isEmpty()) throw ConnectFailure(REPLY_GENERAL_FAILURE)
         return addresses
+    }
+
+    /**
+     * One name lookup. It tracks whether its caller gave up while the
+     * resolver is still inside the call.
+     *
+     * A canceled task that is still queued never runs. Its outstanding count
+     * stays until the executor drops it on stop, which is after the status
+     * matters. A running task that ignores the interrupt keeps its worker and
+     * stays in the abandoned count until it returns.
+     */
+    private inner class ResolverLookup(private val host: String) :
+        Callable<List<InetAddress>> {
+        private val lock = Any()
+        private var started = false
+        private var abandoned = false
+        private var counted = false
+        private var finished = false
+
+        override fun call(): List<InetAddress> {
+            val count = synchronized(lock) {
+                started = true
+                if (abandoned && !counted) {
+                    counted = true
+                    true
+                } else {
+                    false
+                }
+            }
+            if (count) resolverAbandoned.incrementAndGet()
+            resolverActive.incrementAndGet()
+            try {
+                return resolver.resolve(host)
+            } finally {
+                resolverActive.decrementAndGet()
+                resolverOutstanding.decrementAndGet()
+                val release = synchronized(lock) {
+                    finished = true
+                    if (counted) {
+                        counted = false
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (release) resolverAbandoned.decrementAndGet()
+            }
+        }
+
+        /**
+         * Mark that the caller stopped waiting for this lookup.
+         *
+         * A task that never starts is canceled before it runs, so it holds no
+         * worker and is not counted. A task that starts after the caller gave
+         * up is counted here, because its resolver call can now keep a worker.
+         */
+        fun abandon() {
+            val count = synchronized(lock) {
+                if (finished || abandoned) {
+                    false
+                } else {
+                    abandoned = true
+                    if (started && !counted) {
+                        counted = true
+                        true
+                    } else {
+                        false
+                    }
+                }
+            }
+            if (count) resolverAbandoned.incrementAndGet()
+        }
     }
 
     private fun replyCodeFor(failure: IOException?): Int = when (failure) {
@@ -1393,6 +2421,27 @@ internal class SourceSocksServer(
             socket.shutdownOutput()
         } catch (_: Exception) {
             // The other end already closed.
+        }
+    }
+
+    /**
+     * Stop both directions of one TCP socket before it closes.
+     *
+     * A close alone does not reliably wake a thread that is blocked in a
+     * write on every platform. Shutdown does. The session close path calls
+     * this so an evicted relay cannot keep its worker permit.
+     */
+    private fun abortSocket(socket: Socket?) {
+        if (socket == null) return
+        try {
+            socket.shutdownOutput()
+        } catch (_: Exception) {
+            // The socket is already closed or not connected.
+        }
+        try {
+            socket.shutdownInput()
+        } catch (_: Exception) {
+            // The socket is already closed or not connected.
         }
     }
 }

@@ -64,6 +64,11 @@ fn serial() -> MutexGuard<'static, ()> {
 }
 
 fn require_root() {
+    assert_eq!(
+        std::env::var("HS_DISPOSABLE_LINUX_VM").as_deref(),
+        Ok("1"),
+        "set HS_DISPOSABLE_LINUX_VM=1 only inside a disposable Linux VM"
+    );
     let uid = unsafe { libc::geteuid() };
     assert_eq!(
         uid, 0,
@@ -184,6 +189,11 @@ impl TestNet {
         ip_quiet(&["netns", "delete", SOURCE_NS]);
         ip_quiet(&["link", "delete", HOST_IF]);
         ip_run(&["netns", "add", SOURCE_NS]);
+        // Own the namespace before the remaining setup commands can fail.
+        // Drop then removes both it and any partially created host link.
+        let net = Self {
+            host: HOST_IF.to_owned(),
+        };
         ip_run(&[
             "link", "add", HOST_IF, "type", "veth", "peer", "name", SOURCE_IF,
         ]);
@@ -223,9 +233,7 @@ impl TestNet {
         }
         // Let the link flags settle before the pre-test snapshot.
         thread::sleep(Duration::from_millis(200));
-        Self {
-            host: HOST_IF.to_owned(),
-        }
+        net
     }
 }
 

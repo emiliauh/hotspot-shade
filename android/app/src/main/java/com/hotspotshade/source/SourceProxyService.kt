@@ -28,14 +28,26 @@ import com.hotspotshade.demo.R
  * START_NOT_STICKY and never starts itself again. A new start needs the
  * person to request it.
  *
+ * The main thread does only the foreground notification, the state gate, and
+ * the bounded background status close. The environment build, the token load,
+ * the hotspot wait, the listener bind, and every proxy close run on one
+ * service queue. A proxy stop can close many sessions, so it must not run on
+ * the main thread. The background status close closes at most four pairing
+ * sockets and joins no thread.
+ *
  * The service never logs the token, the hotspot address, or a host name.
  */
 class SourceProxyService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val lock = Any()
+    private var coordinator: SourceProxyServiceCoordinator? = null
     private var controller: SourceProxyController? = null
+    private var backgroundStatus: BackgroundStatusHost? = null
     private var runGeneration = 0L
+
+    @Volatile
     private var destroying = false
+
     private var foreground = false
 
     override fun onCreate() {
@@ -50,6 +62,30 @@ class SourceProxyService : Service() {
             setShowBadge(false)
         }
         manager?.createNotificationChannel(channel)
+        // The background status host answers authenticated status only, on the
+        // live hotspot address, while the activity is not visible. It never
+        // pairs. The gate stays explicit so one constant turns it off.
+        backgroundStatus = if (SourceProxyServiceLifecycle.BACKGROUND_STATUS_ENABLED) {
+            try {
+                BackgroundStatusHost.create(applicationContext)
+            } catch (_: Exception) {
+                // The proxy still runs without background status. A missing
+                // host fails closed: the target eventually sees no answer.
+                null
+            }
+        } else {
+            null
+        }
+        coordinator = SourceProxyServiceCoordinator(
+            queue = SingleThreadSourceProxyTaskQueue("source-proxy-service"),
+            runFactory = ::createRun,
+            onState = { snapshot, generation ->
+                mainHandler.post { applyState(snapshot, generation) }
+            },
+            onTerminal = { snapshot, generation ->
+                mainHandler.post { applyTerminal(snapshot, generation) }
+            },
+        )
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -57,11 +93,13 @@ class SourceProxyService : Service() {
     @RequiresPermission(Manifest.permission.ACCESS_NETWORK_STATE)
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            val active = synchronized(lock) { controller }
-            if (active == null) {
+            // A user stop ends presence now. The controller close runs on the
+            // worker, but the background status listener must not keep
+            // answering for a run that the person just stopped.
+            stopBackgroundStatus()
+            val outcome = coordinator?.stop()
+            if (outcome != SourceProxyServiceStop.QUEUED) {
                 stopSelf(startId)
-            } else {
-                active.stop()
             }
             return START_NOT_STICKY
         }
@@ -69,41 +107,101 @@ class SourceProxyService : Service() {
             stopSelf(startId)
             return START_NOT_STICKY
         }
-        val existing = synchronized(lock) { controller }
-        if (existing != null && existing.isActive) {
-            // A second start request does not create a second run. Re-assert
-            // the foreground state and keep the notification text correct.
-            SourceProxyRuntime.attach(existing)
-            val kind = if (existing.state == SourceProxyState.RUNNING) {
-                StatusKind.RUNNING
-            } else {
-                StatusKind.WAITING
+        // Clear the report of the run before this request. This runs before
+        // any worker can build a controller, and it keeps a live attached run
+        // for a repeated start request.
+        SourceProxyRuntime.requestStart()
+        // The platform requires the foreground state before any slow work.
+        // Use the live notification text for a repeated start so it does not
+        // flicker back to the waiting text. Every step after this call runs on
+        // the service queue.
+        if (!startInForeground(buildStatusNotification(foregroundKind()))) {
+            failStart()
+            return START_NOT_STICKY
+        }
+        val active = coordinator
+        if (active == null) {
+            failStart()
+            return START_NOT_STICKY
+        }
+        when (val result = active.start()) {
+            is SourceProxyServiceStart.Queued -> {
+                // A new run can carry a new token. Close any listener left
+                // from the previous run and start a fresh host, so a rotated
+                // token cannot be served from an old background listener.
+                restartBackgroundStatus()
+                synchronized(lock) { runGeneration = result.generation }
             }
-            startInForeground(buildStatusNotification(kind))
-            return START_NOT_STICKY
+            is SourceProxyServiceStart.Active -> {
+                startBackgroundStatus()
+                synchronized(lock) {
+                    runGeneration = result.generation
+                    controller?.let { SourceProxyRuntime.attach(it) }
+                }
+                // A second start request does not create a second run. Record
+                // the live snapshot again because requestStart() may have
+                // cleared the report for this request.
+                SourceProxyRuntime.record(result.snapshot)
+                updateForeground(buildStatusNotification(kindFor(result.snapshot)))
+            }
+            is SourceProxyServiceStart.Starting -> {
+                startBackgroundStatus()
+                synchronized(lock) {
+                    runGeneration = result.generation
+                    controller?.let { SourceProxyRuntime.attach(it) }
+                }
+                // The first request already showed the waiting notification.
+            }
+            SourceProxyServiceStart.Refused -> failStart()
         }
-        if (!startInForeground(buildStatusNotification(StatusKind.WAITING))) {
-            SourceProxyRuntime.record(
-                SourceProxySnapshot(SourceProxyState.STOPPED, SourceProxyStopReason.START_FAILED, 0),
+        return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        destroying = true
+        val active = synchronized(lock) {
+            coordinator.also { coordinator = null }
+        }
+        val status = synchronized(lock) {
+            backgroundStatus.also { backgroundStatus = null }
+        }
+        stopBackgroundStatus(status)
+        val state = SourceProxyRuntime.lastState
+        val hadWork = active?.hasPendingRun() == true ||
+            state == SourceProxyState.RUNNING ||
+            state == SourceProxyState.WAITING_FOR_NETWORK
+        if (active != null) {
+            // The stop only queues the worker. This method must return without
+            // a socket close or a thread join on the main thread. The report
+            // is read from the process record, not from the controller lock,
+            // because a start can hold that lock while it reads the token.
+            SourceProxyServiceLifecycle.finishDestroyedRun(
+                stop = { active.destroy() },
+                snapshot = {
+                    SourceProxySnapshot(
+                        SourceProxyRuntime.lastState,
+                        SourceProxyRuntime.lastStopReason,
+                        0,
+                    )
+                },
+                record = { report ->
+                    if (hadWork) SourceProxyRuntime.record(report)
+                },
+                detach = { SourceProxyRuntime.attach(null) },
             )
-            stopSelf(startId)
-            return START_NOT_STICKY
+        } else {
+            SourceProxyRuntime.attach(null)
         }
-        val generation = synchronized(lock) {
-            runGeneration += 1
-            runGeneration
-        }
-        val environment = try {
-            SourceProxyRuntime.environment(applicationContext)
-        } catch (_: Exception) {
-            finishRun(SourceProxyStopReason.START_FAILED, generation)
-            return START_NOT_STICKY
-        }
-        var created: SourceProxyController? = null
-        val listener = SourceProxyListener { snapshot ->
-            val source = created
-            if (source != null) onSnapshot(source, snapshot, generation)
-        }
+        synchronized(lock) { controller = null }
+        foreground = false
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        super.onDestroy()
+    }
+
+    /** Build and publish one run on the service queue. */
+    @RequiresPermission(Manifest.permission.ACCESS_NETWORK_STATE)
+    private fun createRun(listener: SourceProxyListener): SourceProxyServiceRun {
+        val environment = SourceProxyRuntime.environment(applicationContext)
         val newController = SourceProxyController(
             tokenStore = environment.tokenStore,
             hotspotFinder = environment.hotspotFinder,
@@ -113,60 +211,61 @@ class SourceProxyService : Service() {
             serverFactory = environment.serverFactory,
             watchFactory = environment.watchFactory,
             listener = listener,
+            serverHealthMonitorFactory = SourceServerHealthMonitorFactory.PRODUCTION,
+            // The production store is also the writer. A test environment
+            // whose store cannot write keeps the TOKEN_MISSING stop.
+            tokenWriter = environment.tokenStore as? TokenWriter,
         )
-        created = newController
-        SourceProxyRuntime.resetObservation()
-        SourceProxyRuntime.attach(newController)
-        synchronized(lock) { controller = newController }
-        try {
-            newController.start()
-        } catch (_: Exception) {
-            newController.stop()
-            finishRun(SourceProxyStopReason.START_FAILED, generation)
-        }
-        return START_NOT_STICKY
-    }
-
-    override fun onDestroy() {
-        destroying = true
-        val active = synchronized(lock) {
-            controller.also { controller = null }
-        }
-        SourceProxyRuntime.attach(null)
-        active?.stop()
-        foreground = false
-        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-        super.onDestroy()
-    }
-
-    private fun onSnapshot(
-        source: SourceProxyController,
-        snapshot: SourceProxySnapshot,
-        generation: Long,
-    ) {
-        mainHandler.post {
-            val current = synchronized(lock) { controller }
-            if (current !== source) return@post
-            SourceProxyRuntime.record(snapshot)
-            when (snapshot.state) {
-                SourceProxyState.IDLE -> Unit
-                SourceProxyState.WAITING_FOR_NETWORK -> {
-                    updateForeground(buildStatusNotification(StatusKind.WAITING))
-                }
-                SourceProxyState.RUNNING -> {
-                    updateForeground(buildStatusNotification(StatusKind.RUNNING))
-                }
-                SourceProxyState.STOPPED -> {
-                    synchronized(lock) { controller = null }
-                    SourceProxyRuntime.attach(null)
-                    if (source.closeFailure != null) {
-                        // Retry one incomplete socket close before the service ends.
-                        source.stop()
-                    }
-                    finishRun(snapshot.reason, generation)
-                }
+        synchronized(lock) {
+            if (!destroying) {
+                controller = newController
+                SourceProxyRuntime.attach(newController)
             }
         }
+        return newController
+    }
+
+    /** Record one non-terminal state for the live run. */
+    private fun applyState(snapshot: SourceProxySnapshot, generation: Long) {
+        if (destroying) return
+        if (snapshot.state == SourceProxyState.STOPPED) {
+            applyTerminal(snapshot, generation)
+            return
+        }
+        // Reattach the run for this exact generation. A repeated start
+        // request clears the process report before it asks the coordinator,
+        // so the first real state must publish the controller again.
+        val current = synchronized(lock) {
+            if (generation == runGeneration) controller else null
+        } ?: return
+        SourceProxyRuntime.attach(current)
+        SourceProxyRuntime.record(snapshot)
+        when (snapshot.state) {
+            SourceProxyState.IDLE -> Unit
+            SourceProxyState.WAITING_FOR_NETWORK -> {
+                updateForeground(buildStatusNotification(StatusKind.WAITING))
+            }
+            SourceProxyState.RUNNING -> {
+                updateForeground(buildStatusNotification(StatusKind.RUNNING))
+            }
+            SourceProxyState.STOPPED -> Unit
+        }
+    }
+
+    /** Record the one terminal state for a run and end the service. */
+    private fun applyTerminal(snapshot: SourceProxySnapshot, generation: Long) {
+        if (destroying) return
+        val current = synchronized(lock) { generation == runGeneration }
+        if (!current) return
+        SourceProxyRuntime.record(snapshot)
+        synchronized(lock) { controller = null }
+        SourceProxyRuntime.attach(null)
+        // No run is live after this report. Close the background status
+        // listener now so a rotated token cannot be served by the run that is
+        // ending, and so a later start always creates a listener with the
+        // token that it loaded.
+        stopBackgroundStatus()
+        finishRun(snapshot.reason, generation)
     }
 
     private fun finishRun(reason: SourceProxyStopReason, generation: Long) {
@@ -181,6 +280,76 @@ class SourceProxyService : Service() {
         foreground = false
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    /** End a start that the platform refused before any run existed. */
+    private fun failStart() {
+        if (destroying) return
+        stopBackgroundStatus()
+        synchronized(lock) {
+            runGeneration += 1
+            controller = null
+        }
+        SourceProxyRuntime.attach(null)
+        SourceProxyRuntime.record(
+            SourceProxySnapshot(
+                SourceProxyState.STOPPED,
+                SourceProxyStopReason.START_FAILED,
+                0,
+            ),
+        )
+        showFinalNotification(SourceProxyStopReason.START_FAILED)
+        foreground = false
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun kindFor(snapshot: SourceProxySnapshot): StatusKind =
+        if (SourceProxyServiceLifecycle.showsRunning(snapshot)) {
+            StatusKind.RUNNING
+        } else {
+            StatusKind.WAITING
+        }
+
+    /** The notification kind for the run that the service already owns. */
+    private fun foregroundKind(): StatusKind {
+        val current = synchronized(lock) { controller } ?: return StatusKind.WAITING
+        if (!current.isActive) return StatusKind.WAITING
+        return kindFor(current.snapshot())
+    }
+
+    /** Start the background status host. A failure never stops the proxy. */
+    private fun startBackgroundStatus() {
+        if (!SourceProxyServiceLifecycle.BACKGROUND_STATUS_ENABLED) return
+        val status = synchronized(lock) { backgroundStatus } ?: return
+        try {
+            status.start()
+        } catch (_: Exception) {
+            // The proxy still runs. The target sees no authenticated answer
+            // until a later service start can create a working host.
+        }
+    }
+
+    /**
+     * Stop and start the host so a new run opens its listener with the token
+     * that this run loaded.
+     */
+    private fun restartBackgroundStatus() {
+        if (!SourceProxyServiceLifecycle.BACKGROUND_STATUS_ENABLED) return
+        val status = synchronized(lock) { backgroundStatus } ?: return
+        stopBackgroundStatus(status)
+        startBackgroundStatus()
+    }
+
+    /** Stop one background status host. A failure never stops the proxy. */
+    private fun stopBackgroundStatus(status: BackgroundStatusHost? = null) {
+        if (!SourceProxyServiceLifecycle.BACKGROUND_STATUS_ENABLED) return
+        val target = status ?: synchronized(lock) { backgroundStatus } ?: return
+        try {
+            target.stop()
+        } catch (_: Exception) {
+            // The listener is already closing.
+        }
     }
 
     private fun startInForeground(notification: Notification): Boolean {
@@ -264,8 +433,12 @@ class SourceProxyService : Service() {
         SourceProxyStopReason.BIND_FAILED ->
             "The proxy could not listen on the hotspot address."
         SourceProxyStopReason.START_FAILED -> "The proxy could not start."
+        SourceProxyStopReason.LISTENER_FAILED ->
+            "The proxy listener stopped unexpectedly. Tap Start to try again."
         SourceProxyStopReason.TOKEN_MISSING ->
-            "No source token is stored. Pair a target device first."
+            "No source token is stored. Tap Start again; the app creates one."
+        SourceProxyStopReason.TOKEN_UNREADABLE ->
+            "The source token could not be read. Open the app for details."
         SourceProxyStopReason.NONE -> "The proxy stopped."
     }
 

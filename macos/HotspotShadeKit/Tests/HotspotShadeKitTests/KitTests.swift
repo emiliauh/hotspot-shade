@@ -3,6 +3,15 @@ import Foundation
 import Network
 @testable import HotspotShadeKit
 
+private final class TestTunnelAuthorizer: TunnelStartAuthorizing, @unchecked Sendable {
+    var calls = 0
+    var failure: Error?
+    func authorizeTunnelStart() async throws {
+        calls += 1
+        if let failure { throw failure }
+    }
+}
+
 @MainActor final class KitTests: XCTestCase {
     // A status from a real running phone tunnel. The shape comes from
     // rust/src/service.rs and rust/src/gui_backend.rs.
@@ -94,18 +103,16 @@ import Network
         let number = try JSONDecoder().decode(Status.self, from: Data("{\"phone\":{\"state\":\"connected\",\"connections\":4}}".utf8))
         XCTAssertEqual(number.phone?.connections, 4)
     }
-    func testDecodesLiveDemoEngineStatus() async throws {
-        guard let path = ProcessInfo.processInfo.environment["HS_TEST_DEMO_BINARY"] else { throw XCTSkip("No demo binary provided.") }
-        let process = BackendProcess(executable: URL(fileURLWithPath: path), demo: true)
+    // The engine contract for the status fields, read from the real engine
+    // binary with its hidden test-data flag. The app never passes that flag.
+    func testDecodesLiveTestDataEngineStatus() async throws {
+        guard let path = ProcessInfo.processInfo.environment["HS_TEST_DEMO_BINARY"] else { throw XCTSkip("No engine binary provided.") }
+        let launch = try TestDataEngineLaunch(engine: path)
+        let process = launch.process
         try await process.start()
         do {
-            let port = try XCTUnwrap(process.port)
-            var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/api/status")!)
-            request.setValue("Bearer \(process.secret)", forHTTPHeaderField: "Authorization")
-            request.setValue("127.0.0.1:\(port)", forHTTPHeaderField: "Host")
-            let session = URLSession(configuration: HTTPBackend.configuration())
-            let (data, response) = try await session.data(for: request)
-            XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+            let (code, data) = try await launch.get("/api/status")
+            XCTAssertEqual(code, 200)
             let status = try JSONDecoder().decode(Status.self, from: data)
             XCTAssertEqual(status.demo, true)
             XCTAssertEqual(status.api, 1)
@@ -202,7 +209,7 @@ import Network
         row = result(paired: true, phone: .unknown, message: "A new status.")
         XCTAssertEqual(row.dashboard, DashboardState(screen: .unknown, title: "Status unavailable", subtitle: "A new status.", action: nil, pairedLine: "Paired"))
         row = result(phone: .unknown)
-        XCTAssertEqual(row.dashboard.subtitle, "The engine sent a status that this app does not know.")
+        XCTAssertEqual(row.dashboard.subtitle, "HotspotShade received a status that it does not understand.")
         // The old product name never reaches the window.
         row = result(paired: true, phone: .unknown, message: "Open Hotspot Proxy on your source device.")
         XCTAssertEqual(row.dashboard.subtitle, "Open HotspotShade on your source device.")
@@ -237,7 +244,7 @@ import Network
     }
     func testStartingAndStopping() async throws {
         let fake = FakeBackend(); fake.operationDelay = 200_000_000
-        let model = AppModel(backend: fake); fake.currentStatus = Status(paired: true, phone: Phone(state: "ready")); await model.refresh()
+        let model = AppModel(backend: fake); fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready")); await model.refresh()
         XCTAssertEqual(model.screen, .ready)
         let start = Task { await model.toggle() }; try await Task.sleep(nanoseconds: 30_000_000); XCTAssertEqual(model.screen, .starting); await start.value
         fake.currentStatus = Status(running: true, paired: true, phone: Phone(state: "connected")); await model.refresh()
@@ -246,14 +253,19 @@ import Network
     }
     func testPairingTransitionsAndErrors() async {
         let fake = FakeBackend(); let model = AppModel(backend: fake)
-        await model.beginPairing(); XCTAssertTrue(model.isPairing)
+        // This test drives every pairing read itself. A Pair press also starts
+        // the background pairing poll; stop it after each press, so a poll
+        // that wins the "paired" read cannot make this explicit refresh stale
+        // and return before the screen is updated. stopPolling also moves the
+        // pairing generation, so a poll read already in flight is ignored.
+        await model.beginPairing(); model.stopPolling(); XCTAssertTrue(model.isPairing)
         fake.currentPair = PairState(state: "confirm", code: "123 456"); await model.refreshPairing(); XCTAssertEqual(model.pairing.code, "123 456")
-        fake.currentStatus = Status(paired: true, phone: Phone(state: "ready")); fake.currentPair = PairState(state: "paired"); await model.refreshPairing(); XCTAssertFalse(model.isPairing); XCTAssertEqual(model.screen, .ready)
-        await model.beginPairing(); fake.currentPair = PairState(state: "failed", error: "No"); await model.refreshPairing(); XCTAssertEqual(model.screen, .ready)
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready")); fake.currentPair = PairState(state: "paired"); await model.refreshPairing(); XCTAssertFalse(model.isPairing); XCTAssertEqual(model.screen, .ready)
+        await model.beginPairing(); model.stopPolling(); fake.currentPair = PairState(state: "failed", error: "No"); await model.refreshPairing(); XCTAssertEqual(model.screen, .ready)
         // A status failure keeps the last screen. It becomes stale after 3 s.
         var clock = Date(timeIntervalSince1970: 100)
         let failingModel = AppModel(backend: fake, now: { clock })
-        fake.currentStatus = Status(paired: true, phone: Phone(state: "ready"))
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
         await failingModel.refresh()
         fake.statusFailure = BackendError.unauthorized
         await failingModel.refresh()
@@ -266,7 +278,7 @@ import Network
     }
     func testPairingFailureKeepsTheMessage() async {
         let fake = FakeBackend(); let model = AppModel(backend: fake)
-        fake.currentStatus = Status(paired: false, phone: Phone(state: "unpaired"))
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
         await model.beginPairing()
         fake.currentPair = PairState(state: "failed", error: "The pairing code does not match.")
         await model.refreshPairing()
@@ -311,23 +323,28 @@ import Network
         if inherited >= 0 { close(inherited) }
         await process.stop()
     }
-    func testRealDemoWhenProvided() async throws {
-        guard let path = ProcessInfo.processInfo.environment["HS_TEST_DEMO_BINARY"] else { throw XCTSkip("No demo binary provided.") }
-        let process = BackendProcess(executable: URL(fileURLWithPath: path), demo: true)
+    // A real engine binary started with its hidden test-data flag must never
+    // look like a working app engine. The launch check and the status client
+    // both refuse it, and the app starts no pairing or tunnel on its data.
+    func testAppRefusesALiveTestDataEngine() async throws {
+        guard let path = ProcessInfo.processInfo.environment["HS_TEST_DEMO_BINARY"] else { throw XCTSkip("No engine binary provided.") }
+        let launch = try TestDataEngineLaunch(engine: path)
+        let process = launch.process
         try await process.start()
-        let client = HTTPBackend(port: try XCTUnwrap(process.port), secret: process.secret)
-        let status = try await client.status()
-        XCTAssertNotNil(status.running)
-        try await client.startPairing()
-        var pair = PairState()
-        for _ in 0..<50 {
-            pair = try await client.pairState()
-            if pair.state == "paired" || pair.state == "failed" { break }
-            try await Task.sleep(nanoseconds: 200_000_000)
+        do {
+            let client = HTTPBackend(port: try XCTUnwrap(process.port), secret: process.secret)
+            do {
+                try await UserEngineCheck.verify(client)
+                XCTFail("The launch check must refuse engine test data.")
+            } catch BackendError.testDataEngine {}
+            do {
+                _ = try await client.status()
+                XCTFail("The status client must refuse engine test data.")
+            } catch BackendError.testDataEngine {}
+        } catch {
+            await process.stop()
+            throw error
         }
-        XCTAssertEqual(pair.state, "paired")
-        try await client.startTunnel(); let on = try await client.status(); XCTAssertEqual(on.running, true)
-        try await client.stopTunnel(); let off = try await client.status(); XCTAssertEqual(off.running, false)
         await process.stop()
     }
     func testStartIgnoresSIGPIPE() async throws {
@@ -394,7 +411,7 @@ import Network
     func testAutomaticPairingAndGuards() async throws {
         let fake = FakeBackend(); var clock = Date(timeIntervalSince1970: 100)
         let model = AppModel(backend: fake, now: { clock })
-        fake.currentStatus = Status(paired: false, phone: Phone(state: "unpaired"))
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
         await model.refresh(); await model.refresh(); await model.beginPairing()
         XCTAssertEqual(fake.calls.filter { $0 == "startPairing" }.count, 1)
         XCTAssertEqual(model.screen, .pairing)
@@ -416,7 +433,7 @@ import Network
     func testUnpairedStartsPairingOncePerLaunch() async {
         let fake = FakeBackend(); var clock = Date(timeIntervalSince1970: 100)
         let model = AppModel(backend: fake, now: { clock })
-        fake.currentStatus = Status(paired: false, phone: Phone(state: "unpaired"))
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
         await model.refresh(); await model.refresh()
         clock.addTimeInterval(5); await model.refresh()
         XCTAssertEqual(fake.calls.filter { $0 == "startPairing" }.count, 1)
@@ -430,7 +447,7 @@ import Network
     func testCancelStopsAutomaticPairing() async {
         let fake = FakeBackend(); var clock = Date(timeIntervalSince1970: 100)
         let model = AppModel(backend: fake, now: { clock })
-        fake.currentStatus = Status(paired: false, phone: Phone(state: "unpaired"))
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
         await model.refresh()
         XCTAssertEqual(fake.calls.filter { $0 == "startPairing" }.count, 1)
         fake.currentPair = PairState(state: "failed"); await model.refreshPairing()
@@ -443,7 +460,7 @@ import Network
     func testForgetStopsAutomaticPairing() async {
         let fake = FakeBackend(); var clock = Date(timeIntervalSince1970: 100)
         let model = AppModel(backend: fake, now: { clock })
-        fake.currentStatus = Status(paired: false, phone: Phone(state: "unpaired"))
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
         await model.refresh()
         clock.addTimeInterval(11)
         await model.forget()
@@ -453,7 +470,7 @@ import Network
     func testExplicitPairAndRelaunchRestartAutomaticPairing() async {
         let fake = FakeBackend(); let clock = Date(timeIntervalSince1970: 100)
         let model = AppModel(backend: fake, now: { clock })
-        fake.currentStatus = Status(paired: false, phone: Phone(state: "unpaired"))
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
         await model.refresh()
         await model.cancelPairing()
         XCTAssertEqual(fake.calls.filter { $0 == "startPairing" }.count, 1)
@@ -470,7 +487,7 @@ import Network
     func testNotTrustedDoesNotAutoPairAndPairAgainWorks() async {
         let fake = FakeBackend(); var clock = Date(timeIntervalSince1970: 100)
         let model = AppModel(backend: fake, now: { clock })
-        fake.currentStatus = Status(paired: true, phone: Phone(state: "not_trusted", message: "The source device rejected this target device."))
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "not_trusted", message: "The source device rejected this target device."))
         await model.refresh(); await model.refresh()
         clock.addTimeInterval(11); await model.refresh()
         XCTAssertEqual(fake.calls.filter { $0 == "startPairing" }.count, 0)
@@ -487,7 +504,7 @@ import Network
     func testPairedDoesNotSendAnotherHello() async {
         let fake = FakeBackend(); var clock = Date(timeIntervalSince1970: 100)
         let model = AppModel(backend: fake, now: { clock })
-        fake.currentStatus = Status(paired: true, phone: Phone(state: "ready"))
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
         await model.refresh(); clock.addTimeInterval(20); await model.refresh(); await model.refresh()
         XCTAssertEqual(fake.calls.filter { $0 == "startPairing" }.count, 0)
         XCTAssertEqual(model.screen, .ready)
@@ -601,12 +618,70 @@ import Network
         for enabled in [true, false] {
             let fake = FakeBackend()
             let model = AppModel(backend: fake, pingSetting: FakePingSetting(enabled))
-            fake.currentStatus = Status(paired: true, phone: Phone(state: "ready"))
+            fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
             await model.refresh()
             await model.toggle()
             XCTAssertEqual(fake.startBodies, ["{\"mode\":\"phone\",\"options\":{\"experimental_icmp\":\(enabled)}}"], "\(enabled)")
         }
     }
+    func testTurnOnAsksForAdministratorAuthorizationBeforeTheStart() async {
+        let fake = FakeBackend()
+        let elevated = FakeBackend()
+        let authorizer = TestTunnelAuthorizer()
+        let router = TunnelRoutingBackend(
+            user: fake,
+            prepareElevated: { elevated },
+            stopElevated: { .stopped },
+            authorizeStart: { try await authorizer.authorizeTunnelStart() }
+        )
+        let model = AppModel(backend: router)
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
+        await model.refresh()
+        await model.turnOn()
+        XCTAssertEqual(authorizer.calls, 1)
+        XCTAssertEqual(elevated.startBodies.count, 1)
+        XCTAssertEqual(fake.calls.filter { $0 == "startTunnel" }.count, 0)
+    }
+
+    func testTurnOnDoesNotStartWhenAdministratorAuthorizationFails() async {
+        let fake = FakeBackend()
+        let elevated = FakeBackend()
+        let authorizer = TestTunnelAuthorizer()
+        authorizer.failure = TunnelAuthorizationFailure(message: "Administrator authorization was cancelled.")
+        let router = TunnelRoutingBackend(
+            user: fake,
+            prepareElevated: { elevated },
+            stopElevated: { .stopped },
+            authorizeStart: { try await authorizer.authorizeTunnelStart() }
+        )
+        let model = AppModel(backend: router)
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
+        await model.refresh()
+        await model.turnOn()
+        XCTAssertEqual(authorizer.calls, 1)
+        XCTAssertEqual(elevated.startBodies.count, 0)
+        XCTAssertEqual(fake.calls.filter { $0 == "startTunnel" }.count, 0)
+        XCTAssertEqual(model.dashboard.subtitle, "Administrator authorization was cancelled.")
+        XCTAssertEqual(model.dashboard.action, .retry)
+    }
+
+    func testTurnOffNeverAsksForAdministratorAuthorization() async {
+        let fake = FakeBackend()
+        let authorizer = TestTunnelAuthorizer()
+        let router = TunnelRoutingBackend(
+            user: fake,
+            prepareElevated: { FakeBackend() },
+            stopElevated: { .stopped },
+            authorizeStart: { try await authorizer.authorizeTunnelStart() }
+        )
+        let model = AppModel(backend: router)
+        fake.currentStatus = Status(running: true, paired: true, phone: Phone(state: "connected"))
+        await model.refresh()
+        await model.turnOff()
+        XCTAssertEqual(authorizer.calls, 0)
+        XCTAssertEqual(fake.calls.filter { $0 == "stopTunnel" }.count, 1)
+    }
+
     func testDefaultStartKeepsPingOn() async throws {
         let fake = FakeBackend()
         try await fake.startTunnel()
@@ -668,7 +743,7 @@ import Network
         let fake = FakeBackend()
         let setting = FakePingSetting(true)
         let model = AppModel(backend: fake, pingSetting: setting)
-        fake.currentStatus = Status(paired: true, phone: Phone(state: "ready"))
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
         await model.refresh()
         await model.toggle()
         XCTAssertEqual(fake.startBodies.count, 1)

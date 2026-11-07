@@ -71,7 +71,7 @@ func message(_ payload: Data) -> Data { payload }
 
 func unframe(_ framed: Data) -> Data {
     var reader = PairingFrameReader()
-    reader.push(framed)
+    try! reader.push(framed)
     return try! reader.next()!
 }
 
@@ -103,7 +103,7 @@ func decidePending(_ phone: PairingResponder, allow: Bool, now: TimeInterval) ->
 
 @main
 struct PairingTests {
-    static let credentials = PairingCredentials(host: "172.20.10.1", port: 1080, token: Vectors.token)
+    static let credentials = PairingCredentials(host: "172.20.10.1", port: 1080, token: Vectors.token)!
 
     static func responder(trust: PairingTrustStore = MemoryTrustStore(),
                           credentials: PairingCredentials? = PairingTests.credentials) -> PairingResponder {
@@ -127,6 +127,11 @@ struct PairingTests {
         perPeerLockout()
         unknownChallengeBudget()
         peerChallengeBudget()
+        knownChallengeBudget()
+        knownRefundUsesTheProvenSession()
+        knownForgottenBeforeReveal()
+        unsupportedFlags()
+        sessionCap()
         emptyPeerIsRejected()
         receiveInvalidReleasesTheSession()
         pairingOffChargesNoBudget()
@@ -134,9 +139,17 @@ struct PairingTests {
         promptVisibility()
         deactivateCap()
         promptDebugRedaction()
+        credentialDebugRedaction()
         expiredDecisionsCannotBeApproved()
         staleDecisionCannotApproveAnotherPrompt()
         tamperedCiphertext()
+        credentialConstructorRules()
+        credentialParsingIsStrict()
+        statusRequiresLiveCredentials()
+        encodeStatusValidation()
+        sessionNonceReuse()
+        frameReaderBound()
+        frameErrorsAreTyped()
         trustStore()
         print("Pairing tests passed")
     }
@@ -205,6 +218,293 @@ struct PairingTests {
         // The window clears both budgets.
         let later = try! phone.receive(laptop.hello(), connection: 31, now: 60, active: true, peer: "peer-a")
         check(!later.close && later.frames.count == 1, "the challenge window clears both budgets")
+    }
+
+    static func knownChallengeBudget() {
+        let laptop = TestLaptop()
+        let trust = MemoryTrustStore()
+        trust.add(laptop.lS)
+        var generated = 0
+        let phone = PairingResponder(trust: trust, credentials: { credentials },
+                                     ephemeralKey: { generated += 1; return key(Vectors.pEPrivate) },
+                                     nonce: { Vectors.nonce })
+
+        // The trusted public key is public. A claim of it that never sends a
+        // proof spends the known budget, so it cannot generate keys without
+        // bound.
+        for id in 0..<PairingResponder.maximumKnownPeerChallenges {
+            let output = try! phone.receive(laptop.hello(), connection: id, now: 0, active: true, peer: "peer-a")
+            check(!output.close && output.frames.count == 1, "known challenge \(id)")
+            phone.connectionClosed(id)
+        }
+        check(generated == PairingResponder.maximumKnownPeerChallenges,
+              "one key for each known challenge")
+        let refused = try! phone.receive(laptop.hello(), connection: 20, now: 0, active: true, peer: "peer-a")
+        check(status(refused) == .busy, "the per-address known budget is spent")
+        check(generated == PairingResponder.maximumKnownPeerChallenges,
+              "a refused known challenge creates no key")
+        check(phone.nextDeadline == nil, "a refused known challenge creates no session")
+
+        // Another source address has its own budget until the global limit.
+        let other = try! phone.receive(laptop.hello(), connection: 21, now: 0, active: true, peer: "peer-b")
+        check(!other.close && other.frames.count == 1, "another address has its own known budget")
+        phone.connectionClosed(21)
+        var index = 0
+        while generated < PairingResponder.maximumKnownChallenges,
+              index < PairingResponder.maximumKnownChallenges {
+            let id = 30 + index
+            let output = try! phone.receive(laptop.hello(), connection: id, now: 0, active: true,
+                                            peer: "peer-c\(index)")
+            check(!output.close, "global known challenge \(index)")
+            phone.connectionClosed(id)
+            index += 1
+        }
+        let global = try! phone.receive(laptop.hello(), connection: 60, now: 0, active: true, peer: "peer-d")
+        check(status(global) == .busy, "the global known budget is spent")
+        check(generated == PairingResponder.maximumKnownChallenges,
+              "a globally refused challenge creates no key")
+
+        // The unknown budget is separate. An unpaired target device can still
+        // start while the known budget is spent.
+        let stranger = TestLaptop(staticKey: key(Data(repeating: 0x77, count: 32)))
+        let unknown = try! phone.receive(stranger.hello(), connection: 61, now: 0, active: true, peer: "peer-e")
+        check(!unknown.close && unknown.frames.count == 1,
+              "the known budget does not block an unknown target")
+        check(generated == PairingResponder.maximumKnownChallenges + 1,
+              "an unknown challenge uses its own budget")
+        phone.connectionClosed(61)
+
+        // The presence probe runs every few seconds. A verified proof refunds
+        // its charge, so the target's own status checks are not limited.
+        var probeGenerated = 0
+        let probe = PairingResponder(trust: trust, credentials: { credentials },
+                                     ephemeralKey: { probeGenerated += 1; return key(Vectors.pEPrivate) },
+                                     nonce: { Vectors.nonce })
+        for round in 0..<30 {
+            let now = Double(round) * 0.5
+            let challenge = try! probe.receive(laptop.hello() + Data([1]), connection: round, now: now,
+                                               active: true, peer: "172.20.10.2")
+            check(!challenge.close && challenge.frames.count == 1, "status probe \(round) gets a challenge")
+            let (reveal, _, known) = laptop.reveal(challengeFrame: challenge.frames[0])
+            check(known, "the probe sees a known challenge")
+            let proof = try! probe.receive(reveal, connection: round, now: now + 0.1,
+                                           active: true, peer: "172.20.10.2")
+            check(proof.frames.isEmpty && !proof.close, "the probe authenticates")
+            probe.connectionClosed(round)
+        }
+        check(probeGenerated == 30, "every legitimate probe gets its own key")
+
+        // A bad proof does not refund. Eight claims spend the budget and the
+        // ninth answers Busy.
+        var brokenGenerated = 0
+        let broken = PairingResponder(trust: trust, credentials: { credentials },
+                                      ephemeralKey: { brokenGenerated += 1; return key(Vectors.pEPrivate) },
+                                      nonce: { Vectors.nonce })
+        for round in 0..<PairingResponder.maximumKnownPeerChallenges {
+            let challenge = try! broken.receive(laptop.hello(), connection: round, now: 0,
+                                                active: true, peer: "peer-x")
+            let (reveal, _, _) = laptop.reveal(challengeFrame: challenge.frames[0], breakProof: true)
+            check(status(try! broken.receive(reveal, connection: round, now: 0.1,
+                                             active: true, peer: "peer-x")) == .rejected,
+                  "a bad proof is rejected")
+            broken.connectionClosed(round)
+        }
+        check(brokenGenerated == PairingResponder.maximumKnownPeerChallenges,
+              "a bad proof creates one key per claim")
+        let blocked = try! broken.receive(laptop.hello(), connection: 40, now: 0.2,
+                                          active: true, peer: "peer-x")
+        check(status(blocked) == .busy, "a bad proof does not refund its charge")
+        check(brokenGenerated == PairingResponder.maximumKnownPeerChallenges,
+              "the refused claim creates no key")
+
+        // A legitimate known pairing still gets the token under the budget.
+        let pairing = PairingResponder(trust: trust, credentials: { credentials },
+                                       ephemeralKey: { key(Vectors.pEPrivate) }, nonce: { Vectors.nonce })
+        let challenge = try! pairing.receive(laptop.hello(), connection: 1, now: 0,
+                                             active: true, peer: "172.20.10.2")
+        let (reveal, keys, _) = laptop.reveal(challengeFrame: challenge.frames[0])
+        let success = try! pairing.receive(reveal, connection: 1, now: 1, active: true,
+                                           peer: "172.20.10.2")
+        check(success.status == .ok, "a known target still receives the token")
+        let message = [UInt8](unframe(success.frames[0]))
+        check(try! PairingProtocol.open(keys, nonce: Data(message[2..<14]),
+                                        ciphertext: Data(message[14...])) == credentials,
+              "the known result holds the credentials")
+    }
+
+    static func knownRefundUsesTheProvenSession() {
+        let laptop = TestLaptop()
+        let trust = MemoryTrustStore()
+        trust.add(laptop.lS)
+        var generated = 0
+        let phone = PairingResponder(trust: trust, credentials: { credentials },
+                                     ephemeralKey: { generated += 1; return key(Vectors.pEPrivate) },
+                                     nonce: { Vectors.nonce })
+
+        // At t=0 the first known claim is charged.
+        let older = try! phone.receive(laptop.hello() + Data([1]), connection: 1, now: 0,
+                                       active: true, peer: "172.20.10.2")
+        let (olderReveal, _, olderKnown) = laptop.reveal(challengeFrame: older.frames[0])
+        check(olderKnown, "the first claim is known")
+
+        // At t=4 a second session from the same address is charged. Both
+        // sessions are live and each paid its own challenge.
+        let newer = try! phone.receive(laptop.hello() + Data([1]), connection: 2, now: 4,
+                                       active: true, peer: "172.20.10.2")
+        check(!newer.close, "the second claim gets a challenge")
+        phone.connectionClosed(2)
+
+        // Only the older session proves, before its 5 second deadline. Its
+        // refund must remove the t=0 charge, not the latest t=4 charge.
+        let proof = try! phone.receive(olderReveal, connection: 1, now: 4, active: true,
+                                       peer: "172.20.10.2")
+        check(proof.frames.isEmpty && !proof.close, "the older session authenticates")
+        phone.connectionClosed(1)
+
+        // At t=61 the t=0 charge would have expired. The unproven t=4 charge
+        // keeps its own window, so seven new claims fit and the eighth is
+        // refused. Removing the latest charge would have allowed eight.
+        for round in 0..<7 {
+            let output = try! phone.receive(laptop.hello() + Data([1]), connection: 10 + round,
+                                            now: 61, active: true, peer: "172.20.10.2")
+            check(!output.close, "claim \(round) after the refund")
+            phone.connectionClosed(10 + round)
+        }
+        let busy = try! phone.receive(laptop.hello() + Data([1]), connection: 30, now: 61,
+                                      active: true, peer: "172.20.10.2")
+        check(status(busy) == .busy, "the unproven charge still counts")
+        check(generated == 9, "one key for each allowed claim")
+    }
+
+    static func knownForgottenBeforeReveal() {
+        let laptop = TestLaptop()
+        let trust = MemoryTrustStore()
+        trust.add(laptop.lS)
+        let phone = responder(trust: trust)
+        // The target is trusted at HELLO. The person taps Forget before REVEAL.
+        let challenge = phone.receive(laptop.hello(), connection: 1, now: 0, active: true)
+        let (reveal, _, known) = laptop.reveal(challengeFrame: challenge.frames[0])
+        check(known, "the challenge marks the target as known")
+        trust.remove(laptop.lS)
+        let result = phone.receive(reveal, connection: 1, now: 1, active: true)
+        check(status(result) == .rejected && result.close, "a forgotten target gets no token")
+        check(result.frames.count == 1, "the refusal is one RESULT frame")
+        check(!trust.contains(laptop.lS), "the refusal does not restore trust")
+        check(phone.pendingPrompt == nil, "a forgotten target gets no prompt")
+        // The session is gone, so a later status frame on the same connection
+        // is refused too.
+        let later = phone.receive(Data([5]) + Data(repeating: 0x44, count: 12) + Data(count: 32),
+                                  connection: 1, now: 2, active: true)
+        check(status(later) == .rejected, "no authenticated session remains")
+
+        // The other order is fail-closed too. A target that was unknown at
+        // HELLO and becomes trusted before REVEAL still needs the prompt.
+        let lateTrust = MemoryTrustStore()
+        let late = responder(trust: lateTrust)
+        let second = late.receive(laptop.hello(), connection: 2, now: 0, active: true)
+        let (secondReveal, _, knownAtHello) = laptop.reveal(challengeFrame: second.frames[0])
+        check(!knownAtHello, "the target was unknown at HELLO")
+        lateTrust.add(laptop.lS)
+        let waiting = late.receive(secondReveal, connection: 2, now: 1, active: true)
+        check(waiting.frames.isEmpty && !waiting.close, "a key added after HELLO still needs the prompt")
+        let prompt = late.pendingPrompt
+        check(prompt != nil, "the prompt is shown")
+        check(decidePending(late, allow: true, now: 2)?.status == .ok, "the prompt can still approve")
+        check(lateTrust.count == 1 && lateTrust.contains(laptop.lS), "the approval trusts the key once")
+    }
+
+    static func unsupportedFlags() {
+        let laptop = TestLaptop()
+        let trust = MemoryTrustStore()
+        var generated = 0
+        let phone = PairingResponder(trust: trust, credentials: { credentials },
+                                     ephemeralKey: { generated += 1; return key(Vectors.pEPrivate) },
+                                     nonce: { Vectors.nonce })
+        // Flags 3 would mean status-only and forget at the same time.
+        let unknown = try! phone.receive(laptop.hello() + Data([3]), connection: 1, now: 0,
+                                         active: true, peer: "a")
+        check(status(unknown) == .rejected && unknown.close, "unknown flags 3 is rejected")
+        check(unknown.status == nil, "the flags 3 refusal is not logged as a status")
+        check(generated == 0 && phone.nextDeadline == nil, "flags 3 creates no key and no session")
+        // A trusted key does not make flags 3 valid.
+        trust.add(laptop.lS)
+        let known = try! phone.receive(laptop.hello() + Data([3]), connection: 2, now: 1,
+                                       active: true, peer: "a")
+        check(status(known) == .rejected, "known flags 3 is rejected")
+        check(generated == 0, "known flags 3 creates no key")
+        // An undefined high bit fails the HELLO shape check.
+        let high = try! phone.receive(laptop.hello() + Data([4]), connection: 3, now: 2,
+                                      active: true, peer: "a")
+        check(status(high) == .rejected, "an undefined HELLO flag is rejected")
+        check(generated == 0, "an undefined flag creates no key")
+
+        // A status request must end with a zero flag byte.
+        let info = PairingPhoneInfo(proxyRunning: true, foreground: true, connections: 1,
+                                    port: 31000, host: "172.20.10.1")
+        let statusTrust = MemoryTrustStore()
+        statusTrust.add(laptop.lS)
+        let statusPhone = PairingResponder(trust: statusTrust, credentials: { credentials },
+                                           ephemeralKey: { key(Vectors.pEPrivate) },
+                                           nonce: { Vectors.nonce }, status: { info })
+        let challenge = try! statusPhone.receive(laptop.hello() + Data([1]), connection: 1, now: 0,
+                                                 active: true, peer: "a")
+        let (reveal, keys, _) = laptop.reveal(challengeFrame: challenge.frames[0])
+        let authenticated = try! statusPhone.receive(reveal, connection: 1, now: 1, active: true, peer: "a")
+        check(!authenticated.close, "the status handshake authenticates")
+        let nonce = Data(repeating: 0x44, count: 12)
+        let challengeBytes = Data(repeating: 0x55, count: 16)
+        let refusedCiphertext = try! PairingProtocol.sealMessage(keys, nonce: nonce,
+                                                                 plaintext: challengeBytes + Data([1]))
+        let refused = try! statusPhone.receive(Data([5]) + nonce + refusedCiphertext, connection: 1,
+                                               now: 2, active: true, peer: "a")
+        check(status(refused) == .rejected, "a nonzero status flag is rejected")
+        check(statusTrust.contains(laptop.lS), "the refusal keeps trust")
+        let again = try! statusPhone.receive(Data([5]) + nonce + refusedCiphertext, connection: 1,
+                                             now: 3, active: true, peer: "a")
+        check(status(again) == .rejected, "the refused session is gone")
+
+        // A replayed status request finds no session after the first answer.
+        let replayChallenge = try! statusPhone.receive(laptop.hello() + Data([1]), connection: 2, now: 4,
+                                                       active: true, peer: "a")
+        let (replayReveal, replayKeys, _) = laptop.reveal(challengeFrame: replayChallenge.frames[0])
+        _ = try! statusPhone.receive(replayReveal, connection: 2, now: 5, active: true, peer: "a")
+        let requestNonce = Data(repeating: 0x43, count: 12)
+        let request = try! PairingProtocol.sealMessage(replayKeys, nonce: requestNonce,
+                                                       plaintext: challengeBytes + Data([0]))
+        let answered = try! statusPhone.receive(Data([5]) + requestNonce + request, connection: 2,
+                                                now: 6, active: true, peer: "a")
+        check(answered.frames.count == 1 && answered.close, "a valid status request is answered")
+        let replayed = try! statusPhone.receive(Data([5]) + requestNonce + request, connection: 2,
+                                                now: 7, active: true, peer: "a")
+        check(status(replayed) == .rejected, "a replayed status request is refused")
+    }
+
+    static func sessionCap() {
+        let laptop = TestLaptop()
+        let trust = MemoryTrustStore()
+        trust.add(laptop.lS)
+        var generated = 0
+        let phone = PairingResponder(trust: trust, credentials: { credentials },
+                                     ephemeralKey: { generated += 1; return key(Vectors.pEPrivate) },
+                                     nonce: { Vectors.nonce })
+        var challenges: [Data] = []
+        for id in 0..<PairingResponder.maximumSessions {
+            let output = try! phone.receive(laptop.hello(), connection: id, now: 0,
+                                            active: true, peer: "peer-\(id)")
+            check(!output.close && output.frames.count == 1, "session \(id) is allowed")
+            challenges.append(output.frames[0])
+        }
+        let over = try! phone.receive(laptop.hello(), connection: 10, now: 0, active: true, peer: "peer-10")
+        check(status(over) == .busy && over.close, "a HELLO over the session cap is refused")
+        check(generated == PairingResponder.maximumSessions, "the session cap creates no extra key")
+        // A live session can still finish, and closing it frees the slot.
+        let (reveal, _, _) = laptop.reveal(challengeFrame: challenges[0])
+        check(try! phone.receive(reveal, connection: 0, now: 1, active: true,
+                                 peer: "peer-0").status == .ok,
+              "an existing session still completes")
+        phone.connectionClosed(0)
+        let fresh = try! phone.receive(laptop.hello(), connection: 11, now: 2, active: true, peer: "peer-11")
+        check(!fresh.close && fresh.frames.count == 1, "closing a session frees the slot")
     }
 
     static func emptyPeerIsRejected() {
@@ -431,6 +731,36 @@ struct PairingTests {
         check(!String(describing: prompt).contains(prompt.code), "the display text hides the code")
     }
 
+    static func credentialDebugRedaction() {
+        let credentialsText = String(reflecting: credentials)
+        check(!credentialsText.contains(Vectors.token), "the credentials debug text hides the token")
+        check(credentialsText.contains("[redacted]"), "the credentials debug text marks the redaction")
+        check(credentialsText.contains("172.20.10.1") && credentialsText.contains("1080"),
+              "the credentials debug text keeps host and port")
+        check(!String(describing: credentials).contains(Vectors.token),
+              "the credentials display text hides the token")
+
+        let laptop = TestLaptop()
+        let keys = laptop.keys(pE: key(Vectors.pEPrivate).publicKey.rawRepresentation)
+        let keysText = String(reflecting: keys)
+        check(!keysText.contains(hex(keys.kEnc)), "the key debug text hides k_enc")
+        check(!keysText.contains(hex(keys.kProof)), "the key debug text hides k_proof")
+        check(!keysText.contains(hex(keys.sas)), "the key debug text hides the SAS bytes")
+        check(keysText.contains("[redacted]"), "the key debug text marks the redaction")
+
+        // An Output frame can hold the sealed credentials. Its text shows a
+        // frame count, not the bytes.
+        let phone = responder()
+        let challenge = phone.receive(laptop.hello(), connection: 1, now: 0, active: true)
+        let (reveal, _, _) = laptop.reveal(challengeFrame: challenge.frames[0])
+        _ = phone.receive(reveal, connection: 1, now: 1, active: true)
+        let allowed = decidePending(phone, allow: true, now: 2)!
+        let outputText = String(reflecting: allowed)
+        check(!outputText.contains(hex(allowed.frames[0])), "the output debug text hides the frame bytes")
+        check(outputText.contains("frame_count: 1"), "the output debug text shows the frame count")
+        check(!outputText.contains(Vectors.token), "the output debug text hides the token")
+    }
+
     static func expiredDecisionsCannotBeApproved() {
         let laptop = TestLaptop()
         let trust = MemoryTrustStore()
@@ -594,16 +924,16 @@ struct PairingTests {
 
     static func framing() {
         var reader = PairingFrameReader()
-        let framed = PairingProtocol.frame(Data([1, 2, 3]))
-        reader.push(framed.prefix(3))
+        let framed = try! PairingProtocol.frame(Data([1, 2, 3]))
+        try! reader.push(framed.prefix(3))
         check((try? reader.next()) == .some(nil), "partial frame waits")
-        reader.push(framed.suffix(from: 3))
+        try! reader.push(framed.suffix(from: 3))
         check((try? reader.next()) == .some(Data([1, 2, 3])), "complete frame")
         var big = PairingFrameReader()
-        big.push(Data([0x02, 0x01]))
+        try! big.push(Data([0x02, 0x01]))
         check((try? big.next()) == nil, "oversize frame throws")
         var empty = PairingFrameReader()
-        empty.push(Data([0, 0]))
+        try! empty.push(Data([0, 0]))
         check((try? empty.next()) == nil, "empty frame throws")
         let plain = try! PairingProtocol.encodeCredentials(credentials)
         check(try! PairingProtocol.decodeCredentials(plain) == credentials, "plaintext round trip")
@@ -839,8 +1169,10 @@ struct PairingTests {
         let trust = MemoryTrustStore()
         let laptop = TestLaptop(); trust.add(laptop.lS)
         let info = PairingPhoneInfo(proxyRunning: true, foreground: false, connections: 2, port: 1080, host: "172.20.10.1", sequence: 1)
+        // The result and the status answer share one session, so the nonces differ.
+        var nonceByte: UInt8 = 0x65
         let phone = PairingResponder(trust: trust, credentials: { credentials },
-                                     ephemeralKey: { key(Vectors.pEPrivate) }, nonce: { Data(repeating: 0x66, count: 12) },
+                                     ephemeralKey: { key(Vectors.pEPrivate) }, nonce: { nonceByte += 1; return Data(repeating: nonceByte, count: 12) },
                                      status: { info })
         let c = phone.receive(laptop.hello(), connection: 1, now: 0, active: false)
         let (reveal, keys, _) = laptop.reveal(challengeFrame: c.frames[0])
@@ -883,6 +1215,226 @@ struct PairingTests {
         message[20] ^= 1
         let nonce = Data(message[2..<14]), ciphertext = Data(message[14...])
         check((try? PairingProtocol.open(keys, nonce: nonce, ciphertext: ciphertext)) == nil, "tampered ciphertext fails")
+    }
+
+    // MARK: Parity with rust/src/source_pairing.rs and the Kotlin responder
+
+    /// Run a known, status-only handshake and return the phone, the keys, and a
+    /// sealed status request for the connection.
+    static func statusSession(credentials liveCredentials: @escaping () -> PairingCredentials?,
+                              status info: PairingPhoneInfo?,
+                              nonce: @escaping () -> Data = { Data(repeating: 0x66, count: 12) })
+        -> (PairingResponder, Data) {
+        let laptop = TestLaptop()
+        let trust = MemoryTrustStore()
+        trust.add(laptop.lS)
+        let phone = PairingResponder(trust: trust, credentials: liveCredentials,
+                                     ephemeralKey: { key(Vectors.pEPrivate) }, nonce: nonce,
+                                     status: { info })
+        let challenge = try! phone.receive(laptop.hello() + Data([1]), connection: 1, now: 0, active: true, peer: "a")
+        let (reveal, keys, _) = laptop.reveal(challengeFrame: challenge.frames[0])
+        let proof = try! phone.receive(reveal, connection: 1, now: 1, active: true, peer: "a")
+        check(proof.frames.isEmpty && !proof.close, "the status-only handshake authenticates")
+        let request = try! PairingProtocol.sealMessage(keys, nonce: Data(repeating: 0x44, count: 12),
+                                                       plaintext: Data(repeating: 0x55, count: 16) + Data([0]))
+        return (phone, Data([5]) + Data(repeating: 0x44, count: 12) + request)
+    }
+
+    /// Item 1: the credential constructor follows the Rust and Kotlin rule.
+    static func credentialConstructorRules() {
+        let token = Vectors.token
+        check(PairingCredentials(host: "172.20.10.1", port: 1024, token: token) != nil, "port 1024 is allowed")
+        check(PairingCredentials(host: "172.20.10.1", port: 65535, token: token) != nil, "port 65535 is allowed")
+        check(PairingCredentials(host: "255.255.255.255", port: 1080, token: token) != nil, "broadcast is not refused, as in Rust")
+        for port: UInt16 in [0, 1, 80, 1023, 18090] {
+            check(PairingCredentials(host: "172.20.10.1", port: port, token: token) == nil, "port \(port) is refused")
+        }
+        for host in ["", "0.0.0.0", "224.0.0.1", "239.255.255.255", "172.20.10.01", "172.20.10", "172.20.10.1.5",
+                     "256.1.1.1", "::1", "localhost", "172.20.10.1%en0", " 172.20.10.1", "172.20.10.1 ",
+                     "172.20.10.-1", "+1.2.3.4", "\u{0661}.\u{0662}.\u{0663}.\u{0664}", "1.2.3.4\n"] {
+            check(PairingCredentials(host: host, port: 1080, token: token) == nil, "host \(host.debugDescription) is refused")
+        }
+        check(PairingCredentials(host: "172.20.10.1", port: 1080, token: "") == nil, "an empty token is refused")
+        check(PairingCredentials(host: "172.20.10.1", port: 1080, token: String(repeating: "a", count: 255)) != nil, "a 255 byte token is allowed")
+        check(PairingCredentials(host: "172.20.10.1", port: 1080, token: String(repeating: "a", count: 256)) == nil, "a 256 byte token is refused")
+        for bad in ["caf\u{e9}", "a b", "tab\t", "del\u{7f}", "nul\u{0}", "line\n", "\u{1F600}"] {
+            check(PairingCredentials(host: "172.20.10.1", port: 1080, token: bad) == nil, "token \(bad.debugDescription) is refused")
+        }
+        check(PairingCredentials(host: "172.20.10.1", port: 1080, token: "!~") != nil, "the printable ASCII ends are allowed")
+    }
+
+    /// Item 2: the RESULT plaintext parser is strict, as in rust/src/pairing.rs.
+    static func credentialParsingIsStrict() {
+        func plain(port: UInt16 = 1080, token: [UInt8], host: [UInt8]) -> Data {
+            Data([UInt8(port >> 8), UInt8(port & 0xff), UInt8(token.count)] + token + [UInt8(host.count)] + host)
+        }
+        let token = [UInt8](Vectors.token.utf8)
+        let host = [UInt8]("172.20.10.1".utf8)
+        check((try? PairingProtocol.decodeCredentials(plain(token: token, host: host))) == credentials, "the valid plaintext parses")
+        // The wire format keeps what Rust keeps: only port 0 is refused.
+        let lowPort = try? PairingProtocol.decodeCredentials(plain(port: 80, token: token, host: host))
+        check(lowPort?.port == 80, "a low wire port parses, as in Rust")
+        check((try? PairingProtocol.decodeCredentials(plain(port: 0, token: token, host: host))) == nil, "port 0 is refused")
+        for bad: [UInt8] in [[0xc3, 0xa9], [0x20, 0x61], [0x61, 0x7f], [0x61, 0x09], [0xff, 0xfe]] {
+            check((try? PairingProtocol.decodeCredentials(plain(token: bad, host: host))) == nil, "token bytes \(bad) are refused")
+        }
+        for badHost in ["example.com", "172.20.10.01", "256.1.1.1", "1.2.3", "::1", "172.20.10.1%en0", "1.2.3.4 ", "\u{0661}.2.3.4"] {
+            check((try? PairingProtocol.decodeCredentials(plain(token: token, host: [UInt8](badHost.utf8)))) == nil,
+                  "host \(badHost.debugDescription) is refused")
+        }
+        check((try? PairingProtocol.decodeCredentials(plain(token: token, host: [0xff, 0xfe, 0xfd, 0xfc]))) == nil, "a non-UTF-8 host is refused")
+        // The Rust parser does not apply the usable-host rule. Neither does this one.
+        check((try? PairingProtocol.decodeCredentials(plain(token: token, host: [UInt8]("0.0.0.0".utf8)))) != nil, "the wire parser keeps the Rust host rule")
+    }
+
+    /// Items 3, 4 and 5 at the responder: the status answer needs live
+    /// credentials that match the status host. A refusal sends status 3.
+    static func statusRequiresLiveCredentials() {
+        let info = PairingPhoneInfo(proxyRunning: true, foreground: true, connections: 1, port: 31000, host: "172.20.10.1")
+        var live: PairingCredentials? = credentials
+        let (phone, request) = statusSession(credentials: { live }, status: info)
+        live = nil
+        let missing = try! phone.receive(request, connection: 1, now: 2, active: true, peer: "a")
+        check(status(missing) == .rejected && missing.close, "a status request without live credentials is Rejected")
+        check(phone.nextDeadline == nil, "the refused status request leaves no session")
+
+        // A different host in the status than in the credentials.
+        let otherHost = PairingPhoneInfo(proxyRunning: true, foreground: true, connections: 1, port: 31000, host: "172.20.10.2")
+        let (mismatchPhone, mismatchRequest) = statusSession(credentials: { credentials }, status: otherHost)
+        let mismatch = try! mismatchPhone.receive(mismatchRequest, connection: 1, now: 2, active: true, peer: "a")
+        check(status(mismatch) == .rejected && mismatch.close, "a status host that differs from the credentials is Rejected")
+
+        // A new proxy port is allowed: the target device learns it here.
+        let (okPhone, okRequest) = statusSession(credentials: { credentials }, status: info)
+        let answered = try! okPhone.receive(okRequest, connection: 1, now: 2, active: true, peer: "a")
+        check(answered.frames.count == 1 && answered.close && answered.status == nil, "a matching status is answered")
+        check(info.port != credentials.port, "the answered status carries a different port than the credentials")
+
+        // No status provider.
+        let (nilPhone, nilRequest) = statusSession(credentials: { credentials }, status: nil)
+        check(status(try! nilPhone.receive(nilRequest, connection: 1, now: 2, active: true, peer: "a")) == .rejected,
+              "no status provider is Rejected")
+    }
+
+    /// Item 4: encodeStatus checks the port and the host, and counts UTF-8 bytes.
+    static func encodeStatusValidation() {
+        let challenge = Data(repeating: 0x55, count: 16)
+        func info(port: UInt16 = 1080, host: String = "172.20.10.1") -> PairingPhoneInfo {
+            PairingPhoneInfo(proxyRunning: true, foreground: true, connections: 1, port: port, host: host)
+        }
+        check((try? PairingProtocol.encodeStatus(info(), challenge: challenge)) != nil, "a valid status encodes")
+        for port: UInt16 in [0, 80, 1023, 18090] {
+            check((try? PairingProtocol.encodeStatus(info(port: port), challenge: challenge)) == nil, "status port \(port) is refused")
+        }
+        for host in ["", "0.0.0.0", "224.0.0.1", "172.20.10.01", "example.com", "172.20.10.1%en0",
+                     String(repeating: "\u{e9}", count: 11), "172.20.10.1" + String(repeating: "\u{e9}", count: 5)] {
+            check((try? PairingProtocol.encodeStatus(info(host: host), challenge: challenge)) == nil,
+                  "status host \(host.debugDescription) is refused")
+        }
+        // 11 characters, 22 UTF-8 bytes. A Character count would let it pass.
+        let wide = String(repeating: "\u{e9}", count: 11)
+        check(wide.count <= 21 && wide.utf8.count > 21, "the wide host is short in characters and long in bytes")
+        check((try? PairingProtocol.encodeStatus(info(), challenge: Data(count: 15))) == nil, "a short challenge is refused")
+
+        // At the responder an unusable status port ends the session with no
+        // reply, as the Rust responder returns an error there.
+        let (phone, request) = statusSession(credentials: { credentials }, status: info(port: 80))
+        let output = try! phone.receive(request, connection: 1, now: 2, active: true, peer: "a")
+        check(output.frames.isEmpty && output.close && output.status == nil, "an unusable status ends the session with no reply")
+        check(phone.nextDeadline == nil, "the failed status leaves no session")
+    }
+
+    /// Item 5: a repeated nonce, a short nonce, or a fifth nonce is refused.
+    static func sessionNonceReuse() {
+        let used = (0..<4).map { Data(repeating: UInt8($0), count: 12) }
+        check(PairingResponder.isFreshNonce(Data(repeating: 9, count: 12), used: []), "a first nonce is fresh")
+        check(PairingResponder.isFreshNonce(Data(repeating: 9, count: 12), used: Array(used.prefix(3))), "a fourth nonce is fresh")
+        check(!PairingResponder.isFreshNonce(Data(repeating: 9, count: 12), used: used), "a fifth nonce is refused")
+        check(!PairingResponder.isFreshNonce(used[1], used: Array(used.prefix(2))), "a repeated nonce is refused")
+        check(!PairingResponder.isFreshNonce(Data(repeating: 9, count: 11), used: []), "an 11 byte nonce is refused")
+        check(!PairingResponder.isFreshNonce(Data(repeating: 9, count: 13), used: []), "a 13 byte nonce is refused")
+
+        // Known target, status allowed: the result and the status answer share
+        // one session. A constant nonce repeats, so the status answer is refused.
+        let laptop = TestLaptop()
+        let trust = MemoryTrustStore()
+        trust.add(laptop.lS)
+        let info = PairingPhoneInfo(proxyRunning: true, foreground: true, connections: 1, port: 1080, host: "172.20.10.1")
+        func run(nonce: @escaping () -> Data) -> (PairingResponder.Output, PairingResponder.Output) {
+            let phone = PairingResponder(trust: trust, credentials: { credentials },
+                                         ephemeralKey: { key(Vectors.pEPrivate) }, nonce: nonce, status: { info })
+            let challenge = try! phone.receive(laptop.hello(), connection: 1, now: 0, active: true, peer: "a")
+            let (reveal, keys, _) = laptop.reveal(challengeFrame: challenge.frames[0])
+            let result = try! phone.receive(reveal, connection: 1, now: 1, active: true, peer: "a")
+            let requestNonce = Data(repeating: 0x44, count: 12)
+            let sealed = try! PairingProtocol.sealMessage(keys, nonce: requestNonce, plaintext: Data(repeating: 0x55, count: 16) + Data([0]))
+            let answer = try! phone.receive(Data([5]) + requestNonce + sealed, connection: 1, now: 2, active: true, peer: "a")
+            return (result, answer)
+        }
+        let (firstResult, reused) = run(nonce: { Vectors.nonce })
+        check(firstResult.status == .ok && firstResult.frames.count == 1, "the first nonce seals the result")
+        check(reused.frames.isEmpty && reused.close && reused.status == nil, "a reused nonce ends the session with no reply")
+        var counter: UInt8 = 0x70
+        let (secondResult, answered) = run(nonce: { counter += 1; return Data(repeating: counter, count: 12) })
+        check(secondResult.status == .ok, "distinct nonces seal the result")
+        check(answered.frames.count == 1 && answered.close, "a distinct nonce seals the status answer")
+
+        // A short nonce from the source ends an unknown pairing with no reply
+        // and adds no trust.
+        let freshTrust = MemoryTrustStore()
+        let short = PairingResponder(trust: freshTrust, credentials: { credentials },
+                                     ephemeralKey: { key(Vectors.pEPrivate) }, nonce: { Data(repeating: 1, count: 11) })
+        let challenge = try! short.receive(laptop.hello(), connection: 1, now: 0, active: true, peer: "a")
+        let (reveal, _, _) = laptop.reveal(challengeFrame: challenge.frames[0])
+        _ = try! short.receive(reveal, connection: 1, now: 1, active: true, peer: "a")
+        let denied = decidePending(short, allow: true, now: 2)
+        check(denied != nil && denied!.frames.isEmpty && denied!.close && denied!.status == nil,
+              "an unusable nonce ends the approved pairing with no reply")
+        check(freshTrust.count == 0, "an unusable nonce adds no trust")
+        check(short.nextDeadline == nil, "the failed pairing leaves no session")
+    }
+
+    /// Item 6: the frame reader holds at most 4 * (2 + 512) bytes.
+    static func frameReaderBound() {
+        check(PairingProtocol.maxBuffered == 2056, "the buffer cap is 2056 bytes")
+        var reader = PairingFrameReader()
+        // A prefix that names a complete 512 byte frame, then filler. The reader
+        // does not parse until next(), so the cap is the only limit here.
+        try! reader.push(Data(count: 2056))
+        check(reader.bufferedCount == 2056, "the reader holds the full cap")
+        check((try? reader.push(Data([0]))) == nil, "one byte past the cap throws")
+        check(reader.bufferedCount == 2056, "a refused push keeps the buffer")
+        var once = PairingFrameReader()
+        check((try? once.push(Data(count: 2057))) == nil, "one push past the cap throws")
+        check(once.bufferedCount == 0, "a refused push adds nothing")
+        var split = PairingFrameReader()
+        try! split.push(Data(count: 2000))
+        check((try? split.push(Data(count: 57))) == nil, "a push that would pass the cap throws")
+        try! split.push(Data(count: 56))
+        check(split.bufferedCount == 2056, "a push to the cap is allowed")
+        // Draining frames frees space.
+        var drain = PairingFrameReader()
+        let framed = try! PairingProtocol.frame(Data(repeating: 7, count: 512))
+        for _ in 0..<3 { try! drain.push(framed) }
+        for _ in 0..<3 { check((try! drain.next())?.count == 512, "a full frame drains") }
+        check(drain.bufferedCount == 0, "the drained reader is empty")
+        try! drain.push(Data(count: 2056))
+    }
+
+    /// Item 7: an outgoing frame error is a typed error, not a crash.
+    static func frameErrorsAreTyped() {
+        check((try? PairingProtocol.frame(Data())) == nil, "an empty payload throws")
+        check((try? PairingProtocol.frame(Data(count: 513))) == nil, "an oversize payload throws")
+        do {
+            _ = try PairingProtocol.frame(Data())
+            check(false, "the empty frame did not throw")
+        } catch let error as PairingError {
+            check(!error.reason.isEmpty, "the frame error is a PairingError with a reason")
+        } catch {
+            check(false, "the frame error is a PairingError")
+        }
+        check((try? PairingProtocol.frame(Data(count: 512)))?.count == 514, "a 512 byte payload frames")
+        check((try? PairingProtocol.frame(Data([1]))) == Data([0, 1, 1]), "a one byte payload frames")
     }
 
     static func trustStore() {

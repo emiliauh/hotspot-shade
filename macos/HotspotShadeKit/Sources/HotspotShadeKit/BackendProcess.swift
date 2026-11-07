@@ -4,14 +4,18 @@ import Darwin
 
 public final class BackendProcess {
     private let executable: URL
-    private let demo: Bool
     private var pid: pid_t = 0
     private var parentWrite: Int32 = -1
     private var directory: URL?
     private var attempts = 0
+    private var handoffRead: Int32 = -1
     public private(set) var secret = ""
     public private(set) var port: UInt16?
-    public init(executable: URL, demo: Bool = false) { self.executable = executable; self.demo = demo }
+    public init(executable: URL) { self.executable = executable }
+    // The app end of the private pairing handoff. The engine holds the write
+    // end. The app passes this descriptor to the protected helper over XPC and
+    // never reads it. -1 means the engine has no handoff channel.
+    public var handoffReadDescriptor: Int32 { handoffRead }
     public var isRunning: Bool {
         guard pid > 0 else { return false }
         var status: Int32 = 0
@@ -30,24 +34,34 @@ public final class BackendProcess {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hotspotshade-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700]); directory = dir
         let portFile = dir.appendingPathComponent("port")
-        var token = [Int32](repeating: -1, count: 2), parent = [Int32](repeating: -1, count: 2)
+        var token = [Int32](repeating: -1, count: 2), parent = [Int32](repeating: -1, count: 2), handoff = [Int32](repeating: -1, count: 2)
         guard pipe(&token) == 0 else { throw BackendError.response("Cannot create engine pipes.") }
         guard pipe(&parent) == 0 else { close(token[0]); close(token[1]); throw BackendError.response("Cannot create engine pipes.") }
+        guard socketpair(AF_UNIX, SOCK_STREAM, 0, &handoff) == 0 else {
+            close(token[0]); close(token[1]); close(parent[0]); close(parent[1])
+            throw BackendError.response("Cannot create the pairing handoff.")
+        }
         let tokenRead = fcntl(token[0], F_DUPFD_CLOEXEC, 10)
         let parentRead = fcntl(parent[0], F_DUPFD_CLOEXEC, 10)
         close(token[0]); close(parent[0])
-        guard tokenRead >= 0, parentRead >= 0 else { close(token[1]); close(parent[1]); close(tokenRead); close(parentRead); throw BackendError.response("Cannot create engine pipes.") }
+        guard tokenRead >= 0, parentRead >= 0 else { close(token[1]); close(parent[1]); if handoff[0] >= 0 { close(handoff[0]) }; if handoff[1] >= 0 { close(handoff[1]) }; close(tokenRead); close(parentRead); throw BackendError.response("Cannot create engine pipes.") }
         _ = fcntl(token[1], F_SETFD, FD_CLOEXEC); _ = fcntl(parent[1], F_SETFD, FD_CLOEXEC)
+        if handoff[0] >= 0 {
+            _ = fcntl(handoff[0], F_SETFD, FD_CLOEXEC)
+            _ = fcntl(handoff[1], F_SETFD, FD_CLOEXEC)
+        }
         var actions: posix_spawn_file_actions_t?
         posix_spawn_file_actions_init(&actions)
         // The child needs only these descriptors. The spawn closes the others.
         for fd in Int32(0)..<3 where fcntl(fd, F_GETFD) != -1 { posix_spawn_file_actions_addinherit_np(&actions, fd) }
         posix_spawn_file_actions_adddup2(&actions, tokenRead, 3)
         posix_spawn_file_actions_adddup2(&actions, parentRead, 4)
+        if handoff[1] >= 0 { posix_spawn_file_actions_adddup2(&actions, handoff[1], 5) }
         posix_spawn_file_actions_addclose(&actions, tokenRead); posix_spawn_file_actions_addclose(&actions, parentRead)
-        let args = [executable.path, "gui", "--no-open", "--port", "0", "--port-file", portFile.path, "--token-fd", "3", "--parent-fd", "4"] + (demo ? ["--demo"] : [])
+        if handoff[1] >= 0 { posix_spawn_file_actions_addclose(&actions, handoff[1]) }
+        let args = [executable.path, "gui", "--no-open", "--port", "0", "--port-file", portFile.path, "--token-fd", "3", "--parent-fd", "4", "--handoff-fd", "5"]
         let argv = args.map { strdup($0) } + [nil]
-        defer { for arg in argv { free(arg) }; posix_spawn_file_actions_destroy(&actions); if tokenRead >= 0 { close(tokenRead) }; if parentRead >= 0 { close(parentRead) } }
+        defer { for arg in argv { free(arg) }; posix_spawn_file_actions_destroy(&actions); if tokenRead >= 0 { close(tokenRead) }; if parentRead >= 0 { close(parentRead) }; if handoff[1] >= 0 { close(handoff[1]) } }
         var attributes: posix_spawnattr_t?
         posix_spawnattr_init(&attributes)
         var defaults = sigset_t()
@@ -59,8 +73,9 @@ public final class BackendProcess {
         defer { posix_spawnattr_destroy(&attributes) }
         var child: pid_t = 0
         let result = posix_spawn(&child, executable.path, &actions, &attributes, argv, environ)
-        guard result == 0 else { close(token[1]); close(parent[1]); throw BackendError.response("Cannot start the engine.") }
+        guard result == 0 else { close(token[1]); close(parent[1]); if handoff[0] >= 0 { close(handoff[0]); handoff[0] = -1 }; throw BackendError.response("Cannot start the engine.") }
         pid = child; parentWrite = parent[1]
+        if handoff[0] >= 0 { handoffRead = handoff[0] }
         let bytes = Array((secret + "\n").utf8)
         var sent = 0, failure: Int32 = 0
         while sent < bytes.count {
@@ -86,9 +101,10 @@ public final class BackendProcess {
         let deadline = Date().addingTimeInterval(60)
         while isRunning && Date() < deadline { try? await Task.sleep(nanoseconds: 50_000_000) }
         if parentWrite >= 0 { close(parentWrite); parentWrite = -1 }
+        if handoffRead >= 0 { close(handoffRead); handoffRead = -1 }
         port = nil
         if !isRunning { if let directory { try? FileManager.default.removeItem(at: directory) }; directory = nil }
     }
     func closeParentPipe() { if parentWrite >= 0 { close(parentWrite); parentWrite = -1 } }
-    deinit { closeParentPipe() }
+    deinit { closeParentPipe(); if handoffRead >= 0 { close(handoffRead) } }
 }

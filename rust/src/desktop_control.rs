@@ -160,6 +160,122 @@
 //! request end a session. A caller that needs a deadline must run its own
 //! watchdog and request [`CancelReason::LocalStop`].
 //!
+//! # Bounded output
+//!
+//! [`ControlServer::serve`] writes through a generic [`Write`]. A full socket
+//! or pipe can block that call forever. On Unix, use
+//! `ControlServer::serve_fd` when the output must have a bound. It requires an
+//! open, non-listening `AF_UNIX` stream socket; the private channel is an
+//! `AF_UNIX` socketpair. It waits for `POLLOUT` with `poll(2)`
+//! and applies one absolute deadline to each frame. The deadline covers one
+//! frame, not the session, so a peer that reads slowly can still stretch a
+//! session across many frames. It checks the
+//! [`CancelToken`] between poll waits, so parent loss and a local stop end a
+//! blocked output within [`SESSION_POLL_INTERVAL`] plus scheduler delay. It
+//! handles `EINTR`, `EAGAIN`, and short writes, and it writes each frame once
+//! from a tracked offset. It never retries a partial frame, so it cannot send
+//! the same response bytes twice. A timeout leaves a partial frame on the
+//! channel. The shell must close the channel and must not read that frame.
+//!
+//! The fd path does not change `O_NONBLOCK` or any other file status flag. A
+//! control channel is one duplex socket, so its read and write directions share
+//! one open file description. Changing a status flag would make the input read
+//! non-blocking and break the session. The sink uses per-call flags on Linux
+//! and Android: `MSG_DONTWAIT` for the bound and `MSG_NOSIGNAL` for the signal.
+//! Apple platforms do not honor `MSG_DONTWAIT` on a full `AF_UNIX` stream
+//! socket: a probe on macOS showed the send blocks. The sink therefore saves
+//! and restores the socket `SO_SNDTIMEO` and `SO_NOSIGPIPE` options and uses a
+//! short socket send timeout as the per-call bound. A blocked input read is not
+//! cancellable. `serve_fd` reads the input on the calling thread. Run it on a
+//! dedicated thread when the caller cannot block.
+//!
+//! # Signals
+//!
+//! The sink suppresses `SIGPIPE` for its own sends only. It never changes the
+//! process signal action or a thread signal mask. Linux and Android use
+//! `MSG_NOSIGNAL` on each send. Apple platforms set `SO_NOSIGPIPE` on the
+//! socket for the life of the sink and restore the previous value when it
+//! drops. A send to a closed peer returns an I/O error and the session reports
+//! a fixed fault. The tests run the sink in a child process whose `SIGPIPE`
+//! action is the default and unblocked, on sockets with no helper protection.
+//! A control case in the same child process shows that a plain write to a
+//! closed peer is killed by `SIGPIPE`. These tests cover the sink send path
+//! only. Any other write in the engine needs its own protection.
+//!
+//! # Socket option scope
+//!
+//! `SO_SNDTIMEO` and `SO_NOSIGPIPE` belong to the socket, not to one descriptor
+//! or one call. Every descriptor that shares the socket sees the changed
+//! values, including a `dup` or a clone of the output descriptor and the input
+//! reader that shares the duplex socket. The sink must be the only sender while
+//! it lives: run one sink per control channel, and do not send on another copy
+//! of the output descriptor during the call. Another sender would inherit the
+//! short send timeout and the changed signal option. The read direction is
+//! unaffected because `SO_SNDTIMEO` applies to sends only. The peer end is a
+//! different socket and keeps its own options.
+//!
+//! The save and restore can fail. `Drop` cannot return an error, so it ignores
+//! a failed restore. A closed peer can tear down the socket before the restore
+//! runs. Treat the descriptor as unusable after the sink drops: close it, and
+//! do not return it to a pool. A failed restore on a live socket leaves the
+//! short send timeout in place, and the sink does not report that failure. A
+//! setup that fails part way puts back the signal option before it returns.
+//! The tests check the exact restored values on Apple platforms, including
+//! non-default originals and a failed setup. They do not prove a restore after
+//! the peer closed.
+//!
+//! # Deadline limits
+//!
+//! The absolute deadline is checked before each send and before each poll
+//! wait, and it cannot interrupt a send that is already inside the kernel.
+//! Each poll wait is clipped to the time left, so it adds at most the one
+//! millisecond rounding of `poll(2)`. On Linux and Android a send never
+//! blocks, so a frame overruns `output_deadline` by scheduler delay and that
+//! rounding. On Apple platforms one blocking send can last up to the short send
+//! timeout, which equals [`SESSION_POLL_INTERVAL`]. A frame can therefore
+//! overrun `output_deadline` by up to one poll interval plus scheduler delay on
+//! Apple platforms. Keep the deadline at least one poll interval below the
+//! supervisor grace period. [`DEFAULT_OUTPUT_DEADLINE`] satisfies that bound for
+//! [`SUPERVISOR_GRACE`].
+//!
+//! # Output descriptor
+//!
+//! The output descriptor is typed. [`ControlServer::serve_fd`] borrows a
+//! `BorrowedFd` for the call and does not close it.
+//! [`ControlServer::serve_fd_owned`] takes an `OwnedFd` and closes it when the
+//! call returns. Do not pass a raw descriptor number: another thread can close
+//! it and the number can be reused during the call.
+//!
+//! A pipe or other non-socket, a datagram socket, a seqpacket socket, a
+//! listening socket, an `AF_INET` or `AF_INET6` socket, and every other
+//! descriptor are refused with [`ControlFault::UnsupportedOutput`] before the
+//! first byte. The check reads `SO_TYPE` and the local socket family. Linux
+//! and Android read `SO_ACCEPTCONN` to reject a listener. macOS refuses that
+//! option for every socket, so Apple platforms require a connected peer from
+//! `getpeername` instead. This is a check of the kind of descriptor. It does not
+//! prove that the peer is the shell or that the caller passed the intended
+//! channel, and nothing in this module can prove either. An unconnected stream
+//! socket passes the check on Linux and Android and fails on the first send
+//! with an I/O fault. Apple platforms refuse it at the check. The type guard
+//! has host tests only. It is not wired to any service path.
+//! A pipe has no portable per-call non-blocking send, and Linux gives a pipe no
+//! per-descriptor `SIGPIPE` suppression. Use the generic [`Write`] path for a
+//! pipe, and accept that its write has no bound. A future bounded pipe design
+//! must add its own signal and deadline handling.
+//!
+//! Other Unix platforms fail closed with
+//! [`ControlFault::UnsupportedOutput`] until they add a per-call send bound.
+//!
+//! `serve_fd` is not wired to the service.
+//! [`ControlServer::new_for_service`] still fails closed. Windows has no
+//! bounded output path in this foundation. The Windows service must add one
+//! with non-blocking handles and `WSAPoll`, or keep
+//! [`ServiceRequirement::BoundedOutput`] open.
+//!
+//! The generic [`Write`] path never changes signal disposition. On Unix the
+//! engine must ignore `SIGPIPE` for a generic pipe write, because a write to a
+//! closed pipe must return an error so the cleanup path can run.
+//!
 //! [`PARENT_LIVENESS_ENFORCED`] is false. The transport observes parent loss
 //! independently and always reports inside a bound. It cannot guarantee that a
 //! blocked handler call returns or that cleanup ran.
@@ -212,6 +328,8 @@ use sha2::{Digest, Sha256};
 use std::fmt::{self, Debug};
 use std::hash::{BuildHasher, Hasher};
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
@@ -256,6 +374,12 @@ pub const SESSION_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// The supervisor returns after this period even when the worker is parked.
 /// Use this value in the service. A test may pass a shorter value.
 pub const SUPERVISOR_GRACE: Duration = Duration::from_secs(5);
+
+/// The default absolute deadline for one outbound frame on the fd path.
+///
+/// It is shorter than [`SUPERVISOR_GRACE`] so a blocked write reports before
+/// the supervisor grace period ends. Use this value in the service.
+pub const DEFAULT_OUTPUT_DEADLINE: Duration = Duration::from_secs(2);
 
 /// A fixed control error. It carries no backend text and no input value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,6 +476,17 @@ pub enum ControlFault {
     OversizedFrame,
     /// The channel ended inside a frame.
     TruncatedFrame,
+    /// The channel did not accept a frame before the absolute output deadline.
+    ///
+    /// A partial frame can remain on the channel. The shell must close it.
+    OutputDeadline,
+    /// The output descriptor is not an open, non-listening `AF_UNIX` stream
+    /// socket.
+    ///
+    /// A pipe, a datagram socket, a seqpacket socket, a listening socket, a
+    /// socket of another address family, and a non-socket descriptor are
+    /// refused before the first byte.
+    UnsupportedOutput,
     /// The frame kind is not allowed in this state.
     UnexpectedFrame,
     /// A request identifier is zero, repeated, or lower than the last one.
@@ -373,7 +508,8 @@ impl ControlFault {
         match self {
             Self::Unauthenticated => Some(WireError::Unauthorized),
             Self::HandlerPanicked | Self::Panicked => Some(WireError::Internal),
-            Self::Io => None,
+            Self::UnsupportedOutput => Some(WireError::Unsupported),
+            Self::Io | Self::OutputDeadline => None,
             Self::BadMagic
             | Self::BadVersion
             | Self::UnknownFrameKind
@@ -395,6 +531,8 @@ impl ControlFault {
             Self::BadFlags => "The control frame flags are not valid.",
             Self::OversizedFrame => "The control frame is too large.",
             Self::TruncatedFrame => "The control frame is incomplete.",
+            Self::OutputDeadline => "The control channel did not accept the answer in time.",
+            Self::UnsupportedOutput => "The control output is not a supported stream socket.",
             Self::UnexpectedFrame => "The control frame is not expected now.",
             Self::BadRequestId => "The control request identifier is not valid.",
             Self::BadCommand => "The control command is not allowed.",
@@ -1032,6 +1170,12 @@ pub enum ServiceRequirement {
     /// ignore `SIGPIPE`. The shell must close both private channels.
     ProcessExit,
     /// Control output must not block cleanup indefinitely.
+    ///
+    /// The foundation has a bounded fd path in `ControlServer::serve_fd` for an
+    /// open stream socket on Linux, Android, and Apple platforms. The private
+    /// channel is an `AF_UNIX` socketpair. The service does not use it yet. A
+    /// pipe and the generic [`Write`] path still block. Windows has no bounded
+    /// path in this foundation.
     BoundedOutput,
     /// Device-independent routes need a cleanup path outside a parked worker.
     IndependentRouteCleanup,
@@ -1148,14 +1292,97 @@ impl<H: ControlHandler> ControlServer<H> {
     /// handle. The server cannot close a channel that another copy keeps open.
     ///
     /// The method is single-threaded. It observes a closed channel only in a
-    /// read. A blocked handler delays parent-loss cleanup without a bound. Use
-    /// [`supervise`](Self::supervise) for the parent-liveness boundary. The
-    /// cleanup result is part of the returned [`ServeOutcome`].
+    /// read. A blocked handler delays parent-loss cleanup without a bound. The
+    /// output is a generic [`Write`], so a full socket or pipe can block the
+    /// response write without a bound. Use [`supervise`](Self::supervise) for
+    /// the parent-liveness boundary, and `serve_fd` on Unix for bounded output.
+    /// The cleanup result is part of the returned [`ServeOutcome`].
     pub fn serve<R: Read, W: Write>(self, mut input: R, mut output: W) -> ServeOutcome {
         let cancel = CancelToken::new();
         let phase = SessionPhase::new();
+        let mut sink = StreamSink {
+            output: &mut output,
+        };
         let mut frames = DirectFrames { input: &mut input };
-        self.run(&mut frames, &mut output, &cancel, &phase)
+        self.run(&mut frames, &mut sink, &cancel, &phase)
+    }
+
+    /// Serve one private control channel with bounded non-blocking output.
+    ///
+    /// UNAPPROVED for the real service. [`new_for_service`](Self::new_for_service)
+    /// still fails closed, so this method is a foundation for tests and review.
+    ///
+    /// `output` must be an open, non-listening `AF_UNIX` stream socket. Use an
+    /// `AF_UNIX` socketpair for the private channel. A pipe, a datagram socket,
+    /// a seqpacket socket, a listening socket, a socket of another address
+    /// family, or any other descriptor is refused with
+    /// [`ControlFault::UnsupportedOutput`] before the first byte, and cleanup
+    /// still runs. The method borrows the descriptor for the call and does not
+    /// close it. Use [`serve_fd_owned`](Self::serve_fd_owned) when the server
+    /// should own and close it.
+    ///
+    /// The method does not change `O_NONBLOCK` or any other file status flag.
+    /// On Linux and Android it uses `MSG_DONTWAIT` and `MSG_NOSIGNAL` on each
+    /// send. On Apple platforms it saves and restores `SO_SNDTIMEO` and
+    /// `SO_NOSIGPIPE` and uses a short socket send timeout. Those two options
+    /// belong to the shared socket, so this sink must be the only sender on
+    /// `output` while it lives. A failed restore in `Drop` is ignored. Treat the
+    /// descriptor as unusable after the sink drops, because a closed peer can
+    /// tear down the socket before the restore runs. It waits for
+    /// `POLLOUT` with `poll(2)` and applies one absolute deadline of
+    /// `output_deadline` to each frame. It observes `cancel` between poll waits,
+    /// so parent loss and a local stop end a blocked write. A timeout returns
+    /// [`ServeStop::Fault`] with [`ControlFault::OutputDeadline`]. A cancel
+    /// returns [`ServeStop::Cancelled`]. The deadline cannot interrupt a send
+    /// that is already inside the kernel. On Apple platforms a frame can overrun
+    /// it by up to one [`SESSION_POLL_INTERVAL`] plus scheduler delay. On Linux
+    /// and Android the overrun is scheduler delay only. Keep the deadline at
+    /// least one poll interval below the supervisor grace period. The sink
+    /// suppresses `SIGPIPE` for its own sends only and never changes the process
+    /// signal action. The method
+    /// never retries a partial frame. A partial frame can remain on the channel,
+    /// so the shell must close it and must not read that frame.
+    ///
+    /// The input side still blocks on a direct read. A blocked input read is
+    /// not cancellable. Run this method on a dedicated thread when the input
+    /// must not block the caller. The supervisor does not accept this sink yet;
+    /// a supervised bounded path is still part of the service work.
+    #[cfg(unix)]
+    pub fn serve_fd<R: Read>(
+        self,
+        mut input: R,
+        output: BorrowedFd<'_>,
+        cancel: CancelToken,
+        output_deadline: Duration,
+    ) -> ServeOutcome {
+        let phase = SessionPhase::new();
+        let mut sink = match FdSink::new(output, cancel.clone(), output_deadline) {
+            Ok(sink) => sink,
+            Err(FdSinkError::Unsupported) => {
+                return self.fault_without_session(&phase, ControlFault::UnsupportedOutput)
+            }
+            Err(FdSinkError::Io) => return self.fault_without_session(&phase, ControlFault::Io),
+        };
+        let mut frames = DirectFrames { input: &mut input };
+        self.run(&mut frames, &mut sink, &cancel, &phase)
+    }
+
+    /// Serve one private control channel and close the output descriptor when
+    /// the call returns.
+    ///
+    /// This method takes ownership of `output` and has the same bounded-output
+    /// rules as [`serve_fd`](Self::serve_fd). It closes the descriptor on every
+    /// return path, including an unsupported descriptor. It does not close the
+    /// input reader; the caller owns that reader.
+    #[cfg(unix)]
+    pub fn serve_fd_owned<R: Read>(
+        self,
+        input: R,
+        output: OwnedFd,
+        cancel: CancelToken,
+        output_deadline: Duration,
+    ) -> ServeOutcome {
+        self.serve_fd(input, output.as_fd(), cancel, output_deadline)
     }
 
     /// Serve one private channel with one cancel token.
@@ -1169,6 +1396,9 @@ impl<H: ControlHandler> ControlServer<H> {
     /// thread alive after the session ends. The process exit reclaims it. If
     /// the reader thread cannot start, the session fails closed and runs
     /// cleanup.
+    ///
+    /// Output is still a generic [`Write`]. A full socket or pipe can block a
+    /// response write, and a cancel request does not interrupt that write.
     pub fn serve_cancellable<R, W>(self, input: R, output: W, cancel: CancelToken) -> ServeOutcome
     where
         R: Read + Send + 'static,
@@ -1189,6 +1419,11 @@ impl<H: ControlHandler> ControlServer<H> {
     /// The method never restarts a session. The caller must exit the process
     /// after every outcome, including a clean stop. Use [`SUPERVISOR_GRACE`]
     /// as the grace period.
+    ///
+    /// Output is still a generic [`Write`]. A full socket or pipe can block a
+    /// response write. The supervisor reports a parked worker at the grace
+    /// deadline, but it cannot stop that write. Use `serve_fd` outside the
+    /// supervisor until a supervised bounded path exists.
     pub fn supervise<R, W, L>(
         self,
         input: R,
@@ -1301,27 +1536,32 @@ impl<H: ControlHandler> ControlServer<H> {
         match spawn_frame_reader(input) {
             Ok(reader) => {
                 let mut frames = ChannelFrames { frames: reader };
-                self.run(&mut frames, &mut output, &cancel, phase)
-            }
-            Err(_) => {
-                let mut cleanup = None;
-                let stop = {
-                    let _guard = ShutdownGuard {
-                        handler: &self.handler,
-                        result: &mut cleanup,
-                        phase,
-                    };
-                    ServeStop::Fault(ControlFault::Io)
+                let mut sink = StreamSink {
+                    output: &mut output,
                 };
-                ServeOutcome::new(stop, cleanup.unwrap_or(CleanupOutcome::Panicked))
+                self.run(&mut frames, &mut sink, &cancel, phase)
             }
+            Err(_) => self.fault_without_session(phase, ControlFault::Io),
         }
     }
 
-    fn run<F: FrameSource, W: Write>(
+    fn fault_without_session(self, phase: &SessionPhase, fault: ControlFault) -> ServeOutcome {
+        let mut cleanup = None;
+        let stop = {
+            let _guard = ShutdownGuard {
+                handler: &self.handler,
+                result: &mut cleanup,
+                phase,
+            };
+            ServeStop::Fault(fault)
+        };
+        ServeOutcome::new(stop, cleanup.unwrap_or(CleanupOutcome::Panicked))
+    }
+
+    fn run<F: FrameSource, S: FrameSink>(
         self,
         frames: &mut F,
-        output: &mut W,
+        output: &mut S,
         cancel: &CancelToken,
         phase: &SessionPhase,
     ) -> ServeOutcome {
@@ -1654,7 +1894,7 @@ fn next_frame<F: FrameSource>(frames: &mut F, cancel: &CancelToken) -> Result<Fr
     }
 }
 
-fn report_fault<W: Write>(stop: ServeStop, output: &mut W, cancel: &CancelToken) -> ServeStop {
+fn report_fault<S: FrameSink>(stop: ServeStop, output: &mut S, cancel: &CancelToken) -> ServeStop {
     if let ServeStop::Fault(fault) = stop {
         if cancel.reason().is_none() {
             write_fault(output, fault);
@@ -1665,12 +1905,12 @@ fn report_fault<W: Write>(stop: ServeStop, output: &mut W, cancel: &CancelToken)
     }
 }
 
-fn serve_loop<H: ControlHandler + ?Sized, F: FrameSource, W: Write>(
+fn serve_loop<H: ControlHandler + ?Sized, F: FrameSource, S: FrameSink>(
     handler: &H,
     key: &SessionKey,
     nonce: &[u8; NONCE_LEN],
     frames: &mut F,
-    output: &mut W,
+    output: &mut S,
     cancel: &CancelToken,
 ) -> ServeStop {
     if let Err(stop) = establish(key, nonce, frames, output, cancel) {
@@ -1735,21 +1975,21 @@ fn serve_loop<H: ControlHandler + ?Sized, F: FrameSource, W: Write>(
                             return ServeStop::ShutdownRefused(error);
                         }
                     }
-                    Answer::Io => return ServeStop::Fault(ControlFault::Io),
+                    Answer::Failed(failure) => return stop_for_write_failure(failure),
                 }
             }
             Ok(_) => {
                 let error = ControlError::Internal;
-                if write_error(output, frame.id, error).is_err() {
-                    return ServeStop::Fault(ControlFault::Io);
+                if let Err(failure) = write_error(output, frame.id, error) {
+                    return stop_for_write_failure(failure);
                 }
                 if is_shutdown {
                     return ServeStop::ShutdownRefused(error);
                 }
             }
             Err(error) => {
-                if write_error(output, frame.id, error).is_err() {
-                    return ServeStop::Fault(ControlFault::Io);
+                if let Err(failure) = write_error(output, frame.id, error) {
+                    return stop_for_write_failure(failure);
                 }
                 if is_shutdown {
                     return ServeStop::ShutdownRefused(error);
@@ -1759,18 +1999,18 @@ fn serve_loop<H: ControlHandler + ?Sized, F: FrameSource, W: Write>(
     }
 }
 
-fn establish<F: FrameSource, W: Write>(
+fn establish<F: FrameSource, S: FrameSink>(
     key: &SessionKey,
     nonce: &[u8; NONCE_LEN],
     frames: &mut F,
-    output: &mut W,
+    output: &mut S,
     cancel: &CancelToken,
 ) -> Result<(), ServeStop> {
     if let Some(reason) = cancel.reason() {
         return Err(ServeStop::Cancelled(reason));
     }
-    if write_frame(output, FrameKind::Challenge, 0, nonce).is_err() {
-        return Err(ServeStop::Fault(ControlFault::Io));
+    if let Err(failure) = output.send(FrameKind::Challenge, 0, nonce) {
+        return Err(stop_for_write_failure(failure));
     }
     let frame = match next_frame(frames, cancel) {
         Ok(frame) => frame,
@@ -1798,10 +2038,10 @@ fn establish<F: FrameSource, W: Write>(
         wipe(&mut ready);
         return Err(ServeStop::Cancelled(reason));
     }
-    let sent = write_frame(output, FrameKind::Ready, 0, &ready);
+    let sent = output.send(FrameKind::Ready, 0, &ready);
     wipe(&mut ready);
-    if sent.is_err() {
-        return Err(ServeStop::Fault(ControlFault::Io));
+    if let Err(failure) = sent {
+        return Err(stop_for_write_failure(failure));
     }
     Ok(())
 }
@@ -2015,14 +2255,432 @@ fn read_frame<R: Read>(input: &mut R, max_payload: usize) -> FrameRead {
     FrameRead::Frame(Frame { kind, id, payload })
 }
 
-fn write_frame<W: Write>(
-    output: &mut W,
+/// A fixed failure on the output side of one frame.
+///
+/// It carries no input bytes and no backend text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteFailure {
+    /// The channel is closed or the write failed.
+    Io,
+    /// The payload is above the protocol limit.
+    TooLarge,
+    /// The absolute output deadline ended before the frame was complete.
+    ///
+    /// Only the Unix fd sink constructs this failure today. Windows has no
+    /// bounded output path yet.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    TimedOut,
+    /// A cancel request arrived before the frame was complete.
+    ///
+    /// Only the Unix fd sink constructs this failure today.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Cancelled(CancelReason),
+}
+
+/// The output side of one control session.
+trait FrameSink {
+    /// Write one complete frame or return a fixed failure.
+    ///
+    /// The implementation writes each byte once. It must not retry a partial
+    /// frame after a timeout or a cancel request.
+    fn send(&mut self, kind: FrameKind, id: u32, payload: &[u8]) -> Result<(), WriteFailure>;
+}
+
+/// A generic in-memory output. This path uses blocking writes.
+struct StreamSink<'a, W: Write> {
+    output: &'a mut W,
+}
+
+impl<W: Write> FrameSink for StreamSink<'_, W> {
+    fn send(&mut self, kind: FrameKind, id: u32, payload: &[u8]) -> Result<(), WriteFailure> {
+        let header = frame_header(kind, id, payload.len())?;
+        self.output
+            .write_all(&header)
+            .map_err(|_| WriteFailure::Io)?;
+        self.output
+            .write_all(payload)
+            .map_err(|_| WriteFailure::Io)?;
+        self.output.flush().map_err(|_| WriteFailure::Io)
+    }
+}
+
+/// A fixed failure while preparing a bounded output sink.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FdSinkError {
+    /// The descriptor is not an open stream socket.
+    Unsupported,
+    /// A socket option could not be read or written.
+    ///
+    /// Only the Apple bounded-output path constructs this variant today.
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    Io,
+}
+
+/// A bounded output on one borrowed Unix stream socket.
+///
+/// The sink never changes a file status flag. Linux and Android use
+/// `MSG_DONTWAIT` and `MSG_NOSIGNAL` on each send. Apple platforms ignore
+/// `MSG_DONTWAIT` on a full `AF_UNIX` stream socket, so the sink saves and restores `SO_SNDTIMEO` and
+/// `SO_NOSIGPIPE`. Each frame gets one absolute deadline. A poll wait is at
+/// most [`SESSION_POLL_INTERVAL`], so a cancel request is observed while the
+/// peer is not reading. A send that already entered the kernel cannot be
+/// interrupted. On Apple platforms a frame can overrun the deadline by up to one
+/// poll interval plus scheduler delay. On Linux and Android the sends never
+/// block, so the overrun is scheduler delay only.
+///
+/// The two Apple options belong to the socket, not to one descriptor or one
+/// call. The sink must be the only sender on the socket while it lives. A
+/// failed restore in `Drop` is ignored, and a closed peer can prevent the
+/// restore entirely, so treat the descriptor as unusable after the sink drops.
+/// The sink does not close the descriptor.
+#[cfg(unix)]
+struct FdSink<'fd> {
+    fd: BorrowedFd<'fd>,
+    deadline: Duration,
+    cancel: CancelToken,
+    #[cfg(target_vendor = "apple")]
+    _restore: AppleSocketOptions,
+}
+
+#[cfg(unix)]
+impl<'fd> FdSink<'fd> {
+    fn new(
+        fd: BorrowedFd<'fd>,
+        cancel: CancelToken,
+        deadline: Duration,
+    ) -> Result<Self, FdSinkError> {
+        if !is_supported_stream_socket(fd.as_raw_fd()) {
+            return Err(FdSinkError::Unsupported);
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        {
+            let _ = (fd, cancel, deadline);
+            return Err(FdSinkError::Unsupported);
+        }
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        {
+            #[cfg(target_vendor = "apple")]
+            let restore =
+                AppleSocketOptions::configure(fd.as_raw_fd()).map_err(|_| FdSinkError::Io)?;
+            Ok(Self {
+                fd,
+                deadline,
+                cancel,
+                #[cfg(target_vendor = "apple")]
+                _restore: restore,
+            })
+        }
+    }
+
+    fn write_all_bounded(&self, mut bytes: &[u8], deadline: Instant) -> Result<(), WriteFailure> {
+        while !bytes.is_empty() {
+            if let Some(reason) = self.cancel.reason() {
+                return Err(WriteFailure::Cancelled(reason));
+            }
+            if Instant::now() >= deadline {
+                return Err(WriteFailure::TimedOut);
+            }
+            match send_once(self.fd.as_raw_fd(), bytes) {
+                Ok(0) => return Err(WriteFailure::Io),
+                Ok(count) => bytes = &bytes[count..],
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.wait_writable(deadline)?;
+                }
+                Err(_) => return Err(WriteFailure::Io),
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_writable(&self, deadline: Instant) -> Result<(), WriteFailure> {
+        loop {
+            if let Some(reason) = self.cancel.reason() {
+                return Err(WriteFailure::Cancelled(reason));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(WriteFailure::TimedOut);
+            }
+            let wait = (deadline - now).min(SESSION_POLL_INTERVAL);
+            let milliseconds = wait.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+            let mut descriptor = libc::pollfd {
+                fd: self.fd.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(WriteFailure::Io);
+            }
+            if result == 0 {
+                continue;
+            }
+            if descriptor.revents & libc::POLLNVAL != 0 {
+                return Err(WriteFailure::Io);
+            }
+            if descriptor.revents & libc::POLLOUT != 0 {
+                return Ok(());
+            }
+            // POLLERR and POLLHUP mean the channel is closed. Any other event
+            // is a fixed failure rather than a busy loop.
+            return Err(WriteFailure::Io);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl FrameSink for FdSink<'_> {
+    fn send(&mut self, kind: FrameKind, id: u32, payload: &[u8]) -> Result<(), WriteFailure> {
+        let header = frame_header(kind, id, payload.len())?;
+        let deadline = Instant::now()
+            .checked_add(self.deadline)
+            .ok_or(WriteFailure::TimedOut)?;
+        self.write_all_bounded(&header, deadline)?;
+        self.write_all_bounded(payload, deadline)
+    }
+}
+
+/// The Linux and Android `SO_ACCEPTCONN` option number.
+///
+/// The `libc` crate does not name this option for every Unix target. Apple
+/// platforms are not listed: a probe on macOS showed `getsockopt` refuses
+/// `SO_ACCEPTCONN` with `ENOPROTOOPT` for every socket, so the Apple guard uses
+/// `getpeername` instead.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SO_ACCEPTCONN_OPTION: libc::c_int = 30;
+
+/// True only for an open `AF_UNIX` stream socket that is not listening.
+///
+/// A pipe or any other non-socket returns `ENOTSOCK` from `getsockopt`, so it
+/// maps to false. An `AF_INET` or `AF_INET6` stream socket, a socket of another
+/// type, a listening socket, and an unavailable option all map to false. Other
+/// Unix platforms have no bounded send path, so the result is false there too.
+///
+/// Linux and Android read `SO_ACCEPTCONN`, so an unconnected stream socket
+/// passes this guard and fails on its first send. Apple platforms cannot read
+/// that option, so they require `getpeername` to succeed. A listening or
+/// unconnected socket fails it with `ENOTCONN` and is refused. A socket whose
+/// peer already closed fails it with `EINVAL`. That case passes the guard and
+/// fails closed with an I/O fault when the sink prepares the socket.
+///
+/// This guard checks the kind of descriptor. It does not prove that the peer is
+/// the shell, and it does not prove that the descriptor is the intended one.
+/// The caller must pass the control channel it created.
+#[cfg(unix)]
+fn is_supported_stream_socket(fd: RawFd) -> bool {
+    let mut kind: libc::c_int = 0;
+    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            &mut kind as *mut libc::c_int as *mut libc::c_void,
+            &mut length,
+        )
+    };
+    if result != 0 || kind != libc::SOCK_STREAM {
+        return false;
+    }
+
+    let mut address: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut address_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockname(
+            fd,
+            &mut address as *mut libc::sockaddr_storage as *mut libc::sockaddr,
+            &mut address_len,
+        )
+    };
+    if result != 0 || address.ss_family as libc::c_int != libc::AF_UNIX {
+        return false;
+    }
+
+    #[cfg(target_vendor = "apple")]
+    {
+        let mut peer: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut peer_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getpeername(
+                fd,
+                &mut peer as *mut libc::sockaddr_storage as *mut libc::sockaddr,
+                &mut peer_len,
+            )
+        };
+        // A connected socket has a peer and cannot be a listener. A closed peer
+        // gives EINVAL on macOS. Every other error fails closed.
+        result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL)
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut listening: libc::c_int = 0;
+        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                SO_ACCEPTCONN_OPTION,
+                &mut listening as *mut libc::c_int as *mut libc::c_void,
+                &mut length,
+            )
+        };
+        // A failed lookup fails closed.
+        result == 0 && listening == 0
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        false
+    }
+}
+
+/// Write once with a per-call bound and no `SIGPIPE`.
+///
+/// Linux and Android take both properties from one `send` flag word. Apple
+/// platforms ignore `MSG_DONTWAIT` for this path, so `FdSink::new` sets a short
+/// `SO_SNDTIMEO` and `SO_NOSIGPIPE` and this call uses a plain blocking send.
+#[cfg(unix)]
+fn send_once(fd: RawFd, bytes: &[u8]) -> io::Result<usize> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let written = unsafe {
+            libc::send(
+                fd,
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if written < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(written as usize)
+        }
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        let written = unsafe { libc::send(fd, bytes.as_ptr().cast(), bytes.len(), 0) };
+        if written < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(written as usize)
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        let _ = (fd, bytes);
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
+/// Saved Apple socket options. They are restored when the sink drops.
+#[cfg(all(unix, target_vendor = "apple"))]
+struct AppleSocketOptions {
+    fd: RawFd,
+    send_timeout: libc::timeval,
+    no_sigpipe: libc::c_int,
+}
+
+#[cfg(all(unix, target_vendor = "apple"))]
+impl AppleSocketOptions {
+    fn configure(fd: RawFd) -> io::Result<Self> {
+        let send_timeout = get_socket_option::<libc::timeval>(fd, libc::SO_SNDTIMEO)?;
+        let no_sigpipe = get_socket_option::<libc::c_int>(fd, libc::SO_NOSIGPIPE)?;
+        let one: libc::c_int = 1;
+        set_socket_option(fd, libc::SO_NOSIGPIPE, &one)?;
+        let total = SESSION_POLL_INTERVAL.as_micros();
+        let timeout = libc::timeval {
+            tv_sec: (total / 1_000_000) as libc::time_t,
+            tv_usec: (total % 1_000_000) as libc::suseconds_t,
+        };
+        if let Err(error) = set_socket_option(fd, libc::SO_SNDTIMEO, &timeout) {
+            let _ = set_socket_option(fd, libc::SO_NOSIGPIPE, &no_sigpipe);
+            return Err(error);
+        }
+        Ok(Self {
+            fd,
+            send_timeout,
+            no_sigpipe,
+        })
+    }
+}
+
+#[cfg(all(unix, target_vendor = "apple"))]
+impl Drop for AppleSocketOptions {
+    fn drop(&mut self) {
+        let _ = set_socket_option(self.fd, libc::SO_SNDTIMEO, &self.send_timeout);
+        let _ = set_socket_option(self.fd, libc::SO_NOSIGPIPE, &self.no_sigpipe);
+    }
+}
+
+#[cfg(all(unix, target_vendor = "apple"))]
+fn get_socket_option<T>(fd: RawFd, option: libc::c_int) -> io::Result<T> {
+    let mut value = std::mem::MaybeUninit::<T>::zeroed();
+    let mut length = std::mem::size_of::<T>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            option,
+            value.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if length as usize != std::mem::size_of::<T>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "socket option size",
+        ));
+    }
+    // The caller uses only `c_int` and `timeval`, whose bit patterns are valid
+    // after a successful read of the full size.
+    Ok(unsafe { value.assume_init() })
+}
+
+#[cfg(all(unix, target_vendor = "apple"))]
+fn set_socket_option<T>(fd: RawFd, option: libc::c_int, value: &T) -> io::Result<()> {
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            option,
+            value as *const T as *const libc::c_void,
+            std::mem::size_of::<T>() as libc::socklen_t,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn stop_for_write_failure(failure: WriteFailure) -> ServeStop {
+    match failure {
+        WriteFailure::Io => ServeStop::Fault(ControlFault::Io),
+        WriteFailure::TooLarge => ServeStop::Fault(ControlFault::OversizedFrame),
+        WriteFailure::TimedOut => ServeStop::Fault(ControlFault::OutputDeadline),
+        WriteFailure::Cancelled(reason) => ServeStop::Cancelled(reason),
+    }
+}
+
+fn frame_header(
     kind: FrameKind,
     id: u32,
-    payload: &[u8],
-) -> io::Result<()> {
-    let length = u32::try_from(payload.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame too large"))?;
+    payload_len: usize,
+) -> Result<[u8; HEADER_LEN], WriteFailure> {
+    if payload_len > MAX_RESPONSE_PAYLOAD {
+        return Err(WriteFailure::TooLarge);
+    }
+    let length = u32::try_from(payload_len).map_err(|_| WriteFailure::TooLarge)?;
     let mut header = [0u8; HEADER_LEN];
     header[..4].copy_from_slice(&MAGIC);
     header[4] = VERSION;
@@ -2031,37 +2689,47 @@ fn write_frame<W: Write>(
     header[7] = 0;
     header[8..12].copy_from_slice(&id.to_be_bytes());
     header[12..16].copy_from_slice(&length.to_be_bytes());
+    Ok(header)
+}
+
+fn write_frame<W: Write>(
+    output: &mut W,
+    kind: FrameKind,
+    id: u32,
+    payload: &[u8],
+) -> io::Result<()> {
+    let header = frame_header(kind, id, payload.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame too large"))?;
     output.write_all(&header)?;
     output.write_all(payload)?;
     output.flush()
 }
 
-fn write_fatal<W: Write>(output: &mut W, error: WireError) {
-    let _ = write_frame(output, FrameKind::Fatal, 0, &[error as u8]);
+fn write_fatal<S: FrameSink>(output: &mut S, error: WireError) {
+    let _ = output.send(FrameKind::Fatal, 0, &[error as u8]);
 }
 
-fn write_fault<W: Write>(output: &mut W, fault: ControlFault) {
+fn write_fault<S: FrameSink>(output: &mut S, fault: ControlFault) {
     if let Some(error) = fault.wire_error() {
         write_fatal(output, error);
     }
 }
 
-fn write_error<W: Write>(output: &mut W, id: u32, error: ControlError) -> io::Result<()> {
-    write_frame(
-        output,
-        FrameKind::Response,
-        id,
-        &[1u8, error.wire_error() as u8],
-    )
+fn write_error<S: FrameSink>(
+    output: &mut S,
+    id: u32,
+    error: ControlError,
+) -> Result<(), WriteFailure> {
+    output.send(FrameKind::Response, id, &[1u8, error.wire_error() as u8])
 }
 
 enum Answer {
     Sent,
     Refused(ControlError),
-    Io,
+    Failed(WriteFailure),
 }
 
-fn write_value<W: Write>(output: &mut W, id: u32, value: &Value) -> Answer {
+fn write_value<S: FrameSink>(output: &mut S, id: u32, value: &Value) -> Answer {
     let mut writer = BoundedWriter {
         buffer: Vec::new(),
         limit: MAX_RESPONSE_PAYLOAD - 1,
@@ -2076,18 +2744,18 @@ fn write_value<W: Write>(output: &mut W, id: u32, value: &Value) -> Answer {
         wipe(&mut writer.buffer);
         return match write_error(output, id, error) {
             Ok(()) => Answer::Refused(error),
-            Err(_) => Answer::Io,
+            Err(failure) => Answer::Failed(failure),
         };
     }
     let mut payload = Vec::with_capacity(writer.buffer.len() + 1);
     payload.push(0u8);
     payload.extend_from_slice(&writer.buffer);
-    let sent = write_frame(output, FrameKind::Response, id, &payload);
+    let sent = output.send(FrameKind::Response, id, &payload);
     wipe(&mut payload);
     wipe(&mut writer.buffer);
     match sent {
         Ok(()) => Answer::Sent,
-        Err(_) => Answer::Io,
+        Err(failure) => Answer::Failed(failure),
     }
 }
 
@@ -2124,38 +2792,7 @@ fn fatal_error(payload: &[u8]) -> ControlError {
         .unwrap_or(ControlError::Protocol)
 }
 
-fn redact(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            for (key, value) in map.iter_mut() {
-                if sensitive_field(key) {
-                    *value = Value::String("[redacted]".into());
-                } else {
-                    redact(value);
-                }
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                redact(item);
-            }
-        }
-        _ => (),
-    }
-}
-
-fn sensitive_field(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.contains("token")
-        || lower.contains("password")
-        || lower.contains("passphrase")
-        || lower.contains("authorization")
-        || lower.contains("secret")
-        || lower.contains("credential")
-        || lower == "auth"
-        || lower == "key"
-        || lower.ends_with("key")
-}
+use crate::redact::redact_json as redact;
 
 #[cfg(test)]
 mod tests {
@@ -3147,6 +3784,7 @@ mod tests {
         assert!(!cancellable);
         assert!(!guaranteed);
         assert!(!SERVICE_REQUIREMENTS.is_empty());
+        assert!(DEFAULT_OUTPUT_DEADLINE < SUPERVISOR_GRACE);
         assert!(SERVICE_REQUIREMENTS.contains(&ServiceRequirement::BoundedHandler));
         assert!(SERVICE_REQUIREMENTS.contains(&ServiceRequirement::BoundedCleanup));
         assert!(SERVICE_REQUIREMENTS.contains(&ServiceRequirement::ProcessExit));
@@ -3186,6 +3824,1289 @@ mod tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod fd_output_tests {
+    use super::*;
+    use serde_json::json;
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const KEY_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    fn test_key() -> SessionKey {
+        SessionKey::from_hex(KEY_HEX).unwrap()
+    }
+
+    fn owned(fd: RawFd) -> OwnedFd {
+        assert!(fd >= 0);
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    }
+
+    fn set_no_sigpipe(fd: RawFd) {
+        #[cfg(target_vendor = "apple")]
+        {
+            let one: libc::c_int = 1;
+            let result = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_NOSIGPIPE,
+                    &one as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(result, 0, "SO_NOSIGPIPE: {}", io::Error::last_os_error());
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = fd;
+        }
+    }
+
+    struct SocketPair {
+        left: Option<OwnedFd>,
+        right: Option<OwnedFd>,
+    }
+
+    impl SocketPair {
+        fn new() -> Self {
+            Self::with_type(libc::SOCK_STREAM)
+        }
+
+        fn with_type(kind: libc::c_int) -> Self {
+            let mut fds = [-1; 2];
+            let result = unsafe { libc::socketpair(libc::AF_UNIX, kind, 0, fds.as_mut_ptr()) };
+            assert_eq!(result, 0, "socketpair: {}", io::Error::last_os_error());
+            set_no_sigpipe(fds[0]);
+            set_no_sigpipe(fds[1]);
+            Self {
+                left: Some(owned(fds[0])),
+                right: Some(owned(fds[1])),
+            }
+        }
+
+        fn left_fd(&self) -> RawFd {
+            self.left.as_ref().expect("left socket").as_raw_fd()
+        }
+
+        fn right_fd(&self) -> RawFd {
+            self.right.as_ref().expect("right socket").as_raw_fd()
+        }
+
+        fn right(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.right.as_ref().expect("right socket").as_fd()
+        }
+
+        fn take_right(&mut self) -> OwnedFd {
+            self.right.take().expect("right socket")
+        }
+
+        fn clone_left(&self) -> OwnedFd {
+            self.left
+                .as_ref()
+                .expect("left socket")
+                .try_clone()
+                .unwrap()
+        }
+
+        fn clone_right(&self) -> OwnedFd {
+            self.right
+                .as_ref()
+                .expect("right socket")
+                .try_clone()
+                .unwrap()
+        }
+
+        fn close_left(&mut self) {
+            self.left = None;
+        }
+
+        fn close_right(&mut self) {
+            self.right = None;
+        }
+    }
+
+    struct FdReader(OwnedFd);
+
+    impl Read for FdReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            let read =
+                unsafe { libc::read(self.0.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+            if read < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(read as usize)
+            }
+        }
+    }
+
+    struct FdWriter(OwnedFd);
+
+    impl Write for FdWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.is_empty() {
+                return Ok(0);
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let written = unsafe {
+                libc::send(
+                    self.0.as_raw_fd(),
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    libc::MSG_NOSIGNAL,
+                )
+            };
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let written =
+                unsafe { libc::write(self.0.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+            if written < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(written as usize)
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct DelayFirstWrite<W: Write> {
+        inner: W,
+        delay: Duration,
+        delayed: bool,
+    }
+
+    impl<W: Write> Write for DelayFirstWrite<W> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if !self.delayed {
+                self.delayed = true;
+                thread::sleep(self.delay);
+            }
+            self.inner.write(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    fn get_flags(fd: RawFd) -> libc::c_int {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0, "F_GETFL: {}", io::Error::last_os_error());
+        flags
+    }
+
+    fn set_flags(fd: RawFd, flags: libc::c_int) {
+        let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+        assert!(result >= 0, "F_SETFL: {}", io::Error::last_os_error());
+    }
+
+    struct FlagsGuard {
+        fd: RawFd,
+        flags: libc::c_int,
+    }
+
+    impl FlagsGuard {
+        fn nonblocking(fd: RawFd) -> Self {
+            let flags = get_flags(fd);
+            if flags & libc::O_NONBLOCK == 0 {
+                set_flags(fd, flags | libc::O_NONBLOCK);
+            }
+            Self { fd, flags }
+        }
+    }
+
+    impl Drop for FlagsGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::fcntl(self.fd, libc::F_SETFL, self.flags);
+            }
+        }
+    }
+
+    fn set_socket_buffer(fd: RawFd, option: libc::c_int, size: libc::c_int) {
+        let result = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                &size as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0, "setsockopt: {}", io::Error::last_os_error());
+    }
+
+    fn fill_send_buffer(fd: RawFd) -> usize {
+        let _guard = FlagsGuard::nonblocking(fd);
+        let filler = [0xeeu8; 4096];
+        let mut total = 0;
+        loop {
+            let written = unsafe { libc::write(fd, filler.as_ptr().cast(), filler.len()) };
+            if written > 0 {
+                total += written as usize;
+                continue;
+            }
+            if written == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.kind() == io::ErrorKind::WouldBlock {
+                break;
+            }
+            panic!("fill write failed: {error}");
+        }
+        total
+    }
+
+    fn read_some(fd: RawFd, limit: usize) -> usize {
+        let mut buffer = vec![0u8; limit];
+        let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+        assert!(read > 0, "read: {}", io::Error::last_os_error());
+        read as usize
+    }
+
+    fn drain_available(fd: RawFd) -> Vec<u8> {
+        let _guard = FlagsGuard::nonblocking(fd);
+        let mut collected = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+            if read > 0 {
+                collected.extend_from_slice(&buffer[..read as usize]);
+                continue;
+            }
+            if read == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.kind() == io::ErrorKind::WouldBlock {
+                break;
+            }
+            panic!("drain failed: {error}");
+        }
+        collected
+    }
+
+    fn encoded_frame(kind: FrameKind, id: u32, payload: &[u8]) -> Vec<u8> {
+        let header = frame_header(kind, id, payload.len()).unwrap();
+        let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn pipe_pair() -> (RawFd, RawFd) {
+        let mut fds = [-1; 2];
+        let result = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(result, 0, "pipe: {}", io::Error::last_os_error());
+        (fds[0], fds[1])
+    }
+
+    /// Fill the output socket, then free `hole_request` bytes on the peer.
+    /// Returns the pair and the number of filler bytes that remain queued
+    /// before the frame.
+    fn full_output_pair(hole_request: usize) -> (SocketPair, usize) {
+        let pair = SocketPair::new();
+        set_socket_buffer(pair.right_fd(), libc::SO_SNDBUF, 65536);
+        set_socket_buffer(pair.left_fd(), libc::SO_RCVBUF, 65536);
+        let filler = fill_send_buffer(pair.right_fd());
+        assert!(filler > hole_request, "the socket did not fill");
+        let hole = read_some(pair.left_fd(), hole_request);
+        assert!(hole > 0);
+        (pair, filler - hole)
+    }
+
+    struct CountingHandler {
+        cleanups: Arc<AtomicUsize>,
+        response: Value,
+    }
+
+    impl ControlHandler for CountingHandler {
+        fn handle(&self, _command: ControlCommand) -> Result<Value, ControlError> {
+            Ok(self.response.clone())
+        }
+
+        fn shutdown(&self) -> Result<(), ControlError> {
+            self.cleanups.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn counting_handler(cleanups: &Arc<AtomicUsize>) -> CountingHandler {
+        CountingHandler {
+            cleanups: Arc::clone(cleanups),
+            response: json!({"ok": true}),
+        }
+    }
+
+    #[test]
+    fn a_duplex_socketpair_handshake_and_request_survive_a_blocked_read() {
+        let pair = SocketPair::new();
+        let client_left = pair.clone_left();
+        let key = test_key();
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let server = ControlServer::new(counting_handler(&cleanups), key.clone());
+        let server_input = FdReader(pair.clone_right());
+        let server_thread = thread::spawn(move || {
+            server.serve_fd(
+                server_input,
+                pair.right(),
+                CancelToken::new(),
+                Duration::from_secs(2),
+            )
+        });
+
+        let client_input = FdReader(client_left.try_clone().unwrap());
+        let client_output = DelayFirstWrite {
+            inner: FdWriter(client_left),
+            delay: Duration::from_millis(150),
+            delayed: false,
+        };
+        let mut client = ControlClient::connect(client_input, client_output, key).unwrap();
+        assert_eq!(
+            client.request(ControlCommand::Status).unwrap(),
+            json!({"ok": true})
+        );
+        client.request_shutdown().unwrap();
+
+        let outcome = server_thread.join().unwrap();
+        assert_eq!(outcome.stop(), ServeStop::ShutdownRequested);
+        assert_eq!(outcome.cleanup(), CleanupOutcome::Complete);
+        assert_eq!(cleanups.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_fd_sink_does_not_set_o_nonblock_on_the_shared_description() {
+        let pair = SocketPair::new();
+        let before = get_flags(pair.right_fd());
+        assert_eq!(
+            before & libc::O_NONBLOCK,
+            0,
+            "the test socket starts blocking"
+        );
+        {
+            let _sink =
+                FdSink::new(pair.right(), CancelToken::new(), Duration::from_millis(50)).unwrap();
+            let during = get_flags(pair.right_fd());
+            assert_eq!(during & libc::O_NONBLOCK, before & libc::O_NONBLOCK);
+        }
+        let after = get_flags(pair.right_fd());
+        assert_eq!(after & libc::O_NONBLOCK, before & libc::O_NONBLOCK);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn apple_options(fd: RawFd) -> (libc::timeval, libc::c_int) {
+        (
+            get_socket_option::<libc::timeval>(fd, libc::SO_SNDTIMEO).expect("read send timeout"),
+            get_socket_option::<libc::c_int>(fd, libc::SO_NOSIGPIPE).expect("read no-sigpipe"),
+        )
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn set_apple_options(fd: RawFd, timeout: libc::timeval, no_sigpipe: libc::c_int) {
+        set_socket_option(fd, libc::SO_SNDTIMEO, &timeout).expect("set send timeout");
+        set_socket_option(fd, libc::SO_NOSIGPIPE, &no_sigpipe).expect("set no-sigpipe");
+    }
+
+    /// The sink must put back each non-default original value. Distinct
+    /// originals show that the restore reads the saved value and does not just
+    /// write a fixed default. The active values must differ from every original,
+    /// so a sink that restored nothing would fail.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn the_apple_sink_restores_distinct_original_socket_options() {
+        let active_timeout = libc::timeval {
+            tv_sec: (SESSION_POLL_INTERVAL.as_micros() / 1_000_000) as libc::time_t,
+            tv_usec: (SESSION_POLL_INTERVAL.as_micros() % 1_000_000) as libc::suseconds_t,
+        };
+        let originals = [
+            (
+                libc::timeval {
+                    tv_sec: 3,
+                    tv_usec: 250_000,
+                },
+                0,
+            ),
+            (
+                libc::timeval {
+                    tv_sec: 0,
+                    tv_usec: 0,
+                },
+                1,
+            ),
+            (
+                libc::timeval {
+                    tv_sec: 7,
+                    tv_usec: 0,
+                },
+                1,
+            ),
+            (
+                libc::timeval {
+                    tv_sec: 0,
+                    tv_usec: 0,
+                },
+                0,
+            ),
+        ];
+        for (timeout, no_sigpipe) in originals {
+            let pair = SocketPair::new();
+            set_apple_options(pair.right_fd(), timeout, no_sigpipe);
+            let before = apple_options(pair.right_fd());
+            assert_eq!(
+                (before.0.tv_sec, before.0.tv_usec),
+                (timeout.tv_sec, timeout.tv_usec)
+            );
+            assert_eq!(before.1 != 0, no_sigpipe != 0);
+            {
+                let _sink =
+                    FdSink::new(pair.right(), CancelToken::new(), Duration::from_millis(50))
+                        .unwrap();
+                let during = apple_options(pair.right_fd());
+                assert_eq!(
+                    (during.0.tv_sec, during.0.tv_usec),
+                    (active_timeout.tv_sec, active_timeout.tv_usec)
+                );
+                assert_ne!(during.1, 0, "the sink must suppress SIGPIPE while it lives");
+            }
+            let after = apple_options(pair.right_fd());
+            assert_eq!(
+                (after.0.tv_sec, after.0.tv_usec),
+                (timeout.tv_sec, timeout.tv_usec)
+            );
+            assert_eq!(after.1 != 0, no_sigpipe != 0, "no-sigpipe changed");
+        }
+    }
+
+    /// A failed setup must leave the socket options as they were. On the
+    /// tested macOS version a closed peer rejects the first option write, so
+    /// this does not exercise rollback after a later setup failure.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_failed_apple_setup_leaves_the_original_socket_options() {
+        let mut pair = SocketPair::new();
+        let timeout = libc::timeval {
+            tv_sec: 5,
+            tv_usec: 0,
+        };
+        set_apple_options(pair.right_fd(), timeout, 0);
+        pair.close_left();
+        let before = apple_options(pair.right_fd());
+        let result = FdSink::new(pair.right(), CancelToken::new(), Duration::from_millis(50));
+        let after = apple_options(pair.right_fd());
+        match result {
+            Err(FdSinkError::Io) => {}
+            Ok(sink) => drop(sink),
+            Err(other) => panic!("unexpected setup failure: {other:?}"),
+        }
+        let restored = apple_options(pair.right_fd());
+        for options in [after, restored] {
+            assert_eq!(
+                (options.0.tv_sec, options.0.tv_usec),
+                (before.0.tv_sec, before.0.tv_usec)
+            );
+            assert_eq!(options.1, before.1);
+        }
+    }
+
+    /// Dropping the sink after the peer closed must not panic. The restore can
+    /// fail and is ignored, so the test checks only that the drop completes.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn dropping_an_apple_sink_after_the_peer_closed_does_not_panic() {
+        let mut pair = SocketPair::new();
+        let left = pair.left.take();
+        let sink =
+            FdSink::new(pair.right(), CancelToken::new(), Duration::from_millis(50)).unwrap();
+        drop(left);
+        drop(sink);
+        // The descriptor is still valid for the caller to close.
+        pair.close_right();
+    }
+
+    #[test]
+    fn a_full_output_buffer_hits_the_absolute_deadline_without_duplicate_bytes() {
+        let (mut pair, remaining_filler) = full_output_pair(8192);
+        let mut sink =
+            FdSink::new(pair.right(), CancelToken::new(), Duration::from_millis(150)).unwrap();
+        let payload = vec![0x5au8; MAX_RESPONSE_PAYLOAD];
+        let started = Instant::now();
+        let result = sink.send(FrameKind::Response, 7, &payload);
+        let elapsed = started.elapsed();
+        assert_eq!(result, Err(WriteFailure::TimedOut));
+        assert!(elapsed >= Duration::from_millis(100), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        drop(sink);
+        pair.close_right();
+
+        let drained = drain_available(pair.left_fd());
+        assert!(drained.len() >= remaining_filler);
+        let frame_prefix = &drained[remaining_filler..];
+        assert!(!frame_prefix.is_empty(), "the frame wrote no bytes");
+        let expected = encoded_frame(FrameKind::Response, 7, &payload);
+        assert!(frame_prefix.len() <= expected.len());
+        assert_eq!(frame_prefix, &expected[..frame_prefix.len()]);
+    }
+
+    #[test]
+    fn parent_loss_unblocks_a_full_output_buffer_without_duplicate_bytes() {
+        let (mut pair, remaining_filler) = full_output_pair(8192);
+        let cancel = CancelToken::new();
+        let mut sink = FdSink::new(pair.right(), cancel.clone(), Duration::from_secs(30)).unwrap();
+        let payload = vec![0x3cu8; MAX_RESPONSE_PAYLOAD];
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            cancel.request(CancelReason::ParentLost);
+        });
+        let started = Instant::now();
+        let result = sink.send(FrameKind::Response, 9, &payload);
+        let elapsed = started.elapsed();
+        assert_eq!(
+            result,
+            Err(WriteFailure::Cancelled(CancelReason::ParentLost))
+        );
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        trigger.join().unwrap();
+        drop(sink);
+        pair.close_right();
+
+        let drained = drain_available(pair.left_fd());
+        assert!(drained.len() >= remaining_filler);
+        let frame_prefix = &drained[remaining_filler..];
+        assert!(!frame_prefix.is_empty(), "the frame wrote no bytes");
+        let expected = encoded_frame(FrameKind::Response, 9, &payload);
+        assert!(frame_prefix.len() <= expected.len());
+        assert_eq!(frame_prefix, &expected[..frame_prefix.len()]);
+    }
+
+    #[test]
+    fn the_parent_watch_unblocks_a_full_output_buffer() {
+        let (mut pair, remaining_filler) = full_output_pair(8192);
+        let (read_fd, write_fd) = pipe_pair();
+        let cancel = CancelToken::new();
+        let _watch = ParentWatch::start(FdReader(owned(read_fd)), cancel.clone()).unwrap();
+        let mut sink = FdSink::new(pair.right(), cancel.clone(), Duration::from_secs(30)).unwrap();
+        let payload = vec![0x44u8; MAX_RESPONSE_PAYLOAD];
+        let thread_payload = payload.clone();
+        let result = thread::scope(|scope| {
+            let sender = scope.spawn(move || sink.send(FrameKind::Response, 13, &thread_payload));
+            thread::sleep(Duration::from_millis(50));
+            unsafe {
+                libc::close(write_fd);
+            }
+            sender.join().unwrap()
+        });
+        assert_eq!(
+            result,
+            Err(WriteFailure::Cancelled(CancelReason::ParentLost))
+        );
+        pair.close_right();
+        let drained = drain_available(pair.left_fd());
+        assert!(drained.len() >= remaining_filler);
+        let frame_prefix = &drained[remaining_filler..];
+        assert!(!frame_prefix.is_empty(), "the frame wrote no bytes");
+        let expected = encoded_frame(FrameKind::Response, 13, &payload);
+        assert!(frame_prefix.len() <= expected.len());
+        assert_eq!(frame_prefix, &expected[..frame_prefix.len()]);
+    }
+
+    #[test]
+    fn short_writes_deliver_each_response_byte_once() {
+        let mut pair = SocketPair::new();
+        set_socket_buffer(pair.right_fd(), libc::SO_SNDBUF, 2048);
+        set_socket_buffer(pair.left_fd(), libc::SO_RCVBUF, 2048);
+        let reader_fd = pair.left_fd();
+        let reader = thread::spawn(move || {
+            let mut collected = Vec::new();
+            let mut buffer = [0u8; 512];
+            loop {
+                let read =
+                    unsafe { libc::read(reader_fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+                if read > 0 {
+                    collected.extend_from_slice(&buffer[..read as usize]);
+                    continue;
+                }
+                if read == 0 {
+                    break;
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic!("reader failed: {error}");
+            }
+            collected
+        });
+
+        let payload: Vec<u8> = (0..MAX_RESPONSE_PAYLOAD)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let mut sink =
+            FdSink::new(pair.right(), CancelToken::new(), Duration::from_secs(5)).unwrap();
+        let result = sink.send(FrameKind::Response, 11, &payload);
+        assert_eq!(result, Ok(()));
+        drop(sink);
+        pair.close_right();
+
+        let bytes = reader.join().unwrap();
+        let expected = encoded_frame(FrameKind::Response, 11, &payload);
+        assert_eq!(bytes.len(), expected.len());
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn an_oversized_frame_is_refused_before_the_first_byte() {
+        let pair = SocketPair::new();
+        let mut sink =
+            FdSink::new(pair.right(), CancelToken::new(), Duration::from_millis(100)).unwrap();
+        let payload = vec![0u8; MAX_RESPONSE_PAYLOAD + 1];
+        assert_eq!(
+            sink.send(FrameKind::Response, 1, &payload),
+            Err(WriteFailure::TooLarge)
+        );
+        drop(sink);
+        let drained = drain_available(pair.left_fd());
+        assert!(drained.is_empty());
+    }
+
+    #[test]
+    fn a_closed_peer_returns_io_without_sigpipe() {
+        let mut pair = SocketPair::new();
+        pair.close_left();
+        // Apple can refuse socket option setup after the peer has closed. That
+        // is also a fixed failure before any byte, and it must not raise SIGPIPE.
+        match FdSink::new(pair.right(), CancelToken::new(), Duration::from_secs(1)) {
+            Ok(mut sink) => {
+                let result = sink.send(FrameKind::Fatal, 0, &[WireError::Internal as u8]);
+                assert_eq!(result, Err(WriteFailure::Io));
+            }
+            Err(FdSinkError::Io) => (),
+            Err(other) => panic!("unexpected sink setup failure: {other:?}"),
+        }
+    }
+    // The tests below run a child process. Rust's runtime ignores SIGPIPE
+    // before `main`, and the shared socket helpers set `SO_NOSIGPIPE` on Apple,
+    // so a same-process test cannot show that the sink itself prevents the
+    // signal. The child restores the default `SIGPIPE` action, unblocks it, and
+    // uses sockets with no helper protection. The parent checks that the child
+    // exits normally. The `unprotected` mode is the positive control: a plain
+    // write on the same kind of socket must kill the child with `SIGPIPE`.
+    const SIGPIPE_CHILD_ENV: &str = "HS_DESKTOP_CONTROL_SIGPIPE_CHILD";
+    const SIGPIPE_CHILD_MARKER: &str = "SIGPIPE_CHILD_COMPLETE";
+    const SIGPIPE_CHILD_TEST: &str = "desktop_control::fd_output_tests::sigpipe_child_entry";
+
+    /// A stream socketpair with no test protection against `SIGPIPE`.
+    fn unprotected_socketpair() -> (OwnedFd, OwnedFd) {
+        let mut fds = [-1; 2];
+        let result =
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(result, 0, "socketpair: {}", io::Error::last_os_error());
+        (owned(fds[0]), owned(fds[1]))
+    }
+
+    /// Restore the default `SIGPIPE` action and unblock it on this thread.
+    fn install_default_sigpipe() {
+        unsafe {
+            let previous = libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            assert_ne!(
+                previous,
+                libc::SIG_ERR,
+                "signal: {}",
+                io::Error::last_os_error()
+            );
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            assert_eq!(libc::sigemptyset(&mut set), 0);
+            assert_eq!(libc::sigaddset(&mut set, libc::SIGPIPE), 0);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()),
+                0
+            );
+            // Prove the state instead of trusting the calls above.
+            let mut action: libc::sigaction = std::mem::zeroed();
+            assert_eq!(
+                libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut action),
+                0
+            );
+            assert_eq!(action.sa_sigaction, libc::SIG_DFL, "SIGPIPE is not default");
+            let mut current: libc::sigset_t = std::mem::zeroed();
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut current),
+                0
+            );
+            assert_eq!(
+                libc::sigismember(&current, libc::SIGPIPE),
+                0,
+                "SIGPIPE blocked"
+            );
+        }
+    }
+
+    /// Close the peer when the server first reads, then supply the input.
+    struct ClosePeerOnFirstRead {
+        peer: Option<OwnedFd>,
+        input: io::Cursor<Vec<u8>>,
+    }
+
+    impl Read for ClosePeerOnFirstRead {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.peer = None;
+            self.input.read(buffer)
+        }
+    }
+
+    /// Runs only inside the child process that the parent tests start. A
+    /// normal test run returns at once.
+    #[test]
+    fn sigpipe_child_entry() {
+        let Ok(mode) = std::env::var(SIGPIPE_CHILD_ENV) else {
+            return;
+        };
+        install_default_sigpipe();
+        match mode.as_str() {
+            "unprotected" => {
+                let (left, right) = unprotected_socketpair();
+                drop(left);
+                let byte = [0u8; 1];
+                // No protection: the default action ends this process.
+                let result = unsafe { libc::write(right.as_raw_fd(), byte.as_ptr().cast(), 1) };
+                println!("UNPROTECTED_WRITE_RETURNED {result}");
+            }
+            "sink" => {
+                let (left, right) = unprotected_socketpair();
+                // The sink is built while the peer is open, so Apple setup
+                // succeeds and the send itself meets the closed peer.
+                let mut sink = FdSink::new(
+                    unsafe { std::os::fd::BorrowedFd::borrow_raw(right.as_raw_fd()) },
+                    CancelToken::new(),
+                    Duration::from_secs(1),
+                )
+                .expect("sink setup");
+                drop(left);
+                let result = sink.send(FrameKind::Fatal, 0, &[WireError::Internal as u8]);
+                assert_eq!(result, Err(WriteFailure::Io));
+                drop(sink);
+                println!("{SIGPIPE_CHILD_MARKER}");
+            }
+            "serve" => {
+                let (left, right) = unprotected_socketpair();
+                let key = test_key();
+                let nonce = [0x42u8; NONCE_LEN];
+                let client_nonce = [0x11u8; NONCE_LEN];
+                let proof = session_proof(&key, HELLO_LABEL, &nonce, &client_nonce);
+                let mut hello = Vec::with_capacity(HELLO_LEN);
+                hello.extend_from_slice(&client_nonce);
+                hello.extend_from_slice(&proof);
+                let mut input = Vec::new();
+                write_frame(&mut input, FrameKind::Hello, 0, &hello).unwrap();
+                let cleanups = Arc::new(AtomicUsize::new(0));
+                // The challenge goes out while the peer is open. The reader
+                // closes the peer before the ready frame is written.
+                let outcome = ControlServer::with_nonce(counting_handler(&cleanups), key, nonce)
+                    .serve_fd(
+                        ClosePeerOnFirstRead {
+                            peer: Some(left),
+                            input: io::Cursor::new(input),
+                        },
+                        right.as_fd(),
+                        CancelToken::new(),
+                        Duration::from_secs(1),
+                    );
+                assert_eq!(outcome.stop(), ServeStop::Fault(ControlFault::Io));
+                assert_eq!(outcome.cleanup(), CleanupOutcome::Complete);
+                assert_eq!(cleanups.load(AtomicOrdering::SeqCst), 1);
+                println!("{SIGPIPE_CHILD_MARKER}");
+            }
+            other => panic!("unknown child mode {other}"),
+        }
+    }
+
+    struct ChildResult {
+        status: std::process::ExitStatus,
+        stdout: String,
+        stderr: String,
+    }
+
+    fn run_sigpipe_child(mode: &str) -> ChildResult {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                SIGPIPE_CHILD_TEST,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SIGPIPE_CHILD_ENV, mode)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn child");
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait child") {
+                break status;
+            }
+            if started.elapsed() > Duration::from_secs(30) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the {mode} child did not finish");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stdout.take() {
+            let _ = pipe.read_to_string(&mut stdout);
+        }
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        ChildResult {
+            status,
+            stdout,
+            stderr,
+        }
+    }
+
+    #[test]
+    fn an_unprotected_write_is_killed_by_sigpipe_in_the_child() {
+        use std::os::unix::process::ExitStatusExt;
+        let result = run_sigpipe_child("unprotected");
+        assert_eq!(
+            result.status.signal(),
+            Some(libc::SIGPIPE),
+            "the control child must die from SIGPIPE: {:?}\nstdout: {}\nstderr: {}",
+            result.status,
+            result.stdout,
+            result.stderr
+        );
+    }
+
+    #[test]
+    fn the_fd_sink_raises_no_sigpipe_under_the_default_signal_action() {
+        use std::os::unix::process::ExitStatusExt;
+        for mode in ["sink", "serve"] {
+            let result = run_sigpipe_child(mode);
+            assert_eq!(
+                result.status.signal(),
+                None,
+                "{mode} raised a signal: {:?}\nstderr: {}",
+                result.status,
+                result.stderr
+            );
+            assert!(
+                result.status.success(),
+                "{mode} failed: {:?}\nstdout: {}\nstderr: {}",
+                result.status,
+                result.stdout,
+                result.stderr
+            );
+            assert!(
+                result.stdout.contains(SIGPIPE_CHILD_MARKER),
+                "{mode} child did not run the test: {}",
+                result.stdout
+            );
+        }
+    }
+
+    #[test]
+    fn a_pipe_output_is_refused_before_writing() {
+        let (read_fd, write_fd) = pipe_pair();
+        let read_end = owned(read_fd);
+        let write_end = owned(write_fd);
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let outcome =
+            ControlServer::with_nonce(counting_handler(&cleanups), test_key(), [0x42u8; NONCE_LEN])
+                .serve_fd_owned(
+                    io::Cursor::new(Vec::<u8>::new()),
+                    write_end,
+                    CancelToken::new(),
+                    Duration::from_millis(100),
+                );
+        assert_eq!(
+            outcome.stop(),
+            ServeStop::Fault(ControlFault::UnsupportedOutput)
+        );
+        assert_eq!(outcome.cleanup(), CleanupOutcome::Complete);
+        assert_eq!(cleanups.load(AtomicOrdering::SeqCst), 1);
+        let mut descriptor = libc::pollfd {
+            fd: read_end.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        assert!(ready >= 0, "poll: {}", io::Error::last_os_error());
+        assert_ne!(
+            descriptor.revents & libc::POLLHUP,
+            0,
+            "the owned pipe write end must close"
+        );
+        let drained = drain_available(read_end.as_raw_fd());
+        assert!(drained.is_empty(), "a refused pipe must receive no bytes");
+    }
+
+    #[test]
+    fn a_datagram_socket_is_refused_before_writing() {
+        let pair = SocketPair::with_type(libc::SOCK_DGRAM);
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let outcome =
+            ControlServer::with_nonce(counting_handler(&cleanups), test_key(), [0x42u8; NONCE_LEN])
+                .serve_fd(
+                    io::Cursor::new(Vec::<u8>::new()),
+                    pair.right(),
+                    CancelToken::new(),
+                    Duration::from_millis(100),
+                );
+        assert_eq!(
+            outcome.stop(),
+            ServeStop::Fault(ControlFault::UnsupportedOutput)
+        );
+        assert_eq!(outcome.cleanup(), CleanupOutcome::Complete);
+        assert_eq!(cleanups.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    fn serve_with_output(output: std::os::fd::BorrowedFd<'_>) -> (ServeOutcome, usize) {
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let outcome =
+            ControlServer::with_nonce(counting_handler(&cleanups), test_key(), [0x42u8; NONCE_LEN])
+                .serve_fd(
+                    io::Cursor::new(Vec::<u8>::new()),
+                    output,
+                    CancelToken::new(),
+                    Duration::from_millis(100),
+                );
+        (outcome, cleanups.load(AtomicOrdering::SeqCst))
+    }
+
+    fn assert_refused_with_cleanup(output: std::os::fd::BorrowedFd<'_>) {
+        let (outcome, cleanups) = serve_with_output(output);
+        assert_eq!(
+            outcome.stop(),
+            ServeStop::Fault(ControlFault::UnsupportedOutput)
+        );
+        assert_eq!(outcome.cleanup(), CleanupOutcome::Complete);
+        assert_eq!(cleanups, 1);
+    }
+
+    #[test]
+    fn a_tcp_socket_is_refused_before_writing() {
+        use std::net::{TcpListener, TcpStream};
+        // Loopback only. This opens no route and no interface.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server_side, _) = listener.accept().unwrap();
+        assert_refused_with_cleanup(client.as_fd());
+        server_side.set_nonblocking(true).unwrap();
+        let mut byte = [0u8; 1];
+        let error = (&server_side).read(&mut byte).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::WouldBlock,
+            "a refused TCP socket must receive no bytes"
+        );
+        // A listening TCP socket is refused too.
+        assert_refused_with_cleanup(listener.as_fd());
+    }
+
+    #[test]
+    fn a_listening_unix_socket_is_refused_before_writing() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let path = std::env::temp_dir().join(format!("hs-ctl-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
+        assert_refused_with_cleanup(listener.as_fd());
+        // The connected client of the same listener is a supported socket, so
+        // the refusal above comes from the listening state alone.
+        let (outcome, cleanups) = serve_with_output(client.as_fd());
+        assert_eq!(outcome.stop(), ServeStop::ParentClosed);
+        assert_eq!(cleanups, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_regular_file_and_a_character_device_are_refused() {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        assert_refused_with_cleanup(file.as_fd());
+        let exe = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        assert_refused_with_cleanup(exe.as_fd());
+    }
+
+    #[test]
+    fn an_unconnected_unix_stream_socket_fails_closed_with_no_bytes() {
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        let socket = owned(fd);
+        let (outcome, cleanups) = serve_with_output(socket.as_fd());
+        // Apple platforms refuse it at the type guard. Linux and Android pass the
+        // guard and the first send fails. Both end with a fixed fault.
+        #[cfg(target_vendor = "apple")]
+        assert_eq!(
+            outcome.stop(),
+            ServeStop::Fault(ControlFault::UnsupportedOutput)
+        );
+        #[cfg(not(target_vendor = "apple"))]
+        assert_eq!(outcome.stop(), ServeStop::Fault(ControlFault::Io));
+        assert_eq!(outcome.cleanup(), CleanupOutcome::Complete);
+        assert_eq!(cleanups, 1);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_seqpacket_socket_is_refused_before_writing() {
+        let pair = SocketPair::with_type(libc::SOCK_SEQPACKET);
+        assert_refused_with_cleanup(pair.right());
+    }
+
+    #[test]
+    fn serve_fd_owned_closes_the_descriptor_and_borrowed_keeps_it() {
+        let nonce = [0x42u8; NONCE_LEN];
+        let expected = encoded_frame(FrameKind::Challenge, 0, &nonce);
+
+        // The owned call closes the server end. The peer sees the challenge
+        // followed by end-of-file, which proves closure without checking a raw
+        // descriptor number that another test thread could reuse.
+        let mut pair = SocketPair::new();
+        let write_end = pair.take_right();
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let outcome = ControlServer::with_nonce(counting_handler(&cleanups), test_key(), nonce)
+            .serve_fd_owned(
+                io::Cursor::new(Vec::<u8>::new()),
+                write_end,
+                CancelToken::new(),
+                Duration::from_millis(100),
+            );
+        assert_eq!(outcome.stop(), ServeStop::ParentClosed);
+        assert_eq!(outcome.cleanup(), CleanupOutcome::Complete);
+        assert_eq!(drain_available(pair.left_fd()), expected);
+        let mut descriptor = libc::pollfd {
+            fd: pair.left_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        assert!(ready >= 0, "poll: {}", io::Error::last_os_error());
+        assert_ne!(
+            descriptor.revents & libc::POLLHUP,
+            0,
+            "the owned server end must close"
+        );
+
+        // The borrowed call leaves the descriptor open. The peer receives the
+        // challenge and no end-of-file, so it cannot report a hangup.
+        let pair = SocketPair::new();
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let outcome = ControlServer::with_nonce(counting_handler(&cleanups), test_key(), nonce)
+            .serve_fd(
+                io::Cursor::new(Vec::<u8>::new()),
+                pair.right(),
+                CancelToken::new(),
+                Duration::from_millis(100),
+            );
+        assert_eq!(outcome.stop(), ServeStop::ParentClosed);
+        assert_eq!(outcome.cleanup(), CleanupOutcome::Complete);
+        assert_eq!(drain_available(pair.left_fd()), expected);
+        let mut descriptor = libc::pollfd {
+            fd: pair.left_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        assert_eq!(ready, 0, "the borrowed server end must stay open");
+    }
+
+    #[test]
+    fn invalid_output_deadlines_write_nothing() {
+        for deadline in [Duration::ZERO, Duration::MAX] {
+            let pair = SocketPair::new();
+            let mut sink = FdSink::new(pair.right(), CancelToken::new(), deadline).unwrap();
+            assert_eq!(
+                sink.send(FrameKind::Response, 1, b"x"),
+                Err(WriteFailure::TimedOut)
+            );
+            drop(sink);
+            let drained = drain_available(pair.left_fd());
+            assert!(drained.is_empty(), "deadline {deadline:?} wrote bytes");
+        }
+    }
+
+    #[test]
+    fn a_cancelled_sink_writes_nothing() {
+        let pair = SocketPair::new();
+        let cancel = CancelToken::new();
+        assert!(cancel.request(CancelReason::LocalStop));
+        let mut sink = FdSink::new(pair.right(), cancel, Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            sink.send(FrameKind::Response, 1, b"x"),
+            Err(WriteFailure::Cancelled(CancelReason::LocalStop))
+        );
+        drop(sink);
+        let drained = drain_available(pair.left_fd());
+        assert!(drained.is_empty());
+    }
+
+    #[test]
+    fn output_failures_map_to_fixed_stops() {
+        assert_eq!(
+            stop_for_write_failure(WriteFailure::Io),
+            ServeStop::Fault(ControlFault::Io)
+        );
+        assert_eq!(
+            stop_for_write_failure(WriteFailure::TooLarge),
+            ServeStop::Fault(ControlFault::OversizedFrame)
+        );
+        assert_eq!(
+            stop_for_write_failure(WriteFailure::TimedOut),
+            ServeStop::Fault(ControlFault::OutputDeadline)
+        );
+        assert_eq!(
+            stop_for_write_failure(WriteFailure::Cancelled(CancelReason::ParentLost)),
+            ServeStop::Cancelled(CancelReason::ParentLost)
+        );
+        assert_eq!(
+            ControlFault::UnsupportedOutput.wire_error(),
+            Some(WireError::Unsupported)
+        );
+        assert_eq!(
+            ControlFault::UnsupportedOutput.message(),
+            "The control output is not a supported stream socket."
+        );
+        // A deadline reply would block on the same full channel.
+        assert_eq!(ControlFault::OutputDeadline.wire_error(), None);
+    }
+
+    struct FixedFailure {
+        failure: WriteFailure,
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl FrameSink for FixedFailure {
+        fn send(
+            &mut self,
+            _kind: FrameKind,
+            _id: u32,
+            _payload: &[u8],
+        ) -> Result<(), WriteFailure> {
+            self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            Err(self.failure)
+        }
+    }
+
+    #[test]
+    fn a_blocked_response_is_attempted_once_and_reported() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut sink = FixedFailure {
+            failure: WriteFailure::TimedOut,
+            attempts: Arc::clone(&attempts),
+        };
+        match write_value(&mut sink, 4, &json!({"ok": true})) {
+            Answer::Failed(WriteFailure::TimedOut) => (),
+            _ => panic!("unexpected answer"),
+        }
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn serve_fd_writes_the_challenge_and_runs_cleanup_on_a_closed_input() {
+        let pair = SocketPair::new();
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let handler = counting_handler(&cleanups);
+        let nonce = [0x42u8; NONCE_LEN];
+        let outcome = ControlServer::with_nonce(handler, test_key(), nonce).serve_fd(
+            io::Cursor::new(Vec::<u8>::new()),
+            pair.right(),
+            CancelToken::new(),
+            Duration::from_millis(200),
+        );
+        assert_eq!(outcome.stop(), ServeStop::ParentClosed);
+        assert_eq!(outcome.cleanup(), CleanupOutcome::Complete);
+        assert_eq!(cleanups.load(AtomicOrdering::SeqCst), 1);
+
+        let bytes = drain_available(pair.left_fd());
+        let mut cursor = io::Cursor::new(bytes);
+        match read_frame(&mut cursor, HANDSHAKE_MAX_PAYLOAD) {
+            FrameRead::Frame(frame) => {
+                assert_eq!(frame.kind, FrameKind::Challenge);
+                assert_eq!(frame.id, 0);
+                assert_eq!(frame.payload, nonce.to_vec());
+            }
+            other => panic!("unexpected read: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_full_buffer_stops_a_large_response_before_it_duplicates_bytes() {
+        let mut pair = SocketPair::new();
+        set_socket_buffer(pair.right_fd(), libc::SO_SNDBUF, 4096);
+        set_socket_buffer(pair.left_fd(), libc::SO_RCVBUF, 4096);
+        let key = test_key();
+        let nonce = [0x24u8; NONCE_LEN];
+        let client_nonce = [0x11u8; NONCE_LEN];
+        let proof = session_proof(&key, HELLO_LABEL, &nonce, &client_nonce);
+        let mut hello = Vec::with_capacity(HELLO_LEN);
+        hello.extend_from_slice(&client_nonce);
+        hello.extend_from_slice(&proof);
+        let mut input = Vec::new();
+        write_frame(&mut input, FrameKind::Hello, 0, &hello).unwrap();
+        write_frame(
+            &mut input,
+            FrameKind::Request,
+            1,
+            &ControlCommand::Status.encode(),
+        )
+        .unwrap();
+
+        let value = json!({"text": "a".repeat(60_000)});
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let handler = CountingHandler {
+            cleanups: Arc::clone(&cleanups),
+            response: value.clone(),
+        };
+        let outcome = ControlServer::with_nonce(handler, key.clone(), nonce).serve_fd(
+            io::Cursor::new(input),
+            pair.right(),
+            CancelToken::new(),
+            Duration::from_millis(200),
+        );
+        assert_eq!(
+            outcome.stop(),
+            ServeStop::Fault(ControlFault::OutputDeadline)
+        );
+        assert_eq!(outcome.cleanup(), CleanupOutcome::Complete);
+        assert_eq!(cleanups.load(AtomicOrdering::SeqCst), 1);
+
+        let mut expected = Vec::new();
+        write_frame(&mut expected, FrameKind::Challenge, 0, &nonce).unwrap();
+        let ready = session_proof(&key, READY_LABEL, &nonce, &client_nonce);
+        write_frame(&mut expected, FrameKind::Ready, 0, &ready).unwrap();
+        let mut response = vec![0u8];
+        response.extend_from_slice(&serde_json::to_vec(&value).unwrap());
+        write_frame(&mut expected, FrameKind::Response, 1, &response).unwrap();
+
+        pair.close_right();
+        let drained = drain_available(pair.left_fd());
+        assert!(!drained.is_empty());
+        assert!(
+            drained.len() < expected.len(),
+            "the whole response should not fit"
+        );
+        assert!(drained.len() > 2 * HEADER_LEN + 2 * PROOF_LEN);
+        assert_eq!(drained, expected[..drained.len()]);
+    }
+}
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;

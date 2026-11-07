@@ -25,7 +25,6 @@ import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material.icons.outlined.Wifi
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -36,10 +35,9 @@ import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
-import com.hotspotshade.demo.model.DemoEngine
-import com.hotspotshade.demo.model.DemoState
 import com.hotspotshade.demo.model.RealProxyState
 import com.hotspotshade.demo.model.StatusKind
+import com.hotspotshade.demo.model.formatStopTime
 import com.hotspotshade.demo.ui.theme.LocalHsTokens
 import com.hotspotshade.demo.ui.theme.LocalReduceMotion
 
@@ -53,31 +51,20 @@ private data class DashboardDisplay(
     val actionLabel: String,
     val usageTitle: String,
     val usageSummary: String,
-    val usageDetail: String?,
     val connectionLines: List<String>,
-    val connectionSimulated: Boolean,
     val connectionNote: String?,
     val lastStopLine: String?,
     val keepAwakeMessage: String,
-    val showKeepAwakeSettings: Boolean,
 )
 
 @Composable
 fun DashboardScreen(
     real: RealProxyState,
-    preview: DemoState,
-    previewMode: Boolean,
     trustedTargets: Int,
     onStartStop: () -> Unit,
-    onOpenSettings: () -> Unit,
-    onOpenPreview: () -> Unit,
 ) {
     val reduce = LocalReduceMotion.current
-    val display = if (previewMode) {
-        previewDisplay(preview)
-    } else {
-        realDisplay(real, trustedTargets)
-    }
+    val display = realDisplay(real, trustedTargets)
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -94,14 +81,10 @@ fun DashboardScreen(
         ) {
             StatusCard(
                 display = display,
-                previewMode = previewMode,
                 onStartStop = onStartStop,
             )
             UsageCard(display = display)
-            KeepAwakeCard(
-                display = display,
-                onOpenSettings = onOpenSettings,
-            )
+            KeepAwakeCard(display = display)
             AnimatedVisibility(
                 visible = display.lastStopLine != null,
                 enter = fadeIn(androidx.compose.animation.core.tween(if (reduce) 0 else 180)) +
@@ -111,26 +94,18 @@ fun DashboardScreen(
             ) {
                 LastStopCard(line = display.lastStopLine.orEmpty())
             }
-            if (!previewMode) {
-                OutlinedButton(
-                    onClick = onOpenPreview,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("Open preview controls")
-                }
-            }
         }
     }
 }
 
 private fun realDisplay(real: RealProxyState, trustedTargets: Int): DashboardDisplay {
     val keepAwake = if (real.running) {
-        "The proxy runs as a foreground service. Android keeps it awake while it is on."
+        "The proxy runs as a foreground service. Android can still restrict it."
     } else {
         "Starts when the proxy starts."
     }
     val lastStop = real.lastStopText?.let { line ->
-        val time = real.stoppedAtMillis?.let { DemoEngine.formatTime(it) }
+        val time = real.stoppedAtMillis?.let { formatStopTime(it) }
         if (time != null) "$line $time." else "$line."
     }
     return DashboardDisplay(
@@ -142,60 +117,16 @@ private fun realDisplay(real: RealProxyState, trustedTargets: Int): DashboardDis
         actionLabel = if (real.active) "Stop proxy" else "Start proxy",
         usageTitle = real.usageTitle,
         usageSummary = real.usageSummary(trustedTargets),
-        usageDetail = null,
         connectionLines = real.connectionLines,
-        connectionSimulated = false,
         connectionNote = "Real counts. No address or host is shown.",
         lastStopLine = lastStop,
         keepAwakeMessage = keepAwake,
-        showKeepAwakeSettings = false,
-    )
-}
-
-private fun previewDisplay(state: DemoState): DashboardDisplay {
-    val lastStop = if (state.lastStop != null) {
-        val time = state.lastStopAtMillis?.let { DemoEngine.formatTime(it) }
-        buildString {
-            append("Last stop: ")
-            append(state.lastStop.shortMessage)
-            if (time != null) {
-                append(" ")
-                append(time)
-                append(".")
-            }
-        }
-    } else {
-        null
-    }
-    return DashboardDisplay(
-        statusTitle = state.statusTitle,
-        statusMessage = state.statusMessage,
-        statusKind = state.statusKind,
-        running = state.running,
-        actionTitle = if (state.running) {
-            "Stop"
-        } else if (state.offerRestart) {
-            "Start again"
-        } else {
-            "Start"
-        },
-        actionLabel = if (state.running) "Stop preview" else "Start preview",
-        usageTitle = state.usageTitle,
-        usageSummary = state.usageSummary,
-        usageDetail = state.usageDetail,
-        connectionLines = state.connectionLines,
-        connectionSimulated = true,
-        connectionNote = null,
-        lastStopLine = lastStop,
-        keepAwakeMessage = state.keepAwakeMessage,
-        showKeepAwakeSettings = !state.keepAwake || state.simulatedLocationOff,
     )
 }
 
 @Composable
 private fun StatusCard(
     display: DashboardDisplay,
-    previewMode: Boolean,
     onStartStop: () -> Unit,
 ) {
     val reduce = LocalReduceMotion.current
@@ -259,10 +190,6 @@ private fun StatusCard(
                 }
             }
 
-            if (previewMode) {
-                SimulatedBadge(text = "Preview")
-            }
-
             PrimaryActionButton(
                 title = display.actionTitle,
                 accessibilityLabel = display.actionLabel,
@@ -301,28 +228,14 @@ private fun UsageCard(display: DashboardDisplay) {
                 style = MaterialTheme.typography.bodyLarge,
                 color = tokens.secondaryText,
             )
-            display.usageDetail?.let { detail ->
-                Text(
-                    text = detail,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = tokens.secondaryText,
-                )
-            }
             if (display.connectionLines.isNotEmpty()) {
                 Row(
                     modifier = Modifier.padding(top = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    if (display.connectionSimulated) {
-                        SimulatedBadge()
-                    }
                     Text(
-                        text = if (display.connectionSimulated) {
-                            "Connection attempts"
-                        } else {
-                            "Connections"
-                        },
+                        text = "Connections",
                         style = MaterialTheme.typography.bodySmall,
                         color = tokens.secondaryText,
                     )
@@ -358,10 +271,7 @@ private fun UsageCard(display: DashboardDisplay) {
 }
 
 @Composable
-private fun KeepAwakeCard(
-    display: DashboardDisplay,
-    onOpenSettings: () -> Unit,
-) {
+private fun KeepAwakeCard(display: DashboardDisplay) {
     val tokens = LocalHsTokens.current
     GlassCard {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -376,7 +286,7 @@ private fun KeepAwakeCard(
                     modifier = Modifier.size(20.dp),
                 )
                 Text(
-                    text = "Keeping awake",
+                    text = "Background operation",
                     style = MaterialTheme.typography.titleMedium,
                     modifier = Modifier.semantics { heading() },
                 )
@@ -386,14 +296,6 @@ private fun KeepAwakeCard(
                 style = MaterialTheme.typography.bodyMedium,
                 color = tokens.secondaryText,
             )
-            if (display.showKeepAwakeSettings) {
-                OutlinedButton(
-                    onClick = onOpenSettings,
-                    modifier = Modifier.padding(top = 4.dp),
-                ) {
-                    Text("Open Settings")
-                }
-            }
         }
     }
 }

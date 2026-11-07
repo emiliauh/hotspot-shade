@@ -1,0 +1,68 @@
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - lint
+      - release-audit
+      - rust-macos
+      - rust-windows
+      - rust-linux
+      - desktop-demo
+      - desktop-windows
+      - winui-demo
+      - android-demo
+      - ios
+      - macos-app
+      - verify-macos-binary
+      - verify-ios-ipa
+      - verify-macos-app
+      - artifact-integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-bundle
+          path: release
+      - name: Check the release set digests
+        env:
+          BINARY_SHA256: ${{ needs.verify-macos-binary.outputs.sha256 }}
+          IPA_SHA256: ${{ needs.verify-ios-ipa.outputs.sha256 }}
+          APP_SHA256: ${{ needs.verify-macos-app.outputs.sha256 }}
+          MANIFEST_SHA256: ${{ needs.artifact-integrity.outputs.manifest-sha256 }}
+        run: |
+          sh scripts/release_manifest.sh --expect "$BINARY_SHA256" release/hotspotshade-macos-arm64.bin
+          sh scripts/release_manifest.sh --expect "$IPA_SHA256" release/HotspotShade-iOS-unsigned.ipa
+          sh scripts/release_manifest.sh --expect "$APP_SHA256" release/HotspotShade-unsigned.zip
+          sh scripts/release_manifest.sh --expect "$MANIFEST_SHA256" release/SHA256SUMS
+      - name: Audit the release set against the tag
+        run: sh scripts/release_audit.sh --artifacts release --tag "$GITHUB_REF_NAME" --require-aligned-versions
+      - name: Verify the checksum manifest
+        run: sh scripts/release_manifest.sh --verify release
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: |
+            The iOS app is called HotspotShade. The IPA is unsigned. Sign it with your own certificate before you install it. See ios/README.md.
+
+            The binary for the target device has no executable bit after download. Run chmod +x on the file.
+
+            The HotspotShade app for macOS is ad-hoc signed and runs on arm64 only. It is not notarized.
+
+            SHA256SUMS and PROVENANCE.txt are attached. Check the digest before you run an artifact. The IPA has no app signature. The macOS app is ad-hoc signed and not notarized; the binary's signature is not verified by this workflow. These are not production releases.
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "$NOTES" \
+            release/hotspotshade-macos-arm64.bin \
+            release/HotspotShade-iOS-unsigned.ipa \
+            release/HotspotShade-unsigned.zip \
+            release/SHA256SUMS \
+            release/PROVENANCE.txt

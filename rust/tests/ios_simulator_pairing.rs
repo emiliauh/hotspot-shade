@@ -4,6 +4,7 @@
 //! It needs HS_IOS_SIM=1, a simulator that listens on 172.20.10.1:18090, and
 //! a person or script that taps Allow on the simulator prompt. It is ignored
 //! in normal runs. It uses a fixed public test key and never prints the token.
+//! Running it explicitly without HS_IOS_SIM=1 fails instead of reporting a pass.
 
 use hotspotshade::{
     normalization::Audit,
@@ -17,10 +18,11 @@ use std::time::Duration;
 #[test]
 #[ignore = "needs the iOS Simulator and a mimicked hotspot interface"]
 fn pair_with_the_ios_simulator_and_authenticate_to_its_proxy() {
-    if std::env::var("HS_IOS_SIM").ok().as_deref() != Some("1") {
-        eprintln!("HS_IOS_SIM is not 1; skipping");
-        return;
-    }
+    assert_eq!(
+        std::env::var("HS_IOS_SIM").ok().as_deref(),
+        Some("1"),
+        "set HS_IOS_SIM=1 only after preparing the simulator test environment"
+    );
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 20, 10, 1)), 18090);
     let identity = Identity::from_bytes([0x42; 32]);
     let audit = Audit::default();
@@ -61,5 +63,11 @@ fn pair_with_the_ios_simulator_and_authenticate_to_its_proxy() {
     proxy
         .check_cancellable(&audit, &cancelled)
         .expect("authentication to the iOS source proxy");
-    eprintln!("PROXY_AUTH_OK audit={:?}", audit.snapshot());
+    let (outer_sockets, ttl_bad) = audit.snapshot();
+    assert!(
+        outer_sockets >= 2,
+        "pairing and proxy checks must open sockets"
+    );
+    assert_eq!(ttl_bad, 0, "all outer sockets must pass the TTL audit");
+    eprintln!("PROXY_AUTH_OK audit=({outer_sockets}, {ttl_bad})");
 }

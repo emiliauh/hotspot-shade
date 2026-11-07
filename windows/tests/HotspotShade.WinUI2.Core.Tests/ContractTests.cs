@@ -141,15 +141,29 @@ namespace HotspotShade.WinUI2.Core.Tests
                 }
             });
 
-            runner.Check("contract: package declares no capabilities or extensions", delegate
+            runner.Check("contract: package declares the broker capabilities and no network capability", delegate
             {
                 XDocument package = XDocument.Load(manifest);
-                AssertEx.False(package.Descendants().Any(e => e.Name.LocalName == "Capability"), "Capability element");
-                AssertEx.False(package.Descendants().Any(e => e.Name.LocalName == "Extensions"), "Extensions element");
+                List<string> names = package.Descendants()
+                    .Where(e => e.Name.LocalName == "Capability" || e.Name.LocalName == "DeviceCapability")
+                    .Select(e => (string)e.Attribute("Name"))
+                    .OrderBy(name => name, StringComparer.Ordinal)
+                    .ToList();
+                AssertEx.Equal(2, names.Count, "capability count");
+                AssertEx.Equal("allowElevation", names[0], "elevation capability for Turn on");
+                AssertEx.Equal("runFullTrust", names[1], "full-trust broker capability");
                 string text = File.ReadAllText(manifest);
                 AssertEx.DoesNotContain(text, "internetClient", "internet capability");
                 AssertEx.DoesNotContain(text, "privateNetworkClientServer", "private network capability");
-                AssertEx.DoesNotContain(text, "runFullTrust", "full trust capability");
+                AssertEx.DoesNotContain(text, "(simulated)", "simulated display name");
+                List<string> categories = package.Descendants()
+                    .Where(e => e.Name.LocalName == "Extension")
+                    .Select(e => (string)e.Attribute("Category"))
+                    .OrderBy(name => name, StringComparer.Ordinal)
+                    .ToList();
+                AssertEx.Equal(2, categories.Count, "extension count");
+                AssertEx.Equal("windows.appService", categories[0], "app service extension");
+                AssertEx.Equal("windows.fullTrustProcess", categories[1], "full-trust extension");
             });
 
             runner.Check("contract: no signing material is committed", delegate
@@ -162,35 +176,103 @@ namespace HotspotShade.WinUI2.Core.Tests
                 }
             });
 
-            runner.Check("contract: app code has no network, process, or tunnel APIs", delegate
+            runner.Check("contract: source code has no network client, shell, or tunnel APIs outside the reviewed files", delegate
             {
-                foreach (string file in Files(root, "*.cs"))
+                foreach (string file in Files(Path.Combine(root, "src"), "*.cs"))
                 {
-                    if (file.EndsWith("ContractTests.cs", StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
+                    string normalized = file.Replace('\\', '/');
                     string text = File.ReadAllText(file);
+                    bool releaseProbe = normalized.Contains("/src/HotspotShade.WinUI2.ReleaseProbe/");
+                    // The broker, the starter, the console launcher, and the
+                    // window core name the wintun.dll file to check that it is
+                    // installed. None of them loads it; only the engine does.
+                    bool namesAdapterFile = normalized.Contains("/src/HotspotShade.WinUI2.Broker/")
+                        || normalized.Contains("/src/HotspotShade.WinUI2.Elevate/")
+                        || normalized.Contains("/src/HotspotShade.WinUI2.TestLauncher/")
+                        || normalized.Contains("/src/HotspotShade.WinUI2.Core/App/");
                     for (int index = 0; index < ForbiddenApiNames.Length; index++)
                     {
-                        AssertEx.DoesNotContain(text, ForbiddenApiNames[index], "forbidden API in " + file);
+                        string name = ForbiddenApiNames[index];
+                        if (releaseProbe && name == "Process.Start")
+                        {
+                            continue;
+                        }
+                        if (namesAdapterFile && name == "Wintun")
+                        {
+                            AssertEx.False(text.Contains("WintunOpen") || text.Contains("WintunCreate") || text.Contains("LoadLibrary"), "adapter API in " + file);
+                            continue;
+                        }
+                        if (name == "FullTrustProcessLauncher" && normalized.EndsWith("/src/HotspotShade.WinUI2/Services/BrokerConnection.cs"))
+                        {
+                            continue;
+                        }
+                        AssertEx.DoesNotContain(text, name, "forbidden API in " + file);
+                    }
+                    // Only the elevated launcher asks Windows for elevation.
+                    if (!normalized.EndsWith("/src/HotspotShade.WinUI2.Broker/ElevatedEngineLauncher.cs"))
+                    {
+                        AssertEx.DoesNotContain(text, "\"runas\"", "elevation verb in " + file);
+                    }
+                    if (!normalized.EndsWith("/src/HotspotShade.WinUI2.Broker/ElevatedEngineLauncher.cs")
+                        && !normalized.EndsWith("/src/HotspotShade.WinUI2.Broker/BrokerNative.cs"))
+                    {
+                        // The release probe turns shell execution off.
+                        string scan = releaseProbe ? text.Replace("UseShellExecute = false", "") : text;
+                        AssertEx.DoesNotContain(scan, "ShellExecute", "shell execution in " + file);
+                    }
+                    if (!normalized.EndsWith("/src/HotspotShade.WinUI2.Broker/Win32EngineHost.cs")
+                        && !normalized.EndsWith("/src/HotspotShade.WinUI2.Elevate/Program.cs")
+                        && !normalized.Contains("/src/HotspotShade.WinUI2.ServiceHost/")
+                        && !normalized.Contains("/src/HotspotShade.WinUI2.Service/")
+                        && !normalized.Contains("/src/HotspotShade.WinUI2.Core/Engine/Service/"))
+                    {
+                        AssertEx.DoesNotContain(text, "CreateProcess", "process creation in " + file);
+                    }
+                    AssertEx.DoesNotContain(text, "TerminateProcess", "forced termination in " + file);
+                    AssertEx.DoesNotContain(text, "SetEnvironmentVariable", "environment write in " + file);
+                    AssertEx.DoesNotContain(text, "EnvironmentVariables", "child environment in " + file);
+                }
+            });
+
+            runner.Check("contract: the window and the core hold no process, pipe, or loopback client", delegate
+            {
+                string[] scoped = { appDir, Path.Combine(root, "src", "HotspotShade.WinUI2.Core", "App") };
+                string[] names = { "CreateProcess", "CreatePipe", "WinHttp", "127.0.0.1", "DllImport", "ShellExecute" };
+                for (int dir = 0; dir < scoped.Length; dir++)
+                {
+                    foreach (string file in Files(scoped[dir], "*.cs"))
+                    {
+                        string text = File.ReadAllText(file);
+                        for (int index = 0; index < names.Length; index++)
+                        {
+                            AssertEx.DoesNotContain(text, names[index], names[index] + " in " + file);
+                        }
                     }
                 }
             });
 
-            runner.Check("contract: simulated labels are present", delegate
+            runner.Check("contract: the app has no demo, preview, or simulated surface", delegate
             {
-                StringBuilder text = new StringBuilder();
-                foreach (string file in Files(appDir, "*.cs", "*.xaml"))
+                string[] words = { "simulated", "Simulated", "Simulate", "simulate", "Demo", "demo", "preview", "Preview", "fake", "Fake" };
+                foreach (string file in Files(appDir, "*.cs", "*.xaml", "*.appxmanifest"))
                 {
-                    text.AppendLine(File.ReadAllText(file));
+                    string text = File.ReadAllText(file);
+                    for (int index = 0; index < words.Length; index++)
+                    {
+                        AssertEx.DoesNotContain(text, words[index], "demo word in " + file);
+                    }
                 }
-                string all = text.ToString();
-                AssertEx.Contains(all, "All data is simulated", "banner title");
-                AssertEx.Contains(all, "No tunnel", "no tunnel label");
-                AssertEx.Contains(all, "network listener", "no listener label");
-                AssertEx.Contains(all, "not production ready", "readiness label");
-                AssertEx.Contains(all, "Simulated", "simulated label");
+                foreach (string file in Files(Path.Combine(root, "src", "HotspotShade.WinUI2.Core"), "*.cs"))
+                {
+                    string name = Path.GetFileName(file);
+                    AssertEx.False(name.StartsWith("Demo", StringComparison.Ordinal), "demo source " + file);
+                }
+                foreach (string file in Files(Path.Combine(root, "src", "HotspotShade.WinUI2.Core", "App"), "*.cs"))
+                {
+                    string text = File.ReadAllText(file);
+                    AssertEx.DoesNotContain(text, "simulated", "simulated data in " + file);
+                    AssertEx.DoesNotContain(text, "--demo", "demo engine in " + file);
+                }
             });
 
             runner.Check("contract: dependency versions are pinned", delegate
@@ -250,6 +332,8 @@ namespace HotspotShade.WinUI2.Core.Tests
                 AssertEx.Contains(readme, "UWP", "UWP architecture");
                 AssertEx.Contains(readme, "WinUI 2", "WinUI 2");
                 AssertEx.Contains(readme, "not production ready", "readiness statement");
+                AssertEx.Contains(readme, "BUILD_AND_TEST_ON_PC.md", "PC build guide link");
+                AssertEx.True(File.Exists(Path.Combine(root, "BUILD_AND_TEST_ON_PC.md")), "PC build guide");
                 AssertEx.Contains(readme, "Windows 11 SDK", "SDK prerequisite");
                 string parity = File.ReadAllText(Path.Combine(root, "PARITY.md"));
                 AssertEx.Contains(parity, "Incomplete", "incomplete parity");

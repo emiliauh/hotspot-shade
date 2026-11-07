@@ -2,6 +2,15 @@ name: CI
 
 # Hermetic checks only. No job changes routes, creates a tunnel device, or
 # needs a phone. Tests use loopback servers, mock tunnel devices, and fakes.
+#
+# The `needs:` lists below are the release dependency graph. Each job carries
+# a `# ci-stage:` comment that names the evidence class: policy, build, test,
+# verify, integration, or release. scripts/ci_graph_check.sh reads both and
+# fails on a missing edge, a cycle, or a job that the release job does not
+# wait for. docs/CI_PIPELINE.md draws the same graph.
+#
+# Work that has no shared input stays independent. A macOS failure does not
+# stop the Windows or Android job, so one platform cannot hide another.
 
 on:
   push:
@@ -22,13 +31,58 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  # ci-stage: policy
+  lint:
+    name: Lint
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: github.ref_type != 'tag'
+        with:
+          workspaces: rust
+      - name: Clippy
+        working-directory: rust
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Format check
+        working-directory: rust
+        run: cargo fmt --check
+
+  # ci-stage: policy
+  release-audit:
+    name: Release audit and CI graph check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Check the shell scripts parse
+        run: bash -n scripts/*.sh scripts/tests/*.sh
+      - name: Audit release metadata, workflow policy, and tree hygiene
+        run: sh scripts/release_audit.sh
+      - name: Validate the CI dependency graph
+        run: sh scripts/ci_graph_check.sh
+      - name: Ensure zip is available for the artifact tests
+        run: |
+          if ! command -v zip >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y zip
+          fi
+      - name: Test the release audit, the manifest, and the graph check
+        run: bash scripts/tests/release_pipeline_test.sh
+      - name: Test the portable artifact version extractor
+        run: bash scripts/tests/artifact_versions_test.sh
+      - name: Test the Mach-O version record reader
+        run: HS_MACHO_TEST_NO_CONTAINER=1 bash scripts/tests/macho_version_test.sh
+
+  # ci-stage: build
   rust-macos:
     name: Rust (macOS) type check, test, build
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: github.ref_type != 'tag'
         with:
           workspaces: rust
       - name: Type check (all targets)
@@ -37,25 +91,31 @@ jobs:
       - name: Test
         working-directory: rust
         run: cargo test --locked
+      - name: Test the source snapshot helper
+        run: bash scripts/tests/source_snapshot_test.sh
+      - name: Test adversarial source snapshot cases
+        run: bash scripts/tests/source_snapshot_adversarial_test.sh
       - name: Build release binary
         working-directory: rust
         run: cargo build --release --locked
       - name: GUI smoke test (demo backend)
         run: scripts/gui_smoke.sh rust/target/release/hotspotshade
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: hotspotshade-macos-arm64
           path: rust/target/release/hotspotshade
           retention-days: 14
 
+  # ci-stage: test
   # The tunnel is not implemented on Windows. Keep the portable code tested.
   rust-windows:
     name: Rust (Windows) type check and test
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: github.ref_type != 'tag'
         with:
           workspaces: rust
       - name: Type check (all targets)
@@ -71,13 +131,15 @@ jobs:
         working-directory: rust
         run: cargo clippy --all-targets --locked -- -D warnings
 
+  # ci-stage: test
   rust-linux:
     name: Rust (Linux) foundation checks
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: github.ref_type != 'tag'
         with:
           workspaces: rust
       - name: Type check (all targets)
@@ -89,27 +151,41 @@ jobs:
       - name: Clippy (Linux code)
         working-directory: rust
         run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test Linux privileged helper
+        run: cargo test --locked --manifest-path linux/helper/Cargo.toml
+      - name: Clippy (Linux privileged helper)
+        run: cargo clippy --all-targets --locked --manifest-path linux/helper/Cargo.toml -- -D warnings
       - name: Test disposable VM cleanup
         run: bash scripts/tests/linux_vm_test_test.sh
-      - uses: actions/setup-node@v4
+      - name: Test the source snapshot helper
+        run: bash scripts/tests/source_snapshot_test.sh
+      - name: Test adversarial source snapshot cases
+        run: bash scripts/tests/source_snapshot_adversarial_test.sh
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
+      - name: Build the demo engine for the Node contract test
+        run: cargo build --locked --manifest-path rust/Cargo.toml
       - name: Test Linux Electron demo model and security
         working-directory: linux
+        env:
+          HOTSPOTSHADE_BIN: ${{ github.workspace }}/rust/target/debug/hotspotshade
         run: npm test
       - name: Test Linux Electron demo in a sandboxed webview
         run: bash linux/scripts/test-container.sh smoke
 
+  # ci-stage: test
   desktop-demo:
     name: Shared desktop demo checks
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: github.ref_type != 'tag'
         with:
           workspaces: desktop
       - name: Test Rust bridge and assets
@@ -118,6 +194,8 @@ jobs:
         run: node --test desktop/tests/fetch_shim.test.mjs desktop/tests/ui_model.test.mjs
       - name: Test browser failure report formatting
         run: node --test gui_assets/app.test.mjs
+      - name: Test destination privacy reporting
+        run: node --test gui_assets/destination_privacy.test.mjs
       - name: Build desktop demo
         run: cargo build --locked --manifest-path desktop/Cargo.toml
       - name: Webview smoke test (visible window, embedded assets)
@@ -127,30 +205,35 @@ jobs:
       - name: Check desktop formatting
         run: cargo fmt --manifest-path desktop/Cargo.toml -- --check
 
+  # ci-stage: test
   desktop-windows:
     name: Shared desktop demo checks (Windows)
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: github.ref_type != 'tag'
         with:
           workspaces: desktop
       - name: Test desktop demo
         run: cargo test --locked --manifest-path desktop/Cargo.toml
 
+  # ci-stage: test
   winui-demo:
     name: WinUI demo model and build checks
     runs-on: windows-2025
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
           dotnet-version: '8.0.x'
       - name: Test WinUI demo state and source contracts
         run: dotnet run --project windows/tests/HotspotShade.WinUI2.Core.Tests/HotspotShade.WinUI2.Core.Tests.csproj --configuration Release
-      - uses: microsoft/setup-msbuild@v2
+      - name: Test Windows service foundations (hermetic)
+        run: dotnet run --project windows/tests/HotspotShade.WinUI2.ServiceHost.Tests/HotspotShade.WinUI2.ServiceHost.Tests.csproj --configuration Release
+      - uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
       - name: Build WinUI demo (unsigned, no deployment)
         run: >-
           msbuild windows/HotspotShade.WinUI2.sln /restore
@@ -159,47 +242,33 @@ jobs:
           /p:GenerateAppxPackageOnBuild=false /p:AppxBundle=Never
           /p:AppxPackageSigningEnabled=false /m
 
-  lint:
-    name: Lint
-    runs-on: macos-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
-      - name: Clippy
-        working-directory: rust
-        run: cargo clippy --all-targets --locked -- -D warnings
-      - name: Format check
-        working-directory: rust
-        run: cargo fmt --check
-
+  # ci-stage: test
   android-demo:
     name: Android demo tests and build
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
         with:
           packages: ''
       - name: Install Android SDK platform and build tools
         run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
-      - name: Test, lint, and build the Android demo
+      - name: Test, lint, and build the Android app and test APK
         working-directory: android
-        run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
+        run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest
 
+  # ci-stage: build
   ios:
     name: iOS tests, simulator build, unsigned IPA
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Logic tests (fake links and clocks, no sockets)
         run: scripts/swift_tests.sh
       - name: Simulator build
@@ -210,44 +279,228 @@ jobs:
           CODE_SIGNING_ALLOWED=NO build
       - name: Build unsigned IPA
         run: scripts/build_ipa.sh build/HotspotShade-iOS-unsigned.ipa
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: HotspotShade-iOS-unsigned-ipa
           path: build/HotspotShade-iOS-unsigned.ipa
           retention-days: 14
 
+  # ci-stage: build
   macos-app:
     name: macOS app tests and unsigned app
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: github.ref_type != 'tag'
         with:
           workspaces: rust
       - name: Build demo engine
         run: cargo build --release --locked --manifest-path rust/Cargo.toml
       - name: Swift package tests
         run: HS_TEST_DEMO_BINARY="$PWD/rust/target/release/hotspotshade" swift test --package-path macos/HotspotShadeKit
+      - name: Installer tests
+        run: swift test --package-path macos/Installer
+      - name: Local preview installer tests
+        run: swift test --package-path macos/Installer -Xswiftc -DHOTSPOTSHADE_LOCAL_PREVIEW
+      - name: Local system-preview candidate tests
+        run: swift test --package-path macos/Installer -Xswiftc -DHOTSPOTSHADE_LOCAL_PREVIEW -Xswiftc -DHOTSPOTSHADE_SYSTEM_PREVIEW_CANDIDATE
+      - name: Local preview preparation tests
+        run: |
+          bash scripts/tests/build_mac_local_preview_test.sh
+          bash scripts/tests/mac_local_preview_delivery_test.sh
+          bash scripts/tests/mac_coordinator_cli_test.sh
       - name: Build unsigned app
         run: scripts/build_mac_app.sh build/HotspotShade-unsigned.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: HotspotShade-macos-unsigned
           path: build/HotspotShade-unsigned.zip
           retention-days: 14
 
+  # ci-stage: verify
+  # Verify the uploaded artifact, not the build directory. This is the file a
+  # release publishes.
+  verify-macos-binary:
+    name: Verify macOS binary artifact
+    needs: [rust-macos]
+    outputs:
+      sha256:
+        description: SHA-256 of the verified macOS binary
+        value: ${{ steps.digest.outputs.sha256 }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: hotspotshade-macos-arm64
+          path: artifact
+      - name: Audit the downloaded binary
+        run: sh scripts/release_audit.sh --artifacts artifact
+      - name: Record the verified artifact digest
+        id: digest
+        run: |
+          digest=$(sh scripts/release_manifest.sh --digest artifact/hotspotshade)
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
+
+  # ci-stage: verify
+  verify-ios-ipa:
+    name: Verify iOS IPA artifact
+    needs: [ios]
+    outputs:
+      sha256:
+        description: SHA-256 of the verified iOS IPA
+        value: ${{ steps.digest.outputs.sha256 }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: HotspotShade-iOS-unsigned-ipa
+          path: artifact
+      - name: Audit the downloaded IPA
+        run: sh scripts/release_audit.sh --artifacts artifact
+      - name: Record the verified artifact digest
+        id: digest
+        run: |
+          digest=$(sh scripts/release_manifest.sh --digest artifact/HotspotShade-iOS-unsigned.ipa)
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
+
+  # ci-stage: verify
+  verify-macos-app:
+    name: Verify macOS app artifact
+    needs: [macos-app]
+    outputs:
+      sha256:
+        description: SHA-256 of the verified macOS app archive
+        value: ${{ steps.digest.outputs.sha256 }}
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: HotspotShade-macos-unsigned
+          path: artifact
+      - name: Audit the downloaded app bundle and its signature
+        run: sh scripts/release_audit.sh --artifacts artifact --check-codesign
+      - name: Record the verified artifact digest
+        id: digest
+        run: |
+          digest=$(sh scripts/release_manifest.sh --digest artifact/HotspotShade-unsigned.zip)
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
+
+  # ci-stage: integration
+  # Join the three verified artifacts, write the checksum manifest and the
+  # provenance record, and audit the joined set. The release job consumes
+  # only this artifact.
+  artifact-integrity:
+    name: Assemble and checksum the release set
+    needs: [verify-macos-binary, verify-ios-ipa, verify-macos-app]
+    outputs:
+      manifest-sha256:
+        description: SHA-256 of the verified SHA256SUMS manifest
+        value: ${{ steps.manifest.outputs.sha256 }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: hotspotshade-macos-arm64
+          path: dist/binary
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: HotspotShade-iOS-unsigned-ipa
+          path: dist/ipa
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: HotspotShade-macos-unsigned
+          path: dist/app
+      - name: Check the verified artifact digests
+        env:
+          BINARY_SHA256: ${{ needs.verify-macos-binary.outputs.sha256 }}
+          IPA_SHA256: ${{ needs.verify-ios-ipa.outputs.sha256 }}
+          APP_SHA256: ${{ needs.verify-macos-app.outputs.sha256 }}
+        run: |
+          sh scripts/release_manifest.sh --expect "$BINARY_SHA256" dist/binary/hotspotshade
+          sh scripts/release_manifest.sh --expect "$IPA_SHA256" dist/ipa/HotspotShade-iOS-unsigned.ipa
+          sh scripts/release_manifest.sh --expect "$APP_SHA256" dist/app/HotspotShade-unsigned.zip
+      - name: Assemble the release set
+        run: |
+          mkdir -p release
+          cp dist/binary/hotspotshade release/hotspotshade-macos-arm64.bin
+          cp dist/ipa/HotspotShade-iOS-unsigned.ipa release/
+          cp dist/app/HotspotShade-unsigned.zip release/
+          chmod 0755 release/hotspotshade-macos-arm64.bin
+      - name: Write the checksum manifest and provenance record
+        run: sh scripts/release_manifest.sh release
+      - name: Audit the release set
+        run: sh scripts/release_audit.sh --artifacts release
+      - name: Verify the checksum manifest
+        run: sh scripts/release_manifest.sh --verify release
+      - name: Record the verified manifest digest
+        id: manifest
+        run: |
+          digest=$(sh scripts/release_manifest.sh --digest release/SHA256SUMS)
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-bundle
+          path: release/*
+          retention-days: 14
+
+  # ci-stage: release
   release:
     name: Publish release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [rust-macos, rust-windows, rust-linux, desktop-demo, desktop-windows, winui-demo, android-demo, ios, macos-app, lint]
+    needs:
+      - lint
+      - release-audit
+      - rust-macos
+      - rust-windows
+      - rust-linux
+      - desktop-demo
+      - desktop-windows
+      - winui-demo
+      - android-demo
+      - ios
+      - macos-app
+      - verify-macos-binary
+      - verify-ios-ipa
+      - verify-macos-app
+      - artifact-integrity
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          path: dist
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-bundle
+          path: release
+      - name: Check the release set digests
+        env:
+          BINARY_SHA256: ${{ needs.verify-macos-binary.outputs.sha256 }}
+          IPA_SHA256: ${{ needs.verify-ios-ipa.outputs.sha256 }}
+          APP_SHA256: ${{ needs.verify-macos-app.outputs.sha256 }}
+          MANIFEST_SHA256: ${{ needs.artifact-integrity.outputs.manifest-sha256 }}
+        run: |
+          sh scripts/release_manifest.sh --expect "$BINARY_SHA256" release/hotspotshade-macos-arm64.bin
+          sh scripts/release_manifest.sh --expect "$IPA_SHA256" release/HotspotShade-iOS-unsigned.ipa
+          sh scripts/release_manifest.sh --expect "$APP_SHA256" release/HotspotShade-unsigned.zip
+          sh scripts/release_manifest.sh --expect "$MANIFEST_SHA256" release/SHA256SUMS
+      - name: Audit the release set against the tag
+        run: sh scripts/release_audit.sh --artifacts release --tag "$GITHUB_REF_NAME" --require-aligned-versions
+      - name: Verify the checksum manifest
+        run: sh scripts/release_manifest.sh --verify release
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -256,13 +509,17 @@ jobs:
 
             The binary for the target device has no executable bit after download. Run chmod +x on the file.
 
-            The HotspotShade app for macOS is ad-hoc signed and runs on arm64 only.
+            The HotspotShade app for macOS is ad-hoc signed and runs on arm64 only. It is not notarized.
+
+            SHA256SUMS and PROVENANCE.txt are attached. Check the digest before you run an artifact. The IPA has no app signature. The macOS app is ad-hoc signed and not notarized; the binary's signature is not verified by this workflow. These are not production releases.
         run: |
-          mv dist/hotspotshade-macos-arm64/hotspotshade dist/hotspotshade-macos-arm64.bin
           gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
             --title "${GITHUB_REF_NAME}" \
             --notes "$NOTES" \
-            dist/HotspotShade-iOS-unsigned-ipa/HotspotShade-iOS-unsigned.ipa \
-            dist/hotspotshade-macos-arm64.bin \
-            dist/HotspotShade-macos-unsigned/HotspotShade-unsigned.zip
+            release/hotspotshade-macos-arm64.bin \
+            release/HotspotShade-iOS-unsigned.ipa \
+            release/HotspotShade-unsigned.zip \
+            release/SHA256SUMS \
+            release/PROVENANCE.txt

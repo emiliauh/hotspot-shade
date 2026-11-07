@@ -127,7 +127,6 @@ public enum PreviewData {
             since: 1_762_000_000,
             total: 14,
             dropped: 1,
-            demo: false,
             groups: [
                 FailureGroup(proto: "tcp", family: "ipv4", port: 443, reason: "timed_out", phase: "request", count: 9, name: "example.com", exampleIp: "192.0.2.10"),
                 FailureGroup(proto: "udp", family: "ipv4", port: 53, reason: "unreachable", phase: "connect", count: 3, name: "dns.example", exampleIp: "192.0.2.53"),
@@ -143,9 +142,7 @@ public enum PreviewData {
     // it never starts an engine. The refresh fills the visible state.
     @MainActor public static func appModel(paired: Bool = false, running: Bool = false, phoneState: String = "ready") -> AppModel {
         let backend = FakeBackend()
-        var status = Status(running: running, paired: paired, phone: Phone(state: phoneState), icmpEnabled: true)
-        status.demo = false
-        backend.currentStatus = status
+        backend.currentStatus = Status(running: running, paired: paired, phone: Phone(state: phoneState), icmpEnabled: true)
         let model = AppModel(backend: backend, pingSetting: PreviewPingSetting(), macOSVersion: "14.5", appVersion: "1.0 (1)")
         Task { await model.refresh() }
         return model

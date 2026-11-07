@@ -3,10 +3,14 @@ import Foundation
 // Plain labels for assistive technology. The views use one label for each
 // group, so a screen reader does not read a card piece by piece.
 public enum AccessibilityText {
-    public static func status(kind: ScreenModel.StatusKind, title: String, subtitle: String) -> String {
+    public static func status(kind: ScreenModel.StatusKind, title: String, subtitle: String, checkedText: String? = nil) -> String {
         let state = word(kind)
-        if subtitle.isEmpty { return "\(state). \(title)." }
-        return "\(state). \(title). \(subtitle)"
+        var parts = [state, title]
+        if !subtitle.isEmpty { parts.append(subtitle) }
+        // A screen reader must hear when the status was read, not only see the
+        // small print.
+        if let checkedText, !checkedText.isEmpty { parts.append(checkedText) }
+        return parts.joined(separator: ". ")
     }
 
     public static func card(title: String, lines: [String]) -> String {

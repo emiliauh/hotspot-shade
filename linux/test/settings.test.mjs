@@ -111,11 +111,13 @@ test('settings default, persist, and reload', () => {
       notifications: true,
       notificationsSupported: true,
       ping: true,
+      tunnelMode: 'phone',
       launchAtLogin: false,
       launchAtLoginAvailable: true
     });
     store.update('notifications', false);
     store.update('ping', false);
+    store.update('tunnelMode', 'direct');
     store.update('launchAtLogin', true);
     assert.equal(autostart.status().enabled, true);
 
@@ -123,9 +125,11 @@ test('settings default, persist, and reload', () => {
     const value = reloaded.snapshot();
     assert.equal(value.notifications, false);
     assert.equal(value.ping, false);
+    assert.equal(value.tunnelMode, 'direct');
     assert.equal(value.launchAtLogin, true);
     assert.equal(fs.statSync(filePath).mode & 0o777, 0o600);
     assert.doesNotMatch(fs.readFileSync(filePath, 'utf8'), /secret|token/i);
+    assert.throws(() => reloaded.update('tunnelMode', 'tun'), /phone or direct/);
 
     reloaded.update('launchAtLogin', false);
     assert.equal(autostart.status().enabled, false);
@@ -147,6 +151,7 @@ test('a broken settings file falls back to the defaults', () => {
     const value = store.snapshot();
     assert.equal(value.notifications, true);
     assert.equal(value.ping, true);
+    assert.equal(value.tunnelMode, 'phone');
     assert.equal(value.notificationsSupported, false);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });

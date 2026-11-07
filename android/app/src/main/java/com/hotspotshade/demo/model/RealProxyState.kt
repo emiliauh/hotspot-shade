@@ -1,5 +1,20 @@
 package com.hotspotshade.demo.model
 
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.time.format.FormatStyle
+import java.util.Locale
+
+/** The status mark and tone of the Dashboard header. */
+enum class StatusKind { OFF, STARTING, ON, ATTENTION }
+
+/** Format one clock time for the last stop line. */
+fun formatStopTime(timeMillis: Long, locale: Locale = Locale.getDefault()): String =
+    Instant.ofEpochMilli(timeMillis)
+        .atZone(ZoneId.systemDefault())
+        .format(DateTimeFormatter.ofLocalizedTime(FormatStyle.SHORT).withLocale(locale))
+
 /**
  * The real source proxy phase, for the app UI.
  *
@@ -27,7 +42,9 @@ enum class RealStopReason {
     HOTSPOT_LOST,
     BIND_FAILED,
     START_FAILED,
+    LISTENER_FAILED,
     TOKEN_MISSING,
+    TOKEN_UNREADABLE,
     ;
     /** A short line for the last stop card. */
     val shortMessage: String
@@ -41,7 +58,9 @@ enum class RealStopReason {
             HOTSPOT_LOST -> "The hotspot is gone."
             BIND_FAILED -> "The proxy could not listen on the hotspot address."
             START_FAILED -> "The proxy could not start."
+            LISTENER_FAILED -> "The proxy listener stopped."
             TOKEN_MISSING -> "No source token is stored."
+            TOKEN_UNREADABLE -> "The source token could not be read."
         }
 
     /** A full sentence for the status card. */
@@ -57,7 +76,13 @@ enum class RealStopReason {
             BIND_FAILED ->
                 "The proxy could not listen on the hotspot address. Tap Start to try again."
             START_FAILED -> "The proxy could not start. Tap Start to try again."
+            LISTENER_FAILED ->
+                "The proxy listener stopped unexpectedly. Tap Start to try again."
             TOKEN_MISSING -> "Pair first. No source token is stored."
+            TOKEN_UNREADABLE ->
+                "The source token could not be read. Try again later. The app never replaces " +
+                    "the token on its own. To replace it, rotate the source token; target " +
+                    "devices will need to pair again."
         }
 }
 
@@ -169,9 +194,9 @@ data class RealProxyState(
         }
 
     /** The diagnostics report. It holds counts and states only. */
-    fun diagnosticsReport(listener: String): String = buildString {
+    fun diagnosticsReport(listener: String, version: String): String = buildString {
         appendLine("HotspotShade for Android")
-        appendLine("Version: 0.1.0-demo")
+        appendLine("Version: $version")
         appendLine("State: $statusTitle")
         appendLine("Stop reason: ${stopReason.name.lowercase()}")
         appendLine("Open connections: $connections")

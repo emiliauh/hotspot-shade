@@ -259,21 +259,30 @@ final class FailureHTTPTests: XCTestCase {
             server.stop()
         }
     }
-    func testDemoEngineReportsFailuresOrUnavailable() async throws {
-        guard let path = ProcessInfo.processInfo.environment["HS_TEST_DEMO_BINARY"] else { throw XCTSkip("No demo binary provided.") }
-        let process = BackendProcess(executable: URL(fileURLWithPath: path), demo: true)
+    // The engine contract for the failure report fields, read from the real
+    // engine binary with its hidden test-data flag. The app never passes it,
+    // and its HTTP client refuses this report.
+    func testTestDataEngineFailureReportDecodes() async throws {
+        guard let path = ProcessInfo.processInfo.environment["HS_TEST_DEMO_BINARY"] else { throw XCTSkip("No engine binary provided.") }
+        let launch = try TestDataEngineLaunch(engine: path)
+        let process = launch.process
         try await process.start()
         do {
-            let client = HTTPBackend(port: try XCTUnwrap(process.port), secret: process.secret)
-            do {
-                let failures = try await client.failures()
+            let (code, data) = try await launch.get("/api/failures")
+            if code == 200 {
                 // A newer engine has the endpoint. Every field must decode.
+                let failures = try JSONDecoder().decode(Failures.self, from: data)
+                XCTAssertEqual(failures.demo, true)
                 XCTAssertNotNil(failures.total)
                 XCTAssertNotNil(failures.groups)
                 XCTAssertNotNil(failures.recent)
-            } catch BackendError.unavailable {
-                // The demo engine in this build has no failure endpoint.
-            } catch { XCTFail("Unexpected \(error)") }
+                let client = HTTPBackend(port: try XCTUnwrap(process.port), secret: process.secret)
+                do { _ = try await client.failures(); XCTFail("The client must refuse engine test data.") }
+                catch BackendError.testDataEngine {}
+            } else {
+                // An older engine has no failure endpoint.
+                XCTAssertEqual(code, 404)
+            }
         } catch {
             await process.stop()
             throw error

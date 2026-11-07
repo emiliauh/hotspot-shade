@@ -2,6 +2,7 @@
 use crate::{
     normalization::{self, Audit},
     phone::{self, PhoneProxy},
+    tls_shape::{ClientHelloShaper, ShapeLimits, ShapeState},
 };
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -25,6 +26,8 @@ struct Shared {
     threads: Mutex<Vec<JoinHandle<()>>>,
     phone: Arc<PhoneProxy>,
     audit: Arc<Audit>,
+    /// Explicit ClientHello reframing. `None` keeps every relay byte unchanged.
+    shape: Option<ShapeLimits>,
 }
 
 /// A loopback listener. Stop joins all client handlers.
@@ -47,6 +50,21 @@ impl PhoneServer {
         phone: Arc<PhoneProxy>,
         audit: Arc<Audit>,
         allow_unpinned: bool,
+    ) -> io::Result<Self> {
+        Self::start_with_options_and_shape(address, phone, audit, allow_unpinned, None)
+    }
+    /// Start with an explicit ClientHello reframing policy.
+    ///
+    /// `None` is the default: the relay copies every byte. `Some(limits)` is an
+    /// explicit opt-in. The shaper changes only the record framing of the
+    /// first ClientHello. It does not hide SNI or the destination, and it does
+    /// not control TCP segmentation. See [`crate::tls_shape`].
+    pub fn start_with_options_and_shape(
+        address: SocketAddr,
+        phone: Arc<PhoneProxy>,
+        audit: Arc<Audit>,
+        allow_unpinned: bool,
+        shape: Option<ShapeLimits>,
     ) -> io::Result<Self> {
         if !address.ip().is_loopback() {
             return Err(io::Error::new(
@@ -72,6 +90,10 @@ impl PhoneServer {
                 "invalid phone configuration",
             ));
         }
+        if let Some(limits) = shape {
+            // Fail at start, not on the first flow with a bad configuration.
+            ClientHelloShaper::new(limits)?;
+        }
         let listener = TcpListener::bind(address)?;
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
@@ -83,6 +105,7 @@ impl PhoneServer {
             threads: Mutex::new(Vec::new()),
             phone,
             audit,
+            shape,
         });
         let state = Arc::clone(&shared);
         let thread = thread::Builder::new()
@@ -498,7 +521,22 @@ fn write_all_retry<W: Write>(
 fn copy_direction(
     src: &mut impl Read,
     dst: &mut impl Write,
+    should_stop: impl FnMut() -> bool,
+) -> io::Result<()> {
+    copy_direction_inner(src, dst, should_stop, None)
+}
+/// Copy one direction, optionally reframing the first ClientHello.
+///
+/// The shaper writes one small record per call, so a slow source device socket
+/// applies backpressure. After the ClientHello the shaper is dropped and the
+/// rest of the stream is copied directly. A client EOF while the shaper still
+/// holds bytes releases them unchanged before this returns, so the caller's
+/// half-close cannot drop them.
+fn copy_direction_inner(
+    src: &mut impl Read,
+    dst: &mut impl Write,
     mut should_stop: impl FnMut() -> bool,
+    mut shaper: Option<ClientHelloShaper>,
 ) -> io::Result<()> {
     let mut buffer = [0u8; 32768];
     loop {
@@ -509,11 +547,30 @@ fn copy_direction(
             ));
         }
         match src.read(&mut buffer) {
-            Ok(0) => return Ok(()),
-            Ok(n) => {
-                let mut progress = Instant::now();
-                write_all_retry(dst, &buffer[..n], &mut progress, &mut should_stop)?;
+            Ok(0) => {
+                // A client that ends before the ClientHello is complete must
+                // still deliver the bytes it sent. finish releases them once,
+                // unchanged, before the half-close.
+                if let Some(mut shaping) = shaper.take() {
+                    let mut progress = Instant::now();
+                    shaping.finish(&mut |chunk| {
+                        write_all_retry(dst, chunk, &mut progress, &mut should_stop)
+                    })?;
+                }
+                return Ok(());
             }
+            Ok(n) => match shaper.as_mut() {
+                None => {
+                    let mut progress = Instant::now();
+                    write_all_retry(dst, &buffer[..n], &mut progress, &mut should_stop)?;
+                }
+                Some(shaping) => {
+                    shaping.feed(&buffer[..n], &mut |chunk| {
+                        let mut progress = Instant::now();
+                        write_all_retry(dst, chunk, &mut progress, &mut should_stop)
+                    })?;
+                }
+            },
             Err(e)
                 if matches!(
                     e.kind(),
@@ -523,12 +580,27 @@ fn copy_direction(
                 ) => {}
             Err(e) => return Err(e),
         }
+        if shaper
+            .as_ref()
+            .is_some_and(|shaping| shaping.state() != ShapeState::Buffering)
+        {
+            shaper = None;
+        }
     }
 }
-fn pump(mut src: TcpStream, mut dst: TcpStream, state: Arc<Shared>) {
+fn pump(
+    mut src: TcpStream,
+    mut dst: TcpStream,
+    state: Arc<Shared>,
+    shaper: Option<ClientHelloShaper>,
+) {
     let _ = src.set_read_timeout(Some(Duration::from_secs(1)));
     let _ = dst.set_write_timeout(Some(Duration::from_secs(2)));
-    let result = copy_direction(&mut src, &mut dst, || state.stopped.load(Ordering::Acquire));
+    let should_stop = || state.stopped.load(Ordering::Acquire);
+    let result = match shaper {
+        None => copy_direction(&mut src, &mut dst, should_stop),
+        Some(shaping) => copy_direction_inner(&mut src, &mut dst, should_stop, Some(shaping)),
+    };
     if result.is_ok() {
         // The source ended. Half-close the other side and let the return pump
         // carry the rest of the other direction.
@@ -544,8 +616,13 @@ fn relay(client: TcpStream, outer: TcpStream, state: &Arc<Shared>) -> io::Result
     let shared = Arc::clone(state);
     let worker = thread::Builder::new()
         .name("phone-return".into())
-        .spawn(move || pump(b, a, shared))?;
-    pump(client, outer, Arc::clone(state));
+        .spawn(move || pump(b, a, shared, None))?;
+    // Shape only the client to source device direction. The returned bytes
+    // are never rewritten.
+    let shaper = state
+        .shape
+        .map(|limits| ClientHelloShaper::new(limits).expect("shape limits were checked at start"));
+    pump(client, outer, Arc::clone(state), shaper);
     let _ = worker.join();
     Ok(())
 }
@@ -571,6 +648,415 @@ mod tests {
         )
         .unwrap();
         (server, audit)
+    }
+    fn start_shaped(phone_address: SocketAddr) -> (PhoneServer, Arc<Audit>) {
+        let phone = Arc::new(PhoneProxy {
+            address: phone_address,
+            username: "u".into(),
+            token: "pw".into(),
+            iface: None,
+            timeout: Duration::from_secs(5),
+        });
+        let audit = Arc::new(Audit::default());
+        let server = PhoneServer::start_with_options_and_shape(
+            "127.0.0.1:0".parse().unwrap(),
+            phone,
+            Arc::clone(&audit),
+            true,
+            Some(ShapeLimits::default()),
+        )
+        .unwrap();
+        (server, audit)
+    }
+    /// Complete the source device side of one SOCKS setup and return the
+    /// established socket.
+    fn accept_source_device(listener: TcpListener) -> TcpStream {
+        let (mut s, _) = listener.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut greet = [0u8; 3];
+        s.read_exact(&mut greet).unwrap();
+        assert_eq!(greet, [5, 1, 2]);
+        s.write_all(&[5, 2]).unwrap();
+        let mut auth = [0u8; 6];
+        s.read_exact(&mut auth).unwrap();
+        s.write_all(&[1, 0]).unwrap();
+        let mut req = [0u8; 10];
+        s.read_exact(&mut req).unwrap();
+        assert_eq!(req[0], 5);
+        s.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+        s
+    }
+    /// Force a reset on close, so the peer sees a sink error rather than a
+    /// quiet FIN.
+    fn abort_stream(stream: &TcpStream) {
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &linger as *const libc::linger as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "setsockopt SO_LINGER");
+    }
+    fn client_hello(body_len: usize) -> Vec<u8> {
+        let mut message = Vec::with_capacity(4 + body_len);
+        message.push(1);
+        message.extend_from_slice(&(body_len as u32).to_be_bytes()[1..]);
+        for i in 0..body_len {
+            message.push((i % 251) as u8);
+        }
+        message
+    }
+    fn handshake_record(payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![22, 3, 1];
+        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+    /// Split shaped bytes into records until `message_len` payload bytes are
+    /// collected. Return the payload, the record count, the largest payload,
+    /// and the offset of the first unshaped byte.
+    fn reassemble(bytes: &[u8], message_len: usize) -> (Vec<u8>, usize, usize, usize) {
+        let mut offset = 0;
+        let mut payload = Vec::new();
+        let mut records = 0;
+        let mut largest = 0;
+        while payload.len() < message_len {
+            assert!(bytes.len() - offset >= 5, "a record header is present");
+            let header = &bytes[offset..offset + 5];
+            assert_eq!(header[0], 22, "a shaped record is a handshake record");
+            assert_eq!(header[1], 3);
+            let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
+            assert!(bytes.len() - offset - 5 >= len);
+            payload.extend_from_slice(&bytes[offset + 5..offset + 5 + len]);
+            largest = largest.max(len);
+            offset += 5 + len;
+            records += 1;
+        }
+        (payload, records, largest, offset)
+    }
+    #[test]
+    fn shape_mode_reframes_the_first_client_hello_on_the_source_device_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let message = client_hello(260);
+        let expected = message.clone();
+        let tail = b"after the hello".to_vec();
+        let expected_tail = tail.clone();
+        let mock = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut greet = [0; 3];
+            s.read_exact(&mut greet).unwrap();
+            s.write_all(&[5, 2]).unwrap();
+            let mut auth = [0; 6];
+            s.read_exact(&mut auth).unwrap();
+            s.write_all(&[1, 0]).unwrap();
+            let mut req = [0; 10];
+            s.read_exact(&mut req).unwrap();
+            s.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+            let mut bytes = Vec::new();
+            s.read_to_end(&mut bytes).unwrap();
+            let (payload, records, largest, offset) = reassemble(&bytes, expected.len());
+            assert_eq!(payload, expected, "handshake bytes are identical");
+            assert!(records > 1);
+            assert!(largest <= 8);
+            assert_eq!(&bytes[offset..], &expected_tail[..]);
+            s.write_all(b"response").unwrap();
+        });
+        let (mut server, audit) = start_shaped(addr);
+        let mut client = negotiate(server.address);
+        client
+            .write_all(&[5, 1, 0, 1, 127, 0, 0, 1, 0, 80])
+            .unwrap();
+        let mut reply = [0; 10];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(reply[1], 0);
+        let mut input = handshake_record(&message);
+        input.extend_from_slice(&tail);
+        client.write_all(&input).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert_eq!(response, b"response");
+        server.stop();
+        mock.join().unwrap();
+        assert_eq!(audit.snapshot(), (1, 0));
+        assert_eq!(server.active_clients(), 0);
+    }
+    #[test]
+    fn an_incomplete_client_hello_is_flushed_before_the_source_device_half_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let message = client_hello(260);
+        let input = handshake_record(&message);
+        let partial = input[..37].to_vec();
+        let expected = partial.clone();
+        let mock = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut greet = [0; 3];
+            s.read_exact(&mut greet).unwrap();
+            s.write_all(&[5, 2]).unwrap();
+            let mut auth = [0; 6];
+            s.read_exact(&mut auth).unwrap();
+            s.write_all(&[1, 0]).unwrap();
+            let mut req = [0; 10];
+            s.read_exact(&mut req).unwrap();
+            s.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+            let mut bytes = Vec::new();
+            s.read_to_end(&mut bytes).unwrap();
+            assert_eq!(
+                bytes, expected,
+                "a ClientHello cut short by EOF arrives once, unchanged"
+            );
+            s.write_all(b"response").unwrap();
+        });
+        let (mut server, audit) = start_shaped(addr);
+        let mut client = negotiate(server.address);
+        client
+            .write_all(&[5, 1, 0, 1, 127, 0, 0, 1, 0, 80])
+            .unwrap();
+        let mut reply = [0; 10];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(reply[1], 0);
+        client.write_all(&partial).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert_eq!(response, b"response");
+        server.stop();
+        mock.join().unwrap();
+        assert_eq!(audit.snapshot(), (1, 0));
+        assert_eq!(server.active_clients(), 0);
+    }
+
+    #[test]
+    fn shape_mode_forwards_short_requests_before_a_half_close() {
+        // A one to four byte request that waits for a reply must not be held.
+        for len in 1..=4 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let request = b"PING"[..len].to_vec();
+            let expected = request.clone();
+            let mock = thread::spawn(move || {
+                let mut s = accept_source_device(listener);
+                let mut got = vec![0u8; expected.len()];
+                s.read_exact(&mut got).unwrap();
+                assert_eq!(got, expected);
+                s.write_all(&got).unwrap();
+                let mut sink = [0u8; 1];
+                let _ = s.read(&mut sink);
+            });
+            let (mut server, audit) = start_shaped(addr);
+            let mut client = negotiate(server.address);
+            client
+                .write_all(&[5, 1, 0, 1, 127, 0, 0, 1, 0, 80])
+                .unwrap();
+            let mut reply = [0; 10];
+            client.read_exact(&mut reply).unwrap();
+            assert_eq!(reply[1], 0);
+            client.write_all(&request).unwrap();
+            let mut response = vec![0u8; request.len()];
+            client.read_exact(&mut response).unwrap();
+            assert_eq!(response, request, "a {len} byte request is not held");
+            let _ = client.shutdown(Shutdown::Both);
+            server.stop();
+            mock.join().unwrap();
+            assert_eq!(audit.snapshot(), (1, 0));
+            assert_eq!(server.active_clients(), 0);
+        }
+    }
+
+    #[test]
+    fn shape_mode_reassembles_a_header_split_across_writes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let message = client_hello(260);
+        let expected = message.clone();
+        let tail = b"after the hello".to_vec();
+        let expected_tail = tail.clone();
+        let mock = thread::spawn(move || {
+            let mut s = accept_source_device(listener);
+            let mut bytes = Vec::new();
+            s.read_to_end(&mut bytes).unwrap();
+            let (payload, _, _, offset) = reassemble(&bytes, expected.len());
+            assert_eq!(payload, expected);
+            assert_eq!(&bytes[offset..], &expected_tail[..]);
+            s.write_all(b"response").unwrap();
+        });
+        let (mut server, audit) = start_shaped(addr);
+        let mut client = negotiate(server.address);
+        client
+            .write_all(&[5, 1, 0, 1, 127, 0, 0, 1, 0, 80])
+            .unwrap();
+        let mut reply = [0; 10];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(reply[1], 0);
+        let mut input = handshake_record(&message);
+        input.extend_from_slice(&tail);
+        client.set_nodelay(true).unwrap();
+        for part in [
+            &input[..1],
+            &input[1..2],
+            &input[2..3],
+            &input[3..5],
+            &input[5..6],
+            &input[6..],
+        ] {
+            client.write_all(part).unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert_eq!(response, b"response");
+        server.stop();
+        mock.join().unwrap();
+        assert_eq!(audit.snapshot(), (1, 0));
+        assert_eq!(server.active_clients(), 0);
+    }
+
+    #[test]
+    fn shape_mode_closes_cleanly_on_an_immediate_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mock = thread::spawn(move || {
+            let mut s = accept_source_device(listener);
+            let mut bytes = Vec::new();
+            s.read_to_end(&mut bytes).unwrap();
+            assert!(bytes.is_empty(), "no byte is invented at EOF");
+            s.write_all(b"response").unwrap();
+        });
+        let (mut server, audit) = start_shaped(addr);
+        let mut client = negotiate(server.address);
+        client
+            .write_all(&[5, 1, 0, 1, 127, 0, 0, 1, 0, 80])
+            .unwrap();
+        let mut reply = [0; 10];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(reply[1], 0);
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert_eq!(response, b"response");
+        server.stop();
+        mock.join().unwrap();
+        assert_eq!(audit.snapshot(), (1, 0));
+        assert_eq!(server.active_clients(), 0);
+    }
+
+    #[test]
+    fn shape_mode_closes_when_the_source_device_write_fails() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let closer = thread::spawn(move || {
+            let mut s = accept_source_device(listener);
+            let mut first = [0u8; 1];
+            let _ = s.read(&mut first);
+            abort_stream(&s);
+            drop(s);
+        });
+        let (mut server, audit) = start_shaped(addr);
+        let mut client = negotiate(server.address);
+        client
+            .write_all(&[5, 1, 0, 1, 127, 0, 0, 1, 0, 80])
+            .unwrap();
+        let mut reply = [0; 10];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(reply[1], 0);
+        let message = client_hello(16_380);
+        let input = handshake_record(&message);
+        let _ = client.write_all(&input);
+        let mut buffer = [0u8; 32];
+        match client.read(&mut buffer) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::UnexpectedEof
+                ) => {}
+            other => panic!("the shaped flow must close after a sink failure: {other:?}"),
+        }
+        let _ = client.shutdown(Shutdown::Both);
+        server.stop();
+        closer.join().unwrap();
+        assert_eq!(server.active_clients(), 0);
+        assert_eq!(audit.snapshot(), (1, 0));
+    }
+
+    #[test]
+    fn shape_off_keeps_the_source_device_stream_byte_for_byte() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let message = client_hello(90);
+        let mut input = handshake_record(&message);
+        input.extend_from_slice(b"tail");
+        let expected = input.clone();
+        let mock = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut greet = [0; 3];
+            s.read_exact(&mut greet).unwrap();
+            s.write_all(&[5, 2]).unwrap();
+            let mut auth = [0; 6];
+            s.read_exact(&mut auth).unwrap();
+            s.write_all(&[1, 0]).unwrap();
+            let mut req = [0; 10];
+            s.read_exact(&mut req).unwrap();
+            s.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+            let mut bytes = Vec::new();
+            s.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, expected);
+            s.write_all(b"response").unwrap();
+        });
+        let (mut server, audit) = start(addr);
+        let mut client = negotiate(server.address);
+        client
+            .write_all(&[5, 1, 0, 1, 127, 0, 0, 1, 0, 80])
+            .unwrap();
+        let mut reply = [0; 10];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(reply[1], 0);
+        client.write_all(&input).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert_eq!(response, b"response");
+        server.stop();
+        mock.join().unwrap();
+        assert_eq!(audit.snapshot(), (1, 0));
+    }
+    #[test]
+    fn shape_start_rejects_invalid_limits() {
+        let phone = Arc::new(PhoneProxy {
+            address: "127.0.0.1:9".parse().unwrap(),
+            username: "u".into(),
+            token: "pw".into(),
+            iface: None,
+            timeout: Duration::from_secs(1),
+        });
+        let limits = ShapeLimits {
+            max_chunk: 9,
+            ..ShapeLimits::default()
+        };
+        assert!(PhoneServer::start_with_options_and_shape(
+            "127.0.0.1:0".parse().unwrap(),
+            phone,
+            Arc::new(Audit::default()),
+            true,
+            Some(limits),
+        )
+        .is_err());
     }
     fn negotiate(address: SocketAddr) -> TcpStream {
         let mut stream = TcpStream::connect(address).unwrap();

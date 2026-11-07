@@ -329,7 +329,7 @@ struct DiagnosticsReportTests {
         Open files: estimate 3 for each session, 32 reserved. A stopped run counts until every close finishes.
         Low Power Mode: On.
         Thermal state: Fair.
-        Keep-awake: The app stays awake while the proxy runs.
+        Keep-awake: Location updates are active. iOS can still pause the app.
         """
         check(report.text() == expected, "the full report text:\n\(report.text())")
 

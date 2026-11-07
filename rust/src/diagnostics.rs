@@ -13,6 +13,19 @@ use std::time::Instant;
 /// The number of samples that one metric keeps.
 pub const RESERVOIR: usize = 512;
 
+/// The destination-privacy mode names. The engine, the desktop apps, the
+/// phone apps, and the local page use these four names and no others.
+pub const DESTINATION_PRIVACY_MODES: [&str; 4] = ["off", "shape", "hide", "cover"];
+
+/// This build implements the mechanism.
+pub const CAP_SUPPORTED: &str = "supported";
+/// This build has no such code path.
+pub const CAP_UNSUPPORTED: &str = "unsupported";
+/// The platform or the build configuration cannot provide the mechanism.
+pub const CAP_UNAVAILABLE: &str = "unavailable";
+/// The code path exists, but this project has no live evidence for it.
+pub const CAP_UNVERIFIED: &str = "unverified";
+
 /// The length of one established-flow bucket.
 pub const ESTABLISHED_BUCKET_SECONDS: u64 = 1;
 
@@ -264,6 +277,92 @@ pub fn zero_queue() -> Value {
     json!({"peak":0,"max_age_us":0})
 }
 
+/// The support state of every destination-privacy mode in this build.
+///
+/// Only `off` is supported. The relay copies bytes unchanged and the engine has
+/// no TLS client, so `shape`, `hide`, and `cover` report `unsupported`. A build
+/// that implements one mode changes that mode here. Never report a mode as
+/// supported before its code path and its hermetic tests exist.
+pub fn destination_privacy_modes() -> Value {
+    json!({
+        "off": CAP_SUPPORTED,
+        "shape": CAP_UNSUPPORTED,
+        "hide": CAP_UNSUPPORTED,
+        "cover": CAP_UNSUPPORTED,
+    })
+}
+
+/// Whether the target engine continues after its controlling app exits.
+///
+/// Parent-liveness handling shuts the engine down; this does not describe
+/// hiding a window while its app remains open, such as a Linux tray session.
+pub fn background_relay_capability() -> &'static str {
+    CAP_UNSUPPORTED
+}
+
+/// The destination-privacy capability row that `probe`, `/api/status`, and the
+/// local page report.
+///
+/// It holds fixed tokens only. It never holds a destination name, an address, a
+/// certificate, or an ECH config. `mode` is the mode in effect now. Every build
+/// starts at `off`, because every other mode is opt-in.
+pub fn destination_privacy_capability() -> Value {
+    json!({
+        "mode": "off",
+        "default_mode": "off",
+        "modes": destination_privacy_modes(),
+        "sni_override": CAP_UNSUPPORTED,
+        "ech": CAP_UNSUPPORTED,
+        "background_relay": background_relay_capability(),
+    })
+}
+
+/// The zero destination-privacy counters.
+///
+/// Every counter stays zero while only `off` is supported: the engine never
+/// records one of these events. The keys are the stable contract, so a reader
+/// can rely on their presence. A counter is an event count only. It never
+/// carries a name, an address, a certificate, or an ECH config.
+pub fn zero_destination_privacy_counters() -> Value {
+    json!({
+        // Inner TCP flows that ran while a mode other than `off` was active.
+        "flows": 0,
+        // Flows whose first record or records were re-framed.
+        "shaped_flows": 0,
+        // Flows where re-framing did not complete and bytes went unchanged.
+        "shaped_errors": 0,
+        // Handshakes that started with an ECH config.
+        "ech_attempts": 0,
+        // Handshakes where the server accepted ECH.
+        "ech_ok": 0,
+        // Handshakes that sent GREASE because no config was available.
+        "ech_grease": 0,
+        // Handshakes where the server rejected ECH.
+        "ech_rejected": 0,
+        // Fresh-flow retries without ECH after a rejection or a stall.
+        "ech_fallback": 0,
+        // HTTPS or SVCB lookups over DoH.
+        "doh_lookups": 0,
+        "doh_ok": 0,
+        "doh_failed": 0,
+        // Flows sent through the endpoint the user owns.
+        "cover_flows": 0,
+        // Endpoint setups that failed.
+        "cover_errors": 0,
+    })
+}
+
+/// The destination-privacy diagnostics section.
+///
+/// `mode` is one of `DESTINATION_PRIVACY_MODES`. `counters` holds integers
+/// only. The relay reports the same object with its own counters.
+pub fn destination_privacy() -> Value {
+    json!({
+        "mode": "off",
+        "counters": zero_destination_privacy_counters(),
+    })
+}
+
 /// The complete diagnostics shape when no relay runs.
 pub fn empty() -> Value {
     json!({
@@ -296,11 +395,13 @@ pub fn empty() -> Value {
             "evicted": 0,
         },
         "tcp": {
+            "flows_active": 0,
             "flows_peak": 0,
             "retransmits": 0,
             "zero_window_ms": 0,
             "capacity_refused": 0,
         },
+        "destination_privacy": destination_privacy(),
         "established": {
             "bucket_s": ESTABLISHED_BUCKET_SECONDS,
             "window_s": ESTABLISHED_WINDOW,
@@ -360,6 +461,7 @@ mod tests {
             "tcp",
             "established",
             "failures",
+            "destination_privacy",
         ] {
             assert!(value.get(key).is_some(), "{key}");
         }
@@ -375,6 +477,64 @@ mod tests {
         let text = value.to_string();
         assert!(!text.contains("127.0.0.1"));
         assert!(!text.contains("token"));
+    }
+
+    #[test]
+    fn destination_privacy_is_off_with_zero_counters() {
+        let value = empty();
+        let privacy = &value["destination_privacy"];
+        assert_eq!(privacy["mode"], "off");
+        let counters = privacy["counters"].as_object().unwrap();
+        assert_eq!(counters.len(), 13);
+        assert!(counters.values().all(|count| count.as_u64() == Some(0)));
+        // The section is the same object that `empty()` embeds, so a reader
+        // cannot meet two shapes for one contract.
+        assert_eq!(privacy, &destination_privacy());
+        let text = privacy.to_string();
+        for forbidden in ["example.com", "127.0.0.1", "::1", "token", "BEGIN"] {
+            assert!(!text.contains(forbidden), "{forbidden}");
+        }
+    }
+
+    #[test]
+    fn destination_privacy_capability_claims_only_what_this_build_supports() {
+        let capability = destination_privacy_capability();
+        assert_eq!(capability["mode"], "off");
+        assert_eq!(capability["default_mode"], "off");
+        // Every mode name has a state.
+        let modes = capability["modes"].as_object().unwrap();
+        assert_eq!(modes.len(), DESTINATION_PRIVACY_MODES.len());
+        for name in DESTINATION_PRIVACY_MODES {
+            assert!(modes.get(name).is_some(), "{name}");
+        }
+        assert_eq!(capability["modes"]["off"], CAP_SUPPORTED);
+        // No mode other than `off` has a code path today.
+        for name in ["shape", "hide", "cover"] {
+            assert_eq!(capability["modes"][name], CAP_UNSUPPORTED, "{name}");
+        }
+        assert_eq!(capability["sni_override"], CAP_UNSUPPORTED);
+        assert_eq!(capability["ech"], CAP_UNSUPPORTED);
+        assert_eq!(capability["background_relay"], CAP_UNSUPPORTED);
+        assert!(DESTINATION_PRIVACY_MODES.contains(&capability["mode"].as_str().unwrap_or("")));
+        // Every state token is part of the documented vocabulary.
+        let vocabulary = [
+            CAP_SUPPORTED,
+            CAP_UNSUPPORTED,
+            CAP_UNAVAILABLE,
+            CAP_UNVERIFIED,
+        ];
+        let mut states = vec![
+            capability["sni_override"].clone(),
+            capability["ech"].clone(),
+            capability["background_relay"].clone(),
+        ];
+        states.extend(modes.values().cloned());
+        for state in states {
+            assert!(vocabulary.contains(&state.as_str().unwrap()), "{state}");
+        }
+        let text = capability.to_string();
+        assert!(!text.contains("token"));
+        assert!(!text.contains("127.0.0.1"));
     }
 
     #[test]

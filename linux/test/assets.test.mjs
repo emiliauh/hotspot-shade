@@ -223,9 +223,26 @@ test('the app includes the accessibility and theme hooks', () => {
   assert.match(app, /scrollIntoView/);
 });
 
+test('the page exposes one fixed tunnel mode choice', () => {
+  const html = read('src/renderer/index.html');
+  const app = read('src/renderer/app.js');
+  assert.match(html, /id="modePhone"[^>]*data-start-mode="phone"/);
+  assert.match(html, /id="modeDirect"[^>]*data-start-mode="direct"/);
+  assert.match(html, /aria-labelledby="modeChoiceLabel"/);
+  assert.match(html, /id="modeHelp"/);
+  assert.match(app, /call\('start', \{ mode: state\.startMode, ping: state\.ping \}\)/);
+  assert.match(app, /model\.normalizeStartMode/);
+  assert.match(app, /model\.startFailureText/);
+  assert.match(app, /updateSetting\('tunnelMode', next\)/);
+  assert.doesNotMatch(app, /call\('start',[^\n]*(iface|host|token|command|path)/);
+});
+
 test('the README documents the demo scope and the open work', () => {
   const readme = read('README.md');
-  assert.match(readme, /not implemented/i);
+  assert.match(readme, /Electron app sends both modes/i);
+  assert.match(readme, /live hotspot, source device, and direct-mode\s+route test are still open/i);
+  assert.match(readme, /Direct mode sends\s+`\{"mode":"tun","options":\{"ipv6":"block"\}\}`/);
+  assert.match(readme, /packaged non-demo start, live direct routing, and route cleanup remain\s+unverified/i);
   assert.match(readme, /simulated/i);
   assert.match(readme, /engine boundary/i);
   assert.match(readme, /memory/i);

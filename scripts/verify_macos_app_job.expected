@@ -1,0 +1,21 @@
+    name: Verify macOS app artifact
+    needs: [macos-app]
+    outputs:
+      sha256:
+        description: SHA-256 of the verified macOS app archive
+        value: ${{ steps.digest.outputs.sha256 }}
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: HotspotShade-macos-unsigned
+          path: artifact
+      - name: Audit the downloaded app bundle and its signature
+        run: sh scripts/release_audit.sh --artifacts artifact --check-codesign
+      - name: Record the verified artifact digest
+        id: digest
+        run: |
+          digest=$(sh scripts/release_manifest.sh --digest artifact/HotspotShade-unsigned.zip)
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"

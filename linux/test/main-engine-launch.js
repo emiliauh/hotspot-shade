@@ -19,10 +19,20 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { app } = require('electron');
+const { app, dialog } = require('electron');
 
 const REPORT_PATH = '/tmp/hotspotshade-main-engine-report.json';
 const ENGINE_PATH = process.env.HOTSPOTSHADE_ENGINE || '';
+const TEST_CRASH_WARNING = process.env.HS_TEST_DEMO_CRASH_WARNING === '1';
+if (TEST_CRASH_WARNING && process.env.HOTSPOTSHADE_ENGINE_DEMO !== '1') {
+  console.error('The crash-warning check requires the engine demo mode.');
+  process.exit(2);
+}
+const warningDialogs = [];
+if (TEST_CRASH_WARNING) {
+  // Capture the real main entry's dialog call without blocking the test.
+  dialog.showMessageBoxSync = (options) => { warningDialogs.push(options); return 0; };
+}
 const USER_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'hotspotshade-main-engine-'));
 app.setPath('userData', USER_DATA);
 const checks = [];
@@ -120,6 +130,18 @@ app.on('browser-window-created', (_event, created) => {
       enginePidBefore = children.length ? children[0] : null;
       check('one engine child process runs', children.length === 1, children);
       check('no engine temp directory is left before the close', engineTempDirectories().length <= 1, engineTempDirectories());
+      if (TEST_CRASH_WARNING && children.length === 1) {
+        // This child is the explicitly selected demo engine. It creates no
+        // tunnel or route; the signal exercises an unexpected engine exit.
+        process.kill(children[0], 'SIGKILL');
+        const exitDeadline = Date.now() + 5000;
+        while (engineChildren().length && Date.now() < exitDeadline) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        check('the demo engine exits unexpectedly', engineChildren().length === 0);
+        // Let the main process receive the child exit before requesting quit.
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
     } catch (error) {
       check('the page check finished', false, error && error.stack ? error.stack : String(error));
     }
@@ -135,8 +157,16 @@ app.on('will-quit', () => {
     check('the engine child is gone after the close', engineChildren().length === 0, engineChildren());
     check('the engine temp directory is gone after the close', engineTempDirectories().length === 0, engineTempDirectories());
     check('the engine child was running before the close', Number.isInteger(enginePidBefore) && enginePidBefore > 0, enginePidBefore);
+    if (TEST_CRASH_WARNING) {
+      check('an unconfirmed cleanup displays one native warning',
+        warningDialogs.length === 1 && warningDialogs[0].type === 'warning' &&
+          warningDialogs[0].message === 'HotspotShade could not confirm that the engine cleaned up.' &&
+          /Routes or rules may remain/.test(warningDialogs[0].detail),
+        warningDialogs);
+    }
   }
   writeReport('will-quit');
+  if (failed) app.exit(1);
 });
 
 setTimeout(() => {

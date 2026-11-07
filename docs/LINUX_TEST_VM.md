@@ -1,16 +1,81 @@
 # Disposable Linux test VM
 
+**Current transfer gate:** The source snapshot helper and the VM archive
+verification path are being repaired after an independent security review.
+Do not use the commands below to transfer the current checkout until both
+repairs have passed a new independent review and the exact archive and its
+contents have been reviewed. The earlier VM results do not establish that the
+current dirty checkout was tested.
+
+The latest harness review also found that a shared Cargo target directory can
+reuse stale build results and that code under test can forge the fixed status
+file. Do not treat a new VM result as evidence until those findings and the
+CLI dependency integrity question have been resolved and independently reviewed.
+An independent review also reproduced a mismatch between the snapshot
+helper's tar header parser and bsdtar on macOS: a crafted numeric field could
+hide an entry from the validator. The review found incomplete path-collision
+checks as well. The helper must be repaired and reviewed again before its
+verification result is trusted.
+
+The independent review of Linux platform source SHA-256 `ab0ba779...` found
+that an IPv6 `RTA_CACHEINFO` attribute emitted by the reviewed kernel versions
+was treated as unmodeled. That snapshot can refuse block-mode startup and IPv6
+cleanup or recovery. Later source repairs for cache information, expiry, and
+clone ownership received hermetic review, followed by a lint correction. The
+earlier VM results do not test those later bytes. See `LINUX_ROUTE_RECOVERY.md`
+for the reviewed snapshots and remaining limits; fresh disposable-VM evidence
+is still required for the build under test.
+
 A prepared Linux VM image holds the tools for the Linux and Electron checks: Rust, Node.js, GTK, WebKitGTK, Xvfb, and cached dependencies. A disposable clone passed the Linux foundation tests, mock source device tests, direct-mode tunnel tests, and desktop demo tests. These tests do not prove a live Linux hotspot, carrier, or physical-device result.
+
+The 2026-11-05 preflight found that the prepared image's cached source is stale
+and partial: it has no `linux/` directory or Linux helper source. Its Electron
+package availability was not verified. The preflight created and deleted
+disposable VMs but uploaded no source archive and ran no build or tunnel test.
+Those image contents cannot establish results for the current tree.
 
 The image is a test tool, not a release artifact. Its source tree is a point-in-time copy. Refresh it with the reviewed source under test. Do not copy personal files, tokens, identity keys, certificates, provisioning profiles, packet captures, or machine-specific configuration into the VM or image. Review untracked files before including them. The general archive test runner must not create a TUN device or change routes. The tunnel test in the "Linux tunnel start test" section is a separate opt-in run. It creates a TUN device, a network namespace, and policy routes inside the disposable VM.
 
-For a full run against current source, create and review a `.tar.gz` archive whose top level contains `rust/`, `desktop/`, `linux/`, `gui_assets/`, and `assets/`. Include the source and lockfiles required by the build. Exclude `.git`, build artifacts, and all private data. Run:
+For a new cloud sandbox, the contributor guide prefers Boat. Its sandboxes have
+a public IPv4 address by default, and `boat scp` is a separate transfer path;
+neither the Freestyle harness nor its isolated upload checks cover it. Do not
+copy this working tree, use a recursive upload, or assume the sandbox is offline.
+First review the exact archive and its contents, establish a reviewed transfer
+and verification procedure, and confirm the sandbox network and credential
+settings. Use `--no-env` to avoid account environment secrets, and explicitly
+stop or delete a disposable sandbox after preserving the required evidence.
+Boat is Ubuntu; it does not establish native macOS, Windows, or physical
+hotspot behavior. See the current [Boat CLI documentation](https://docs.boat.dev/llms.txt).
 
-```sh
-scripts/linux_vm_test.sh /path/to/reviewed-source.tar.gz
-```
+For a full run against current source, the archive must contain the reviewed
+source and lockfiles needed by the build, without `.git`, build artifacts, or
+private data. The old one-argument invocation is no longer valid. This guide
+requires independently reviewed SHA-256 pins for both the archive (`--sha256`)
+and the snapshot helper (`--helper-sha256`). The helper pin can instead be
+provided through `HOTSPOTSHADE_SNAPSHOT_HELPER_SHA256`. A digest supplied by
+the same untrusted source as its file is not an independent review record. Do
+not upload an archive before the gate has passed review.
 
-The script creates a private disposable clone through the configured VM provider, copies the reviewed archive, extracts it into a new directory, runs the full Rust tests, Linux clippy, and desktop tests and Linux Electron demo tests offline, and deletes the clone on exit. A failure can leave a clone if the platform cannot delete it. Check the VM list when the script reports a cleanup error. The image must already contain the dependencies needed by the archive. This script does not run a visual webview test. The helper script uses the VM provider configured for the project. If your provider differs, create the clone and run the same checks manually.
+The script uses Freestyle CLI 0.2.21 to create a private disposable clone,
+disables automatic VM restart, copies the reviewed archive, extracts it into a
+new directory, runs the full
+Rust tests, Linux clippy, desktop tests, and Linux Electron demo tests offline,
+and deletes the clone on exit. The CLI version is pinned to keep the lifecycle
+commands reproducible. A failure can leave a clone if the platform cannot delete
+it. Check the VM list when the script reports a cleanup error. The image must
+already contain the dependencies needed by the archive. This script does not
+run a visual webview test. If your provider differs, create the clone and run
+the same checks manually.
+
+The harness creates its private archive and its pinned helper copy through
+unpredictable names and noclobber descriptors, then writes through those
+descriptors. A symlink planted at a predictable copy path is therefore not
+followed. Cleanup checks each private root first. It refuses to change
+permissions through a root that another process replaced with a symlink, unlinks
+only that name, and reports a cleanup failure. The remaining races are real: a
+same-user process still has the caller's file access, a helper can leave a
+background process, a change made and reverted between two hashes is not
+visible, and a check and a use are not atomic. This is not a sandbox.
 
 Create an isolated clone from the prepared image. Use a unique name for each run. Keep the clone private, and use no network and no SSH when the dependencies are cached. Use the provider console or command runner to inspect the clone. For an offline check with the cached source and dependencies:
 
@@ -54,11 +119,40 @@ Do not add the lower priority rule without the `oif` rule. A plain rule also cap
 
 ### Ownership and cleanup
 
-At install the manager reads the dedicated table and the rule list with netlink. It refuses to start when table 700 has any route or when priority 17000 or 17001 is in use. An empty table and free priorities are the ownership precondition. The manager then creates every object with `NLM_F_CREATE | NLM_F_EXCL`, so a concurrent object makes the add fail. It records the table id, both rule priorities, every rule selector, and every route key before the add.
+Before installing new objects, the manager may recover objects named by an
+eligible stale claim. Recovery can remove recorded objects without a prompt
+when its ownership checks pass. The subsequent install reads the dedicated
+table and rule list with netlink and refuses if table 700 is not empty or
+priority 17000 or 17001 is in use. Those reads are snapshots and may omit an
+object. The manager creates new objects with `NLM_F_CREATE | NLM_F_EXCL`, so
+a concurrent conflicting object makes the add fail. It records the table id,
+both rule priorities, every rule selector, and every route key before the add.
+The claim and its predecessor records must be reviewed before any live start;
+see [LINUX_ROUTE_RECOVERY.md](LINUX_ROUTE_RECOVERY.md).
 
-Cleanup reads each object again and compares it with the record. A rule must match the family, prefix lengths, destination and source addresses, TOS, table, priority, action, rule flags, input and output interface names, goto target, protocol, mark, mark mask, flow, tunnel id, suppress values, l3mdev, uid range, IP protocol, port ranges, port masks, DSCP, DSCP mask, and flow label. An unknown selector blocks the delete. Detached and unresolved rule state bits are not selectors, so cleanup ignores them. A route must match the family, prefix, source length and source, TOS, table, protocol, type, output interface, metric, preferred source, and flow. It must have no gateway, multipath, encapsulation, or nexthop object. For a blackhole route the output interface is not a selector, because the kernel reports the loopback interface for it. A matching object is deleted. An absent object is already clean. A different object at the same key, or a failed read, is left in place, kept in the record, and reported. Stop is idempotent.
+Cleanup reads each recorded key and requires one clean, fully matching object
+in a conservative delete-candidate set. A rule comparison includes its prefix,
+TOS, table, priority, action, interface names, protocol, and other modeled
+selectors. Unknown attributes block deletion. A route comparison includes its
+prefix, source, TOS, table, protocol, type, scope, output interface, metric,
+preferred source, and flow; gateway, multipath, encapsulation, nexthop, or an
+unmodeled attribute makes it unclean. The candidate model does not rely on
+zero TOS or source length to exclude a foreign object. IPv6 delete ignores
+route type, and a nexthop object can ignore output interface, so those shapes
+remain candidates. A second read must confirm one exact candidate before a
+delete. A conflicting candidate or failed read blocks that delete. An absent
+object is not deleted, and cleanup requires two complete absence rounds before
+dropping its record. This agreement is evidence, not proof: repeated dump
+omissions can hide an object, and a read and delete are not atomic. A single
+IPv6 delete can also remove ECMP siblings that a dump did not show. See
+[LINUX_ROUTE_RECOVERY.md](LINUX_ROUTE_RECOVERY.md) for the current review limits.
 
-An add can be applied before its ACK arrives. When the ACK times out, the manager reads the object list again. It keeps the record only when the object is present and matches the record. The rollback then removes an add that the kernel applied without an answer. A read failure keeps the record for a later cleanup attempt. On a different add error, the manager removes the record because the object was not proven.
+An add can be applied before its ACK arrives. The manager records the intended
+object before the add and retains that record when the outcome is unknown.
+Rollback deletes only a confirmed matching object and uses the same two-round
+absence rule. A definite add failure can drop the in-memory object record.
+Repeatedly omitted objects can still outlive the claim after cleanup accepts
+two absence rounds; no test here proves that cannot happen.
 
 An IPv4 route has no metric by default. The kernel gives an IPv6 route the default metric 1024. The manager records 1024 as part of the IPv6 ownership key.
 
@@ -66,14 +160,20 @@ Linux gives a route and a rule no creator identity. A privileged process can cre
 
 If the physical link is gone before cleanup, the kernel (tested on 6.1) keeps the rule, stores the output interface name, and marks the rule detached. The manager still reads the name, matches the record, and deletes the rule by priority and table. A VM test confirmed this. Do not remove a rule that you cannot match to the record.
 
-The routes point at the TUN device. A crash that closes the descriptor removes the device, its address, and its device-bound routes. The policy rules are not bound to the device. A crash leaves the two rules for each address family, and table 700 stays selected for unbound traffic. In forward mode the table is empty, so the kernel falls through to table main and traffic keeps working. The next start refuses because the priorities are in use. Remove the stale rules before a new start:
+Closing the TUN descriptor removes the device, its address, and its
+device-bound routes. The policy rules are not device-bound and can survive a
+crash. The IPv6 blackhole is also not device-bound and can survive. A later
+start with the route-claim code can remove recorded objects without a prompt if
+its recovery checks pass; otherwise it refuses. This behavior still needs an
+independent review and a VM crash-recovery test.
 
-```sh
-sudo ip rule del priority 17001 table 700
-sudo ip rule del priority 17000 table main
-```
-
-Run the command for IPv4 and IPv6 as needed. Keep the table id and the priorities in one place: `TUNNEL_TABLE`, `OUTER_RULE_PRIORITY`, and `TUNNEL_RULE_PRIORITY` in `rust/src/platform_linux.rs`.
+Do not delete rules or routes by priority, table, or prefix alone. Those keys
+can match objects created by another process. Inspect the recorded claim and
+current objects, and stop if ownership is uncertain. Any manual cleanup needs
+the device owner's approval. The manual delete examples in
+`LINUX_ROUTE_RECOVERY.md` are not approved for use pending their correction.
+Keep the table id and priorities in `TUNNEL_TABLE`, `OUTER_RULE_PRIORITY`, and
+`TUNNEL_RULE_PRIORITY` in `rust/src/platform_linux.rs`.
 
 ### IPv6
 
@@ -81,7 +181,13 @@ Direct mode defaults to block and accepts explicit forward. Source device proxy 
 
 The start gate verifies the block policy. It reads table 700 and requires exactly the recorded `2000::/3` blackhole with protocol 196. It sends one fake `RTM_GETROUTE` FIB match for each default probe. The kernel reports a blackhole FIB entry as `EINVAL`, so every probe must get `EINVAL`. A unicast reply or a missing route is a bypass. Another kernel error is inconclusive, not a success. A more-specific route or a higher-priority rule can still bypass the blackhole. Do not describe the block as fail-closed.
 
-The blackhole route has no real output interface. The kernel reports the loopback interface for it. The route ownership key ignores the output interface only when both route types are blackhole. Cleanup still compares the family, prefix, table, protocol, type, metric, preferred source, and flow.
+The blackhole route has no real output interface. The kernel reports the
+loopback interface for it. The full record comparison handles that blackhole
+shape, but the IPv6 delete candidate model does not use route type to separate
+a blackhole from a unicast route. A visible conflicting candidate blocks the
+delete. The IPv6 parser accepts one default `RTA_PREF` byte and treats a
+nondefault value as unclean. These changes still need independent review and
+live-kernel verification for the current source snapshot.
 
 ### Test network
 
@@ -100,30 +206,43 @@ The link-loss test sets `hs-host0` down. The worker reads the netlink link state
 
 ### Procedure
 
-Build the test binary and the CLI in the VM:
+Build the test binary and the CLI in a fresh target directory in the VM. This
+prevents a binary left by an earlier build from being mistaken for the current
+source:
 
 ```sh
 cd ~/hotspotshade/rust
-cargo build --locked --tests
-cargo build --locked
+export CARGO_TARGET_DIR="$(mktemp -d /tmp/hotspotshade-cargo.XXXXXXXX)"
+cargo build --locked --test linux_tunnel_vm --bin hotspotshade
 ```
 
 Run the serial tunnel tests as root. The binary name has a hash:
 
 ```sh
 cd ~/hotspotshade/rust
-binary=$(find target/debug/deps -maxdepth 1 -type f \
-  -name 'linux_tunnel_vm-*' -perm -u+x | sort | tail -1)
-sudo -n -E "$binary" --ignored --test-threads=1 --nocapture
+binary=$(find "$CARGO_TARGET_DIR/debug/deps" -maxdepth 1 -type f \
+  -name 'linux_tunnel_vm-*' -perm -u+x)
+test -n "$binary" && test "$(printf '%s\n' "$binary" | wc -l | tr -d ' ')" = 1
+sudo -n -E env HS_DISPOSABLE_LINUX_VM=1 "$binary" \
+  --ignored --test-threads=1 --nocapture \
+  --skip linux_vm_mock_source --skip linux_vm_direct_echo
 ```
 
-The reviewed-source workflow wraps these steps:
+The opt-in is a reminder, not an automatic proof that the VM is disposable.
+Do not set it on a host with a network configuration that must be preserved.
+The run should report eight passing scenarios and two filtered helper entry
+points. The scenarios still invoke those helpers as child processes.
 
-```sh
-scripts/linux_vm_test.sh --tunnel /path/to/reviewed-source.tar.gz
-```
+The reviewed-source workflow is intended to wrap these steps after the transfer
+gate is repaired and reviewed. The old `--tunnel` invocation without digest
+arguments is no longer valid; do not use it.
 
-The script creates the disposable clone, runs the full suite, builds the engine, runs the tunnel tests as root, checks that no route, rule, link, namespace, or TUN device remains, prints the log, and deletes the clone.
+The current `--tunnel` harness is diagnostic only and always reports failure.
+The root test process can alter any status file used to report its own result,
+so its exit status cannot establish a trusted pass. It attempts to run the
+tests and cleanup inside the disposable clone, then deletes the clone. A future
+trusted tunnel result needs a separately reviewed result boundary and cleanup
+evidence; passing the transfer gate alone would not provide either.
 
 The tunnel suite covers:
 
@@ -136,7 +255,14 @@ The tunnel suite covers:
 - a SIGTERM stop that restores the pre-test routes, rules, TUN, and addresses;
 - a SIGKILL run that shows the TUN and its address are gone and reports the remaining policy rules.
 
-On 2026-11-05 a disposable Linux VM passed `cargo test --locked` with 733 library tests and every integration test, and the serial ignored suite with 10 tests. The same run left no `hs-tun`, `hs-host0`, `hs-src0`, network namespace, policy rule at priority 17000 or 17001, or route in table 700.
+A start after that SIGKILL can read the private route claim and remove its
+recorded objects before installing new ones if every recovery check passes.
+Otherwise it refuses. The serial suite does not yet include that recovery
+start; the hermetic coverage is in
+[LINUX_ROUTE_RECOVERY.md](LINUX_ROUTE_RECOVERY.md). A start from a build before
+the claim existed keeps the old refusal.
+
+On 2026-11-05 a disposable Linux VM passed `cargo test --locked` with 733 library tests and every integration test. The route-recovery tests in `platform_linux` were added after that run. The serial ignored suite reported 10 passes: eight tunnel scenarios and two helper entry points that return immediately when not invoked as child processes. The same run left no `hs-tun`, `hs-host0`, `hs-src0`, network namespace, policy rule at priority 17000 or 17001, or route in table 700.
 
 The IPv6 flow uses the source address that the kernel selects on the test host. It does not add an address to the TUN. A host without an IPv6 source address cannot start an inner IPv6 flow. The test proves the TUN, relay, and source device IPv6 path only on a host with IPv6.
 

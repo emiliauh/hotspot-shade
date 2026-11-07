@@ -84,10 +84,14 @@ public struct NotificationInput: Equatable {
     public var lastStopMessage: String?
     // A tunnel error from the model. Used when the engine sends no last stop.
     public var error: String?
-    public init(authorization: NotificationAuthorization = .authorized, isFrontmost: Bool = false, running: Bool = false, phone: PhoneState = .unknown, sourceDeviceWarning: Bool = false, pairingNeedsAttention: Bool = false, lastStop: LastStop? = nil, lastStopMessage: String? = nil, error: String? = nil) {
+    // True when the engine cannot prove whether the tunnel is on or off. A
+    // message about a stop or a source device failure would be a guess.
+    public var serviceStateUnknown: Bool
+    public init(authorization: NotificationAuthorization = .authorized, isFrontmost: Bool = false, running: Bool = false, phone: PhoneState = .unknown, sourceDeviceWarning: Bool = false, pairingNeedsAttention: Bool = false, lastStop: LastStop? = nil, lastStopMessage: String? = nil, error: String? = nil, serviceStateUnknown: Bool = false) {
         self.authorization = authorization; self.isFrontmost = isFrontmost; self.running = running; self.phone = phone
         self.sourceDeviceWarning = sourceDeviceWarning; self.pairingNeedsAttention = pairingNeedsAttention
         self.lastStop = lastStop; self.lastStopMessage = lastStopMessage; self.error = error
+        self.serviceStateUnknown = serviceStateUnknown
     }
 }
 
@@ -123,6 +127,13 @@ public struct NotificationPolicy {
     }
 
     public mutating func evaluate(_ input: NotificationInput) -> NotificationOutput {
+        // An unknown service state proves neither a stop nor a live source
+        // device. A message here would blame the hotspot or the source device
+        // for an interrupted operation on the target device. Keep the last
+        // delivered warning and send nothing.
+        if input.serviceStateUnknown {
+            return NotificationOutput(messages: [], clearDelivered: false)
+        }
         let date = now()
         var messages: [NotificationMessage] = []
         var clear = false
@@ -153,7 +164,7 @@ public struct NotificationPolicy {
                     }
                 case .error:
                     if !input.isFrontmost, canFire(.tunnelError, at: date) {
-                        let body = sanitizedMessage(input.lastStopMessage) ?? input.error.flatMap(sanitizedMessage) ?? Strings.attention
+                        let body = sanitizedMessage(input.lastStopMessage) ?? input.error.flatMap(sanitizedMessage) ?? Strings.tunnelErrorBody
                         messages.append(NotificationMessage(kind: .tunnelError, body: body))
                         markFired(.tunnelError, at: date)
                     }

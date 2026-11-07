@@ -438,6 +438,14 @@ struct DiagnosticsReport: Equatable {
     var appVersion = "Unknown"
     var systemVersion = "Unknown"
     var proxyState = "Off"
+    /// The plain attention line for the current proxy state. It is the same
+    /// text that the Dashboard shows for a Start failure or a token problem.
+    /// It holds no token and no address. Empty keeps the report unchanged.
+    var proxyDetail = ""
+    /// The source device capability lines. The app fills them from the iOS
+    /// capability model. They are plain lines, so this file keeps no dependency
+    /// on the Settings screen. Empty keeps the report unchanged.
+    var capabilityLines: [String] = []
 
     /// The report text. One fact per line. The first line is the plain header.
     func text() -> String {
@@ -447,6 +455,9 @@ struct DiagnosticsReport: Equatable {
             "Proxy: \(proxyState).",
             "Connections: \(connections.summary)"
         ]
+        if !proxyDetail.isEmpty {
+            lines.append("Proxy detail: \(proxyDetail)")
+        }
         if let cancelled = connections.cancelledSummary {
             lines.append("Cancelled: \(cancelled)")
         }
@@ -472,6 +483,9 @@ struct DiagnosticsReport: Equatable {
         lines.append("Low Power Mode: \(lowPowerMode ? "On" : "Off").")
         lines.append("Thermal state: \(thermal.rawValue).")
         lines.append(locationHealth.isEmpty ? "Keep-awake: unknown." : "Keep-awake: \(locationHealth)")
+        if !capabilityLines.isEmpty {
+            lines.append(contentsOf: capabilityLines)
+        }
         return lines.joined(separator: "\n")
     }
 

@@ -43,6 +43,8 @@ internal object ProxyStatusMapping {
         SourceProxyStopReason.HOTSPOT_LOST -> RealStopReason.HOTSPOT_LOST
         SourceProxyStopReason.BIND_FAILED -> RealStopReason.BIND_FAILED
         SourceProxyStopReason.START_FAILED -> RealStopReason.START_FAILED
+        SourceProxyStopReason.LISTENER_FAILED -> RealStopReason.LISTENER_FAILED
         SourceProxyStopReason.TOKEN_MISSING -> RealStopReason.TOKEN_MISSING
+        SourceProxyStopReason.TOKEN_UNREADABLE -> RealStopReason.TOKEN_UNREADABLE
     }
 }

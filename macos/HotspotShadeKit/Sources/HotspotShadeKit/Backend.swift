@@ -120,6 +120,48 @@ public struct LastStop: Codable, Equatable {
     }
 }
 
+// The engine-level service state from GET /api/status. The current engine sends
+// "unknown" after an interrupted operation. In that status `running` is a
+// conservative guard, not a measurement of a live tunnel. An older engine
+// sends no state at all, so a missing value is .ready and the running flag
+// keeps its old meaning.
+public enum ServiceState: String, Equatable {
+    case ready, unknown
+    // A missing value is an older engine. Any value that this app does not
+    // know is treated as unknown, so a future recovery state cannot slip
+    // through as a normal status and enable a start.
+    public init(raw: String?) {
+        let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if value == nil || value == "" || value == "ready" { self = .ready } else { self = .unknown }
+    }
+}
+
+// How far the app can trust the engine's running flag. This type is pure, so
+// every status shape is a test without a backend.
+public enum EngineHealth: Equatable {
+    // The status describes a tunnel that the app may act on.
+    case normal
+    // The engine reports incomplete cleanup and says the tunnel is off. A new
+    // start must stay disabled until a person checks the target device.
+    case cleanupBlocked
+    // The engine cannot prove whether the tunnel is on or off. The app must
+    // not show On or Off and must not start or stop from this state.
+    case stateUnknown
+
+    public static func resolve(state: String?, running: Bool?, cleanupBlocked: Bool?) -> EngineHealth {
+        if ServiceState(raw: state) == .unknown { return .stateUnknown }
+        guard cleanupBlocked == true else { return .normal }
+        // A guarded running flag is not evidence of a live tunnel. A missing
+        // flag is unknown too. Only an explicit false describes a stopped
+        // tunnel whose cleanup did not finish.
+        return running == false ? .cleanupBlocked : .stateUnknown
+    }
+    public var isNormal: Bool { self == .normal }
+    // A start needs a normal status. The engine refuses a start after an
+    // interrupted operation, and the app must not offer one either.
+    public var allowsStart: Bool { self == .normal }
+}
+
 public struct Status: Codable {
     public var demo: Bool?; public var api: Int?; public var running: Bool?; public var mode: String?; public var error: String?; public var started_at: Double?; public var paired: Bool?; public var phone_host: String?; public var phone_port: Int?; public var phone: Phone?; public var logs: [LogLine]?; public var icmp_enabled: Bool?
     // New fields from the current engine. Every one is optional.
@@ -127,11 +169,18 @@ public struct Status: Codable {
     public var forget: ForgetState?
     public var last_stop: LastStop?
     public var last_stop_message: String?
-    public init(running: Bool? = nil, paired: Bool? = nil, phone: Phone? = nil, error: String? = nil, icmpEnabled: Bool? = nil, iface: String? = nil, forget: ForgetState? = nil, lastStop: LastStop? = nil, lastStopMessage: String? = nil) {
+    // The current engine adds these. An older engine sends neither, so a
+    // missing value must not change the old running meaning.
+    public var state: String?
+    public var cleanup_blocked: Bool?
+    public init(running: Bool? = nil, paired: Bool? = nil, phone: Phone? = nil, error: String? = nil, icmpEnabled: Bool? = nil, iface: String? = nil, forget: ForgetState? = nil, lastStop: LastStop? = nil, lastStopMessage: String? = nil, state: String? = nil, cleanupBlocked: Bool? = nil) {
         self.running = running; self.paired = paired; self.phone = phone; self.error = error; self.icmp_enabled = icmpEnabled
         self.iface = iface; self.forget = forget; self.last_stop = lastStop; self.last_stop_message = lastStopMessage
+        self.state = state; self.cleanup_blocked = cleanupBlocked
     }
-    enum CodingKeys: String, CodingKey { case demo, api, running, mode, error, started_at, paired, phone_host, phone_port, phone, logs, icmp_enabled, iface, forget, last_stop, last_stop_message }
+    public var serviceState: ServiceState { ServiceState(raw: state) }
+    public var engineHealth: EngineHealth { EngineHealth.resolve(state: state, running: running, cleanupBlocked: cleanup_blocked) }
+    enum CodingKeys: String, CodingKey { case demo, api, running, mode, error, started_at, paired, phone_host, phone_port, phone, logs, icmp_enabled, iface, forget, last_stop, last_stop_message, state, cleanup_blocked }
     public init(from decoder: Decoder) throws {
         let container = try? decoder.container(keyedBy: CodingKeys.self)
         demo = decodeField(container, .demo, as: Bool.self)
@@ -151,6 +200,8 @@ public struct Status: Codable {
         forget = decodeField(container, .forget, as: ForgetState.self)
         last_stop = decodeField(container, .last_stop, as: LastStop.self)
         last_stop_message = decodeField(container, .last_stop_message, as: String.self)
+        state = decodeField(container, .state, as: String.self)
+        cleanup_blocked = decodeField(container, .cleanup_blocked, as: Bool.self)
     }
 }
 public struct PairState: Codable {
@@ -248,13 +299,17 @@ public struct UDPDiagnostics: Codable, Equatable {
 }
 public struct TCPDiagnostics: Codable, Equatable {
     public var flows_peak: Int?; public var retransmits: Int?; public var zero_window_ms: Double?
-    public init(flows_peak: Int? = nil, retransmits: Int? = nil, zero_window_ms: Double? = nil) { self.flows_peak = flows_peak; self.retransmits = retransmits; self.zero_window_ms = zero_window_ms }
-    enum CodingKeys: String, CodingKey { case flows_peak, retransmits, zero_window_ms }
+    // Live target relay entries, including setup. An older engine omits it,
+    // and a negative value is not a count, so both stay unknown.
+    public var flows_active: Int?
+    public init(flows_peak: Int? = nil, retransmits: Int? = nil, zero_window_ms: Double? = nil, flows_active: Int? = nil) { self.flows_peak = flows_peak; self.retransmits = retransmits; self.zero_window_ms = zero_window_ms; self.flows_active = flows_active }
+    enum CodingKeys: String, CodingKey { case flows_peak, retransmits, zero_window_ms, flows_active }
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         flows_peak = decodeField(container, .flows_peak, as: Int.self)
         retransmits = decodeField(container, .retransmits, as: Int.self)
         zero_window_ms = decodeField(container, .zero_window_ms, as: Double.self)
+        flows_active = decodeField(container, .flows_active, as: Int.self).flatMap { $0 >= 0 ? $0 : nil }
     }
 }
 public struct FailureTotals: Codable, Equatable {
@@ -370,12 +425,18 @@ public protocol BackendClient {
     func probe() async throws -> Phone
     // Read the engine counters. An older engine has no endpoint.
     func diagnostics() async throws -> Diagnostics
+    // Write one pairing handoff into the private descriptor that the user
+    // engine holds. The app calls this only before it asks for an elevated
+    // engine. The response never carries a token or a key.
+    func pairHandoff() async throws
 }
 public extension BackendClient {
     func status() async throws -> Status { try await status(timeout: 3) }
     func stopTunnel() async throws { try await stopTunnel(timeout: 70) }
     // Old call sites keep the product default: ping works.
     func startTunnel() async throws { try await startTunnel(experimentalICMP: true) }
+    // An engine before the handoff build has no endpoint.
+    func pairHandoff() async throws { throw BackendError.notSupported }
 }
 public enum BackendError: LocalizedError {
     case unauthorized
@@ -392,6 +453,9 @@ public enum BackendError: LocalizedError {
     case forgetBlockedByTunnel
     // An engine before the current build has no endpoint for this request.
     case notSupported
+    // The engine answered with its built-in test data. The app has no mode for
+    // that data, so it is an engine error and the values are never shown.
+    case testDataEngine
     public var errorDescription: String? {
         switch self {
         case .unauthorized: return "The engine rejected the request."
@@ -403,6 +467,7 @@ public enum BackendError: LocalizedError {
         case .phoneTokenRejected(let message): return message
         case .forgetBlockedByTunnel: return "Turn off the tunnel first."
         case .notSupported: return "This engine does not support the request."
+        case .testDataEngine: return EngineLaunchText.testDataEngine
         }
     }
 }
@@ -463,12 +528,16 @@ public final class HTTPBackend: BackendClient {
             if code == "tunnel_running" { throw BackendError.forgetBlockedByTunnel }
             throw BackendError.response(message)
         }
-        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any], obj["ok"] as? Bool == false {
+        let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        if object?["ok"] as? Bool == false {
             let (code, message) = engineError(data)
             if code == "phone_token_rejected" { throw BackendError.phoneTokenRejected(message) }
             if code == "tunnel_running" { throw BackendError.forgetBlockedByTunnel }
             throw BackendError.response(message)
         }
+        // The engine marks its built-in test data. The app has no mode for it,
+        // so no answer with that mark is shown or acted on.
+        if object?["demo"] as? Bool == true { throw BackendError.testDataEngine }
         return data
     }
     public func status(timeout: TimeInterval) async throws -> Status { try JSONDecoder().decode(Status.self, from: await request("/api/status", timeout: timeout)) }
@@ -538,6 +607,9 @@ public final class HTTPBackend: BackendClient {
         let data = try await request("/api/diagnostics", timeout: 2, allowNotFound: true)
         do { return try JSONDecoder().decode(Diagnostics.self, from: data) }
         catch { throw BackendError.unavailable }
+    }
+    public func pairHandoff() async throws {
+        _ = try await request("/api/pairing/handoff", body: "{}", timeout: 5)
     }
 }
 public final class FakeBackend: BackendClient {
@@ -717,4 +789,5 @@ public final class FakeBackend: BackendClient {
         if let failure { throw failure }
         return value
     }
+    public func pairHandoff() async throws { try call("pairHandoff") }
 }

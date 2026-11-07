@@ -14,7 +14,7 @@ struct LocationHealthTests {
 
         check(LocationHealth.recentSeconds == 60, "recent window")
         check(LocationHealth.stoppedSeconds == 300, "stopped window")
-        check(LocationHealth.keepingAwake == "The app stays awake while the proxy runs.", "keeping awake text")
+        check(LocationHealth.keepingAwake == "Location updates are active. iOS can still pause the app.", "keeping awake text")
         check(LocationHealth.updatesStopped == "Location updates stopped. Open HotspotShade to restart.",
               "stopped text")
         check(LocationHealth.noFix == "No location yet.", "no fix text")

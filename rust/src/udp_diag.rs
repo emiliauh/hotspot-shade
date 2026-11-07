@@ -104,10 +104,7 @@ pub fn read_secrets_fd(fd: RawFd) -> Result<Secrets, String> {
     let mode = stat.st_mode as libc::mode_t;
     #[cfg(not(all(target_os = "android", target_pointer_width = "32")))]
     let mode = stat.st_mode;
-    let kind = mode & libc::S_IFMT;
-    let private_file =
-        kind == libc::S_IFREG && stat.st_uid == unsafe { libc::geteuid() } && mode & 0o077 == 0;
-    if kind != libc::S_IFIFO && kind != libc::S_IFSOCK && !private_file {
+    if !acceptable_secret_descriptor(mode, stat.st_uid, unsafe { libc::geteuid() }) {
         return Err(
             "the secret descriptor must be a pipe, a socket, or a file with mode 0600".into(),
         );
@@ -129,6 +126,17 @@ pub fn read_secrets_fd(fd: RawFd) -> Result<Secrets, String> {
     };
     buffer.fill(0);
     result
+}
+
+/// True when the descriptor mode is a pipe, a socket, or a regular file that
+/// only its owner can read and write. `mode` is a `libc::mode_t`. On the
+/// 32-bit Android targets that is 16 bits wide while `stat.st_mode` is 32 bits,
+/// so the caller casts before the file type and permission bits are read.
+fn acceptable_secret_descriptor(mode: libc::mode_t, owner: libc::uid_t, euid: libc::uid_t) -> bool {
+    let kind = mode & libc::S_IFMT;
+    kind == libc::S_IFIFO
+        || kind == libc::S_IFSOCK
+        || (kind == libc::S_IFREG && owner == euid && mode & 0o077 == 0)
 }
 
 struct EchoGuard {
@@ -1278,6 +1286,30 @@ mod tests {
         assert!(read_secrets_fd(fd).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(read_secrets_fd(-1).is_err());
+    }
+
+    #[test]
+    fn secret_descriptor_modes_are_classified_portably() {
+        // 32-bit Android has a 16-bit mode_t and a 32-bit stat.st_mode. The
+        // file type and permission bits must fit mode_t after the cast.
+        let file = |perm: libc::mode_t| libc::S_IFREG | perm;
+        assert!(acceptable_secret_descriptor(file(0o600), 1000, 1000));
+        assert!(!acceptable_secret_descriptor(file(0o644), 1000, 1000));
+        assert!(!acceptable_secret_descriptor(file(0o600), 1000, 1001));
+        assert!(acceptable_secret_descriptor(libc::S_IFIFO, 1000, 0));
+        assert!(acceptable_secret_descriptor(libc::S_IFSOCK, 1000, 0));
+        assert!(!acceptable_secret_descriptor(
+            libc::S_IFDIR | 0o700,
+            1000,
+            1000
+        ));
+        // Permission bits alone are not a file type.
+        assert!(!acceptable_secret_descriptor(0o600, 1000, 1000));
+        // Every file type constant fits the target mode_t. On the 32-bit
+        // Android targets a 32-bit stat.st_mode would otherwise be truncated.
+        for constant in [libc::S_IFMT, libc::S_IFREG, libc::S_IFIFO, libc::S_IFSOCK] {
+            assert_eq!(constant & !libc::S_IFMT, 0);
+        }
     }
 
     #[test]

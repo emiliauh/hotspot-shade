@@ -4,10 +4,14 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const {
+  ACTION_FAILURE,
+  createActionFailureNotifier,
+  createActionFailurePolicy,
   createElectronNotificationSink,
   createNotificationPolicy,
   sanitize
 } = require('../src/main/notifications.js');
+const { notificationsAllowedForConfig } = require('../src/main/monitor.js');
 
 function status(overrides = {}) {
   return Object.assign({
@@ -132,6 +136,92 @@ test('each kind is limited to one message in the debounce window', () => {
     status: status({ last_stop: { reason: 'hotspot_lost', at: 3 } })
   });
   assert.equal(third.length, 1);
+});
+
+function actionNotifier(options = {}) {
+  let clock = 1000;
+  const posts = [];
+  const sink = Object.prototype.hasOwnProperty.call(options, 'sink')
+    ? options.sink
+    : { supported: true, post(message) { posts.push(message); return true; } };
+  const settingsStore = Object.prototype.hasOwnProperty.call(options, 'settingsStore')
+    ? options.settingsStore
+    : { snapshot() { return { notifications: options.notifications !== false }; } };
+  const notifier = createActionFailureNotifier({
+    sink,
+    settingsStore,
+    allowNotifications: options.allow !== false,
+    policy: createActionFailurePolicy({ now: () => clock })
+  });
+  return {
+    notifier,
+    posts,
+    advance(milliseconds) {
+      clock += milliseconds;
+    }
+  };
+}
+
+test('a tray action failure uses fixed text and a separate limit for each action', () => {
+  const { notifier, posts, advance } = actionNotifier();
+
+  assert.equal(notifier.notify('start'), true);
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].kind, 'action-start');
+  assert.equal(posts[0].title, 'HotspotShade');
+  assert.equal(posts[0].body, ACTION_FAILURE.start);
+  assert.equal(posts[0].body, 'The tunnel did not start. Open HotspotShade to read the status.');
+
+  assert.equal(notifier.notify('start'), false);
+  assert.equal(posts.length, 1);
+
+  assert.equal(notifier.notify('stop'), true);
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1].kind, 'action-stop');
+  assert.equal(posts[1].body, ACTION_FAILURE.stop);
+  assert.equal(posts[1].body, 'The tunnel did not stop. Open HotspotShade to read the status.');
+
+  advance(59999);
+  assert.equal(notifier.notify('start'), false);
+  advance(1);
+  assert.equal(notifier.notify('start'), true);
+  assert.equal(posts.length, 3);
+});
+
+test('demo and invalid-engine configurations stay silent for tray action failures', () => {
+  for (const config of [
+    { mode: 'demo' },
+    { mode: 'error' },
+    { mode: 'engine', demo: true }
+  ]) {
+    const { notifier, posts } = actionNotifier({
+      allow: notificationsAllowedForConfig(config)
+    });
+    assert.equal(notifier.notify('start'), false);
+    assert.deepEqual(posts, []);
+  }
+});
+
+test('the notification setting, desktop support, and a failing store gate action failures', () => {
+  const disabled = actionNotifier({ notifications: false });
+  assert.equal(disabled.notifier.notify('stop'), false);
+  assert.deepEqual(disabled.posts, []);
+
+  const unsupported = actionNotifier({ sink: { supported: false, post() { throw new Error('must not post'); } } });
+  assert.equal(unsupported.notifier.notify('stop'), false);
+  assert.deepEqual(unsupported.posts, []);
+
+  const unreadable = actionNotifier({
+    settingsStore: { snapshot() { throw new Error('The settings file is unreadable.'); } }
+  });
+  assert.equal(unreadable.notifier.notify('start'), false);
+  assert.deepEqual(unreadable.posts, []);
+
+  const failingSink = actionNotifier({
+    sink: { supported: true, post() { throw new Error('The desktop rejected the message.'); } }
+  });
+  assert.equal(failingSink.notifier.notify('start'), false);
+  assert.deepEqual(failingSink.posts, []);
 });
 
 test('message text is one bounded line and holds no control character', () => {

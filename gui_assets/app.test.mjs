@@ -42,6 +42,28 @@ const script = stubs +
 vm.runInNewContext(script, context);
 const api = context.__failureApi;
 
+test('unverified forget outcomes never claim remote removal', () => {
+  const start = source.indexOf('    function updatePairUI() {');
+  const end = source.indexOf('    // Show the automatic stop message', start);
+  assert.ok(start > 0 && end > start, 'pairing presentation must exist');
+  for (const outcome of ['confirmed', 'not_delivered']) {
+    const dom = Object.fromEntries([
+      'pairPill', 'pairPillText', 'pairStatus', 'pairCodeBlock', 'pairCode',
+      'pairStart', 'pairCancel', 'pairForget', 'phoneProbe'
+    ].map((name) => [name, {}]));
+    const scope = {
+      state: { pair: { state: 'idle' }, forget: { state: outcome } },
+      dom,
+      PAIR_ACTIVE: {},
+      setText: (node, text) => { node.textContent = text; }
+    };
+    vm.runInNewContext(source.slice(start, end) + '\nupdatePairUI();', scope);
+    assert.equal(dom.pairPillText.textContent, 'Forget not confirmed');
+    assert.match(dom.pairStatus.textContent, /Could not confirm/);
+    assert.match(dom.pairStatus.textContent, /may still trust/);
+  }
+});
+
 test('a known phase has a plain label and a report word', () => {
   assert.equal(api.failurePhaseToken('connect'), 'connect');
   assert.equal(api.failurePhaseToken('GREETING'), 'greeting');

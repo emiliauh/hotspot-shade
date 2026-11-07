@@ -1,4 +1,5 @@
 import SwiftUI
+import Foundation
 
 // The menu bar menu. It is a native menu, not a window. The order is: the
 // status, the actions, the notices, the window and settings rows, then Quit.
@@ -83,7 +84,9 @@ public struct MenuBarMenu: View {
             }
         }
         .disabled(!item.isEnabled)
-        .help(item.help ?? "")
+        // An enabled Turn on item explains the administrator prompt. A
+        // disabled item keeps the reason why it is disabled.
+        .help(item.help ?? (item.kind == .turnOn ? UIStrings.adminAuthorization : ""))
     }
 
     private func activate(_ kind: MenuBarItem.Kind) {

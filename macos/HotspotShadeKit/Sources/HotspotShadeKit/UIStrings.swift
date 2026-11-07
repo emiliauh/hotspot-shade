@@ -5,15 +5,17 @@ import Foundation
 // The pairing state line in Settings. It follows the screen, not only the
 // saved credentials.
 public enum SettingsPairingText {
-    public static func state(_ screen: Screen, paired: Bool, unavailable: Bool) -> String {
+    public static func state(_ screen: Screen, paired: Bool, unavailable: Bool, indeterminate: Bool = false) -> String {
+        // An unknown service state cannot support "Paired" or "Not paired".
+        if indeterminate { return Strings.serviceStateUnknownTitle }
         if unavailable { return UIStrings.statusUnavailableLine }
         if screen == .notTrusted { return Strings.notTrustedTitle }
         if screen == .unpaired { return Strings.notPaired }
         return paired ? Strings.paired : Strings.notPaired
     }
 
-    public static func symbol(_ screen: Screen, paired: Bool, unavailable: Bool) -> String {
-        if unavailable { return "questionmark.circle" }
+    public static func symbol(_ screen: Screen, paired: Bool, unavailable: Bool, indeterminate: Bool = false) -> String {
+        if indeterminate || unavailable { return "questionmark.circle" }
         if screen == .notTrusted { return "exclamationmark.triangle" }
         return paired ? "checkmark.seal" : "link.badge.plus"
     }
@@ -34,6 +36,10 @@ public enum UIStrings {
     public static let noConnectionDetails = "No connection details yet."
     public static let noConnectionYet = "No connection yet."
     public static let statusUnavailableLine = "The status is unavailable."
+    // The engine cannot prove whether the tunnel is on. The cards must not
+    // show Tunnel off or a source device state as if either were measured.
+    public static let unknownValue = "Unknown"
+    public static let unknownCardHint = "Inspect routes, devices, and the start record before restarting."
     public static let startingApp = "Starting HotspotShade"
     public static let failuresUnavailable = "This app cannot list failures."
 
@@ -69,12 +75,13 @@ public enum UIStrings {
     public static let refreshStatusHelp = "Refresh the status. Command R."
     public static let activityEmpty = Strings.noLogs
     public static let activityUnavailable = "The app cannot read activity now."
+    public static let activityError = "HotspotShade could not read activity."
     public static let activityDetailsNote = "Details add the level and the sequence number."
 
     // Settings.
     public static let notifications = "Notifications"
     public static let notificationsOn = "Notifications are on."
-    public static let notificationsNotAsked = "Notifications are asked for the first time you turn the tunnel on."
+    public static let notificationsNotAsked = "macOS asks for notification permission the first time you turn the tunnel on."
     public static let openSystemSettings = "Open System Settings"
     public static let forgetHint = "Forget removes this pairing from this target device."
     public static let link = "Wi-Fi"
@@ -83,10 +90,10 @@ public enum UIStrings {
     public static let appDetails = "App details"
     public static let appVersion = "App version"
     public static let macOSVersion = "macOS"
-    public static let mode = "Mode"
-    public static let modeDemo = "Demo. Data is simulated."
-    public static let modeNormal = "Source device proxy"
     public static let status = "Status"
+    public static let serviceState = "Service state"
+    public static let serviceStateUnknown = "unknown"
+    public static let serviceStateCleanupBlocked = "cleanup blocked"
     public static let copied = Strings.diagnosticsCopied
     public static let copyDiagnostics = "Copy diagnostics"
 
@@ -107,11 +114,16 @@ public enum UIStrings {
     public static let menuStartingDetail = "The window shows more when the app is ready."
     public static let checking = "Checking..."
 
+    // The administrator authorization is a system prompt at the tunnel start,
+    // not at app launch. The dashboard and the Turn on menus say so.
+    public static let adminAuthorization = "macOS asks for administrator authorization when you turn on the tunnel."
+
     // The texts that the tests check for product words. Add a text here when
     // a window shows new text.
     public static let allText: [String] = [
         dashboard, activity, general, pairingTab, advanced,
         sourceDevice, connection, needsAttention, noConnectionDetails, noConnectionYet, statusUnavailableLine,
+        unknownValue, unknownCardHint,
         startingApp, failuresUnavailable,
         tunnelOn, tunnelOff, connectionStarting, pairToRestoreTrust, pressPairToContinue,
         pairingIsSaved, lookingForSourceDevice, checksEverySecond, tunnelUsesSourceDevice,
@@ -119,15 +131,17 @@ public enum UIStrings {
         checkBothScreens, pairWhenReady, waitingForCode, pairingStepOpen, pairingStepCompare,
         pairingStepAllow, copyCode, codeCopied, pairingCodeLabel,
         details, detailsHelp, refreshActivityHelp, refreshing, refreshStatusHelp,
-        activityEmpty, activityUnavailable, activityDetailsNote,
+        activityEmpty, activityUnavailable, activityError, activityDetailsNote,
         notifications, notificationsOn, notificationsNotAsked, openSystemSettings, forgetHint,
-        link, noLinkAdvice, loadingActivity, appDetails, appVersion, macOSVersion, mode, modeDemo, modeNormal, status, copied,
+        link, noLinkAdvice, loadingActivity, appDetails, appVersion, macOSVersion, status, serviceState, serviceStateUnknown, serviceStateCleanupBlocked, copied,
         copyDiagnostics, countColumn, kindColumn, targetColumn, stageColumn, reasonColumn, failureDetails,
         notices, settingsMenu, turningOff, turningOffNote, menuStarting, menuStartingDetail, checking,
+        adminAuthorization,
         Strings.pair, Strings.pairAgain, Strings.turnOn, Strings.turnOff, Strings.checkNow,
         Strings.openApp, Strings.quit, Strings.settings, Strings.refresh, Strings.copyReport,
         Strings.recentFailures, Strings.pairingTitle, Strings.compareCode, Strings.allow,
         Strings.cancel, Strings.letPingWork, Strings.login, Strings.forget,
-        Strings.turnOffAndForget, Strings.forgetBlocked,
+        Strings.turnOffAndForget, Strings.forgetBlocked, Strings.alreadyPaired,
+        Strings.tunnelErrorBody,
     ]
 }

@@ -11,12 +11,22 @@ public struct DiagnosticsContext: Equatable {
     public var lastStop: LastStop?
     public var lastStopMessage: String?
     public var notificationAuthorization: NotificationAuthorization
+    // The engine service state and its cleanup flag. An older engine sends
+    // neither, so the defaults describe a normal status.
+    public var serviceState: ServiceState
+    public var cleanupBlocked: Bool
+    // An unconfirmed helper stop that the status answer cannot show. The app
+    // owns this state, so the report names it separately.
+    public var pendingCleanup: String?
     public var now: Date
-    public init(macOSVersion: String = "unknown", appVersion: String = "unknown", link: WiFiLinkInfo? = nil, interfaceName: String? = nil, icmpEnabled: Bool? = nil, lastStop: LastStop? = nil, lastStopMessage: String? = nil, notificationAuthorization: NotificationAuthorization = .notDetermined, now: Date = Date()) {
+    public init(macOSVersion: String = "unknown", appVersion: String = "unknown", link: WiFiLinkInfo? = nil, interfaceName: String? = nil, icmpEnabled: Bool? = nil, lastStop: LastStop? = nil, lastStopMessage: String? = nil, notificationAuthorization: NotificationAuthorization = .notDetermined, serviceState: ServiceState = .ready, cleanupBlocked: Bool = false, pendingCleanup: String? = nil, now: Date = Date()) {
         self.macOSVersion = macOSVersion; self.appVersion = appVersion; self.link = link
         self.interfaceName = interfaceName; self.icmpEnabled = icmpEnabled
         self.lastStop = lastStop; self.lastStopMessage = lastStopMessage
-        self.notificationAuthorization = notificationAuthorization; self.now = now
+        self.notificationAuthorization = notificationAuthorization
+        self.serviceState = serviceState; self.cleanupBlocked = cleanupBlocked
+        self.pendingCleanup = pendingCleanup
+        self.now = now
     }
 }
 
@@ -32,6 +42,12 @@ public enum DiagnosticsReport {
         lines.append(wifiLine(context))
         lines.append("Ping: \(switchWord(context.icmpEnabled, on: "on", off: "off"))")
         lines.append(lastStopLine(context))
+        if context.serviceState == .unknown || context.cleanupBlocked {
+            lines.append("Service: \(serviceStateLine(context))")
+        }
+        if let pending = context.pendingCleanup, !pending.isEmpty {
+            lines.append("Cleanup: \(pending)")
+        }
         lines.append("Notifications: \(authorizationWord(context.notificationAuthorization))")
         if let diagnostics {
             lines.append(engineLine(diagnostics.engine))
@@ -70,11 +86,23 @@ public enum DiagnosticsReport {
     }
 
     private static func lastStopLine(_ context: DiagnosticsContext) -> String {
+        if context.serviceState == .unknown { return "Last stop: unknown" }
         guard let stop = context.lastStop, let reason = stop.reason, !reason.isEmpty else { return "Last stop: none" }
         var line = "Last stop: \(reason)"
         if let at = stop.at { line += " at \(timeWord(Date(timeIntervalSince1970: at)))" }
         if let message = Strings.sanitized(context.lastStopMessage), !message.isEmpty { line += ". \(message)" }
         return line
+    }
+
+    // A poisoned engine reports an unknown state; incomplete cleanup is a
+    // known stopped tunnel. Neither line claims that the tunnel is on.
+    private static func serviceStateLine(_ context: DiagnosticsContext) -> String {
+        switch context.serviceState {
+        case .unknown:
+            return context.cleanupBlocked ? "unknown, cleanup blocked" : "unknown"
+        case .ready:
+            return context.cleanupBlocked ? "ready, cleanup blocked" : "ready"
+        }
     }
 
     private static func authorizationWord(_ value: NotificationAuthorization) -> String {
@@ -123,8 +151,12 @@ public enum DiagnosticsReport {
         "UDP: \(udp?.flows.map(String.init) ?? "unknown") flows, \(udp?.age_drops.map(String.init) ?? "unknown") age drops"
     }
 
+    // flows_active is the live target relay entry count. It is not the source
+    // device connection count and it is not cumulative. A missing, malformed,
+    // or negative value stays unknown; never show it as zero.
     private static func tcpLine(_ tcp: TCPDiagnostics?) -> String {
-        "TCP: \(tcp?.flows_peak.map(String.init) ?? "unknown") peak flows, \(tcp?.retransmits.map(String.init) ?? "unknown") retransmits, \(number(tcp?.zero_window_ms)) ms zero window"
+        let active = tcp?.flows_active.flatMap { $0 >= 0 ? String($0) : nil } ?? "unknown"
+        return "TCP: \(tcp?.flows_peak.map(String.init) ?? "unknown") peak flows, \(active) active flows, \(tcp?.retransmits.map(String.init) ?? "unknown") retransmits, \(number(tcp?.zero_window_ms)) ms zero window"
     }
 
     // These are local relay events, not end-to-end packet loss. Do not turn

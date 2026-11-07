@@ -5,7 +5,7 @@ import AppKit
 
 // These tests measure the real views without a window. The offscreen image
 // renderer does not draw text in the test process, so the tests do not compare
-// pixels. The previews and the demo app check the drawing.
+// pixels. The previews and the app check the drawing.
 @MainActor final class W6LayoutTests: XCTestCase {
     // The refresh control must keep the same size while it shows the spinner.
     // A changing size moved the toolbar and clipped the spinner.

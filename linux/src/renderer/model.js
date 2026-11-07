@@ -63,14 +63,22 @@
     notTrustedRunning: 'The source device forgot this target device. The tunnel keeps running until you turn it off.',
     forgetBlocked: 'Turn off the tunnel to forget this source device.',
     forgetPending: 'Forgetting this source device.',
-    forgetConfirmed: 'Forgotten. The source device removed this target device.',
-    forgetNotDelivered: 'The source device did not answer. This target device forgot the pairing, but the source device may still trust it.',
+    forgetConfirmed: 'Could not confirm that the source device removed this pairing. This target device forgot the pairing, but the source device may still trust it.',
+    forgetNotDelivered: 'Could not confirm that the source device removed this pairing. This target device forgot the pairing, but the source device may still trust it.',
     trustedBySource: 'The source device still knows this target device. Press Pair to continue.',
     portChanged: 'The source device changed its port. Turn the tunnel off and on.',
     notificationsDenied: 'Notifications are off. You will not see a message when the tunnel turns off.',
     notificationsUnavailable: 'This desktop does not support notifications.',
     pingOn: 'Ping is on.',
     pingOff: 'Ping is off.',
+    directNotUsed: 'Not used',
+    directReady: 'Direct mode',
+    directDetail: 'No source device app is used. The tunnel uses this target device hotspot link.',
+    directOnDetail: 'Direct mode. No source device app is used.',
+    directSourceDetail: 'Direct mode does not use a source device app.',
+    directIpv6: 'IPv6 is blocked in direct mode.',
+    directLink: 'The tunnel uses this target device hotspot link.',
+    directUnverified: 'The engine reports direct mode. Live route behavior is not verified by this app.',
     paired: 'Paired',
     notPairedCard: 'Not paired',
     tunnelOn: 'Tunnel on',
@@ -100,6 +108,73 @@
     pairingIdle: 'Pair when you are ready.',
     waitingForCode: 'Waiting for the code.'
   };
+
+  /* The two tunnel modes. The page offers one choice before a start. Direct
+   * mode has no source device app, blocks IPv6 by default, and uses the engine
+   * default physical hotspot interface. Source device proxy mode keeps the
+   * existing pairing and forwarding behavior. */
+  var START_MODE_ROWS = [
+    {
+      id: 'phone',
+      label: 'Source device proxy',
+      detail: 'Uses the HotspotShade app on the source device. IPv6 is forwarded through the source device.'
+    },
+    {
+      id: 'direct',
+      label: 'Direct',
+      detail: 'No app on the source device. The engine uses this target device hotspot link. IPv6 is blocked by default.'
+    }
+  ];
+
+  function normalizeStartMode(value) {
+    return value === 'direct' ? 'direct' : 'phone';
+  }
+
+  function modeChoice(input) {
+    var value = object(input);
+    var runningMode = value.runningMode === 'phone' || value.runningMode === 'direct' ? value.runningMode : '';
+    var selected = runningMode || normalizeStartMode(value.selected);
+    var locked = value.locked === true || runningMode !== '';
+    return {
+      selected: selected,
+      running: runningMode !== '',
+      locked: locked,
+      rows: START_MODE_ROWS.map(function (row) {
+        return {
+          id: row.id,
+          label: row.label,
+          detail: row.detail,
+          pressed: row.id === selected,
+          disabled: locked
+        };
+      })
+    };
+  }
+
+  /* Fixed text for known start refusal codes. The code comes from the engine
+   * or from the local request validation. An unknown code keeps the plain
+   * message that the backend sent. */
+  function startFailureText(code, message) {
+    var fallback = sanitized(message) || 'The tunnel did not start.';
+    switch (text(code)) {
+      case 'admin_required':
+        return 'Direct mode needs the root engine. Start the packaged app, or run the development engine as root.';
+      case 'route_setup':
+        return 'The tunnel could not configure its routes. Cleanup may need attention. Check the current status before trying again.';
+      case 'tunnel_setup':
+        return 'The tunnel could not set up its virtual interface. Check the current status and any cleanup warning before trying again.';
+      case 'service_start':
+        return 'The engine could not start the tunnel. Check the hotspot link and try again.';
+      case 'start_cancelled':
+        return 'The start was cancelled. Check the current status and any cleanup warning before trying again.';
+      case 'unsupported_mode':
+        return 'This engine does not support the selected tunnel mode.';
+      case 'protected_helper_required':
+        return 'The protected engine helper is not available. Install the signed package, then try again.';
+      default:
+        return fallback;
+    }
+  }
 
   function object(value) {
     return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
@@ -226,6 +301,137 @@
     return message ? 'Last stop: ' + message : null;
   }
 
+  /* Destination privacy capabilities for this target build.
+   *
+   * These rows are fixed facts about the Linux target app and the engine build
+   * it ships with. The card reports what the build can do, not a live mode,
+   * because the page does not read the tunnel state. Off is the built-in
+   * behavior that applies only while a tunnel runs, so it is reported as the
+   * default and never as "in force" or "on". Every other mode is unavailable
+   * or deferred, and the page offers no switch. When the engine gains a mode,
+   * change a row only with a working engine path and a real control. Never
+   * mark a mode available on its own.
+   */
+  var PRIVACY_MODES = [
+    {
+      id: 'off',
+      title: 'Off',
+      state: 'default',
+      stateText: 'Default',
+      detail: 'This is the built-in behavior when a tunnel runs. It normalizes the TTL and sends each inner flow through a normal outer socket, and it changes no payload byte. It adds no concealment of its own. This card does not report whether a tunnel is running now.'
+    },
+    {
+      id: 'shape',
+      title: 'Shape the TLS handshake',
+      state: 'unavailable',
+      stateText: 'Unavailable',
+      detail: 'Proposed, not built in this engine. It would re-cut the first TLS records on the relay socket and change no handshake byte. It would not hide the server name, the destination address, the TLS fingerprint, or the flow size, and it cannot pad the handshake.'
+    },
+    {
+      id: 'hide',
+      title: 'Hide the destination name',
+      state: 'unavailable',
+      stateText: 'Unavailable',
+      detail: 'Unavailable under the current design. The engine relays bytes and does not terminate another application TLS connection, so it cannot add ECH or change the server name in that handshake. Adding ECH or DoH to the engine would not by itself hide relayed application TLS. This build offers no switch for it.'
+    },
+    {
+      id: 'cover',
+      title: 'Cover with an endpoint you own',
+      state: 'deferred',
+      stateText: 'Deferred',
+      detail: 'No endpoint is configured. It would need one TLS endpoint that you own. The project keeps no external relay or VPS, so this build does not offer it, and naming a site that belongs to another service stays out of scope.'
+    }
+  ];
+
+  var PRIVACY_FACTS = [
+    {
+      id: 'ech',
+      title: 'ECH in the engine',
+      value: 'Not in this build',
+      detail: 'This build has no TLS client that uses ECH, so it adds no encrypted server name. An application can use its own ECH; that is outside this app, and this card does not turn it on or verify it. A server name may still be visible when a flow does not use ECH.'
+    },
+    {
+      id: 'server_name',
+      title: 'Server name override',
+      value: 'Not in this build',
+      detail: 'The engine relays bytes and opens no TLS session for a destination. A relay cannot change the server name in a handshake it does not terminate.'
+    },
+    {
+      id: 'doh',
+      title: 'DNS over HTTPS',
+      value: 'Not in this build',
+      detail: 'Relayed DNS is forwarded through the tunnel without DoH. A resolver or application can use encrypted DNS on its own; that is outside this app, and this card does not turn it on or verify it. A DNS name may still be visible when the lookup is not encrypted.'
+    },
+    {
+      id: 'one_socket',
+      title: 'One socket per flow',
+      value: 'Yes',
+      detail: 'Each inner flow keeps its own outer socket. The relay adds no nested TLS session.'
+    }
+  ];
+
+  var PRIVACY_LIMITS = [
+    'Off adds no concealment. For a flow that the application does not conceal itself, a network may see the TLS server name, the destination address and network, DNS names, the TLS fingerprint, and the flow size and timing. Some networks do not inspect these values, and some applications or resolvers use their own encryption. This card does not rely on either.',
+    'An application or resolver can use its own ECH or encrypted DNS. That work happens outside this app, and this card neither provides it nor verifies it. Metadata such as the destination address, the flow size, and the timing can stay visible even then.',
+    'When both endpoints negotiate TLS 1.3, the destination certificate is encrypted. The relay does not control the negotiated version, so this is not a property of this app.',
+    'Tethering detection also uses the TCP and operating-system fingerprint and volume patterns. No mode on this page changes those.',
+    'The relay is not a TLS tunnel. Each inner flow keeps its own outer socket, so there is no nested TLS handshake to detect. That is a property of the existing relay, not a privacy mode.',
+    'Hide, if it is ever built, would cover only flows carried by a product-owned TLS client, and only destinations that publish an ECH config. Most destinations do not. Adding ECH and DoH to the engine would not by itself hide relayed application TLS.'
+  ];
+
+  var PRIVACY_STORAGE_NOTE = 'This card has no switch and saves no setting. The app stores no destination-privacy mode, and nothing here changes the engine or a running tunnel.';
+
+  function copyRow(row) {
+    return {
+      id: row.id,
+      title: row.title,
+      state: row.state,
+      stateText: row.stateText,
+      detail: row.detail
+    };
+  }
+
+  function copyFact(fact) {
+    return {
+      id: fact.id,
+      title: fact.title,
+      value: fact.value,
+      detail: fact.detail
+    };
+  }
+
+  function privacyView(input) {
+    input = object(input);
+    var demo = input.demo === true;
+    var engine = input.engine === true;
+    var intro;
+    if (demo) {
+      intro = 'Demo mode. This card describes the app build. The simulated backend runs no tunnel. The card does not report a live mode.';
+    } else if (engine) {
+      intro = 'This build has no destination-privacy mode. This card reports what the build can do. It does not report whether a tunnel is running. When a tunnel runs it normalizes the TTL and forwards each flow as it is, and it adds no concealment of its own.';
+    } else {
+      intro = 'This build has no destination-privacy mode. This card reports what the build can do. It does not report whether a tunnel is running. When a tunnel runs it normalizes the TTL and forwards each flow as it is, and it adds no concealment of its own.';
+    }
+    return {
+      mode: 'off',
+      modeText: 'Off',
+      modeState: 'default',
+      modeStateText: 'Default',
+      modePillText: 'Off (default)',
+      modeTitle: 'Off is the default behavior of this build. This card does not report whether a tunnel is running.',
+      appliesLiveMode: false,
+      subtitle: 'What this build can and cannot hide. This card is read-only and does not report a live mode.',
+      intro: intro,
+      demo: demo,
+      engine: engine,
+      modes: PRIVACY_MODES.map(copyRow),
+      facts: PRIVACY_FACTS.map(copyFact),
+      limits: PRIVACY_LIMITS.slice(),
+      storageNote: PRIVACY_STORAGE_NOTE,
+      switchAvailable: false
+    };
+  }
+
   function statusFreshness(failureSince, nowMilliseconds, hasStatus) {
     if (!hasStatus) return 'fresh';
     var since = finite(failureSince);
@@ -249,15 +455,25 @@
     var pairingActive = pairingState === 'connecting' || pairingState === 'confirm' || pairingState === 'starting';
     var operation = busy === 'start' || busy === 'stop' ? busy : null;
     var running = hasStatus && status.running === true;
+    var pairingKnown = hasStatus && typeof status.paired === 'boolean';
     var paired = hasStatus && status.paired === true;
+    var selectedMode = normalizeStartMode(input.startMode);
+    var runningMode = running
+      ? (status.mode === 'tun' ? 'direct' : status.mode === 'phone' ? 'phone' : '')
+      : '';
+    var directRunning = runningMode === 'direct';
+    var directIdle = !running && selectedMode === 'direct';
     var phone = object(status.phone);
-    var phoneState = text(phone.state) || 'unknown';
+    var phoneState = text(phone.state) || (pairingKnown && !paired ? 'unpaired' : 'unknown');
     var phoneMessage = sanitized(phone.message);
     var tokenRejected = sanitized(input.tokenRejected);
     var linkAdvice = Array.isArray(input.linkAdvice) ? input.linkAdvice.map(function (line) { return sanitized(line); }).filter(Boolean) : [];
     var demo = hasStatus && status.demo === true;
     var checked = hasStatus ? checkedText(phone.checked_at, input.nowSeconds) : null;
-    var unavailable = freshness === 'unavailable';
+    var unknown = hasStatus && (status.state === 'unknown' || typeof status.running !== 'boolean');
+    var cleanupBlocked = hasStatus && status.cleanup_blocked === true;
+    var recoveryBlocked = unknown || cleanupBlocked;
+    var unavailable = freshness === 'unavailable' || recoveryBlocked;
     var forgetBlocked = input.forgetBlocked === true;
     var attention = [];
     var title;
@@ -288,6 +504,13 @@
       title = T.stopping;
       subtitle = T.takesAMinute;
       kind = 'busy';
+    } else if (recoveryBlocked) {
+      title = T.statusUnavailable;
+      subtitle = sanitized(status.error) || (cleanupBlocked
+        ? 'Tunnel cleanup did not finish. Inspect routes and devices before restarting.'
+        : T.unknownDetail);
+      kind = 'attention';
+      primary = action('checkNow');
     } else if (tokenRejected) {
       title = 'Pair again';
       subtitle = tokenRejected;
@@ -302,10 +525,10 @@
       title = T.needsAttention;
       subtitle = error;
       kind = 'attention';
-      primary = action('retry');
+      primary = action(running ? 'turnOff' : 'retry');
     } else if (running) {
       title = T.on;
-      subtitle = phoneMessage || T.onDetail;
+      subtitle = directRunning ? T.directOnDetail : (phoneMessage || T.onDetail);
       kind = 'on';
       primary = action('turnOff');
     } else if (pairingActive) {
@@ -320,6 +543,16 @@
       title = T.checking;
       subtitle = T.checkingDetail;
       kind = 'busy';
+    } else if (directIdle) {
+      title = T.directReady;
+      subtitle = T.directDetail;
+      kind = 'off';
+      primary = action('turnOn');
+    } else if (!pairingKnown) {
+      title = T.statusUnavailable;
+      subtitle = T.unknownDetail;
+      kind = 'attention';
+      primary = action('checkNow');
     } else {
       var calm = unpairedState();
       switch (phoneState) {
@@ -372,6 +605,7 @@
           title = T.statusUnavailable;
           subtitle = phoneMessage || T.unknownDetail;
           kind = 'attention';
+          primary = action('checkNow');
           break;
         case 'unpaired':
         default:
@@ -380,7 +614,11 @@
       }
     }
 
-    if (forgetBlocked) {
+    if (recoveryBlocked) {
+      secondary = running && freshness === 'fresh'
+        ? { id: 'turnOff', label: 'Try to turn off' }
+        : null;
+    } else if (forgetBlocked) {
       secondary = action('turnOffAndForget');
     } else if (freshness === 'stale') {
       secondary = action('checkNow');
@@ -388,14 +626,15 @@
       secondary = action('forget');
     }
 
-    if (running && phoneState === 'not_responding') attention.push(T.sourceStopped);
-    if (running && phoneState === 'not_trusted') attention.push(T.notTrustedRunning);
-    attention.push.apply(attention, linkAdvice);
+    if (!recoveryBlocked && running && !directRunning && phoneState === 'not_responding') attention.push(T.sourceStopped);
+    if (!recoveryBlocked && running && !directRunning && phoneState === 'not_trusted') attention.push(T.notTrustedRunning);
+    if (recoveryBlocked && input.retryAction === 'stop' && error) attention.push(error);
+    if (!recoveryBlocked) attention.push.apply(attention, linkAdvice);
     if (freshness !== 'fresh') attention.push(T.staleStatus);
     if (input.notificationsUnavailable === true) attention.push(T.notificationsUnavailable);
     else if (input.notificationsDenied === true) attention.push(T.notificationsDenied);
-    if (forgetBlocked) attention.unshift(T.forgetBlocked);
-    if (phone.port_changed === true) attention.push(T.portChanged);
+    if (forgetBlocked && !recoveryBlocked) attention.unshift(T.forgetBlocked);
+    if (!recoveryBlocked && phone.port_changed === true) attention.push(T.portChanged);
     attention = unique(attention);
 
     if (kind !== 'attention' && title === T.notTrusted) kind = 'attention';
@@ -442,14 +681,27 @@
         hasStatus: hasStatus,
         running: running,
         paired: paired,
-        phoneState: phoneState
+        pairingKnown: pairingKnown,
+        phoneState: phoneState,
+        selectedMode: selectedMode,
+        runningMode: runningMode,
+        activeMode: runningMode || selectedMode,
+        direct: directRunning || directIdle,
+        modeLocked: recoveryBlocked || running || !!operation || pairingActive
       };
     }
 
     function sourceCard() {
       var value;
       var details = [];
-      if (phoneState === 'not_trusted' && paired) {
+      if (directRunning || directIdle) {
+        value = T.directNotUsed;
+        details.push(T.directSourceDetail);
+        if (directRunning) details.push(T.directLink);
+      } else if (!pairingKnown) {
+        value = T.statusUnavailableLine;
+        details.push(T.checkStatusAgain);
+      } else if (phoneState === 'not_trusted' && paired) {
         value = T.notTrusted;
         details.push(T.pairToRestoreTrust);
       } else if (paired) {
@@ -477,9 +729,16 @@
       else value = T.tunnelOff;
 
       var details = [];
+      var stop = lastStopLine(status);
+      if (directRunning || directIdle) {
+        details.push(T.directDetail);
+        details.push(T.directIpv6);
+        if (directRunning) details.push(T.directUnverified);
+        if (stop) details.push(stop);
+        return { value: value, details: unique(details) };
+      }
       var ping = pingLine(status);
       var connections = connectionsLine(status);
-      var stop = lastStopLine(status);
       if (ping) details.push(ping);
       if (connections) details.push(connections);
       if (stop) details.push(stop);
@@ -798,10 +1057,21 @@
     return ['dashboard', 'activity', 'settings', 'settings-inline', 'advanced', 'refresh', 'check-now', 'theme', 'demo-limitations', 'demo-scenarios'].indexOf(value) !== -1;
   }
 
+  function tunnelStateConfirmed(status, running) {
+    var value = object(status);
+    return typeof running === 'boolean' && value.running === running &&
+      value.state !== 'unknown' && value.cleanup_blocked !== true;
+  }
+
   return {
     ACTION_LABELS: ACTION_LABELS,
+    START_MODE_ROWS: START_MODE_ROWS,
     TEXT: T,
     deriveDashboard: deriveDashboard,
+    tunnelStateConfirmed: tunnelStateConfirmed,
+    modeChoice: modeChoice,
+    normalizeStartMode: normalizeStartMode,
+    startFailureText: startFailureText,
     pairingView: pairingView,
     groupPairingCode: groupPairingCode,
     checkedText: checkedText,
@@ -809,6 +1079,7 @@
     pingLine: pingLine,
     connectionsLine: connectionsLine,
     lastStopLine: lastStopLine,
+    privacyView: privacyView,
     statusFreshness: statusFreshness,
     formatInt: formatInt,
     formatClock: formatClock,

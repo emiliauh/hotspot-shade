@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>allow-root</key>
+	<false/>
+	<key>authenticate-user</key>
+	<true/>
+	<key>class</key>
+	<string>user</string>
+	<key>comment</key>
+	<string>Sanitized read-back fixture for the HotspotShade start right.</string>
+	<key>created</key>
+	<real>700000000.38970995</real>
+	<key>group</key>
+	<string>admin</string>
+	<key>modified</key>
+	<real>700000001.38970995</real>
+	<key>session-owner</key>
+	<false/>
+	<key>shared</key>
+	<false/>
+	<key>timeout</key>
+	<integer>10</integer>
+	<key>tries</key>
+	<integer>10000</integer>
+	<key>version</key>
+	<integer>0</integer>
+</dict>
+</plist>

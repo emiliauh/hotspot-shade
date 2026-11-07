@@ -12,4 +12,8 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\HotspotShade.WinUI2.Core\HotspotShade.WinUI2.Core.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- The pure launcher rules. The launcher itself is Windows only. -->
+    <Compile Include="..\..\src\HotspotShade.WinUI2.TestLauncher\LauncherRules.cs" Link="TestLauncher\LauncherRules.cs" />
+  </ItemGroup>
 </Project>

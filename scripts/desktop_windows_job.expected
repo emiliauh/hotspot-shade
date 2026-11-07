@@ -1,0 +1,11 @@
+    name: Shared desktop demo checks (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: github.ref_type != 'tag'
+        with:
+          workspaces: desktop
+      - name: Test desktop demo
+        run: cargo test --locked --manifest-path desktop/Cargo.toml

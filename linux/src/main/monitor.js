@@ -9,10 +9,14 @@
  * The monitor never starts or stops the tunnel by itself.
  */
 
-const { createNotificationPolicy, sanitize } = require('./notifications');
+const { createNotificationPolicy, createRateLimiter, sanitize } = require('./notifications');
 
 const DEFAULT_INTERVAL_MS = 2000;
 const ENGINE_GONE_AFTER = 3;
+
+function notificationsAllowedForConfig(config) {
+  return !!config && config.mode === 'engine' && config.demo !== true;
+}
 
 function createStatusMonitor(options) {
   const settings = options && typeof options === 'object' ? options : {};
@@ -29,37 +33,46 @@ function createStatusMonitor(options) {
     ? settings.intervalMs
     : DEFAULT_INTERVAL_MS;
   const onError = typeof settings.onError === 'function' ? settings.onError : null;
+  const engineGoneLimiter = createRateLimiter({ now: settings.now });
 
   if (!backend || typeof backend.status !== 'function') throw new TypeError('A backend is required.');
   if (!settingsStore || typeof settingsStore.snapshot !== 'function') throw new TypeError('A settings store is required.');
 
   let timer = null;
-  let inFlight = false;
+  let activePoll = null;
+  let queuedRefresh = null;
+  let refreshGeneration = 0;
   let stopped = false;
   let failures = 0;
   let engineGoneNotified = false;
   let state = { status: null, pair: null };
 
+  function reportError(error) {
+    if (!onError) return;
+    try { onError(error); } catch (_) { /* Reporting must not reject a poll. */ }
+  }
+
   function publish() {
     if (!onState) return;
     try {
-      onState({ status: state.status, pair: state.pair });
+      onState(Object.assign({}, state));
     } catch (error) {
-      if (onError) onError(error);
+      reportError(error);
     }
   }
 
   function notifyEngineGone() {
     if (!allowNotifications) return;
     const current = settingsStore.snapshot();
-    if (current.notifications !== true || (sink && sink.supported !== true)) return;
+    if (current.notifications !== true || !sink || sink.supported !== true ||
+        typeof sink.post !== 'function') return;
     if (engineGoneNotified) return;
     engineGoneNotified = true;
-    if (sink && typeof sink.post === 'function') {
+    if (engineGoneLimiter.take('engine-gone')) {
       sink.post({
         kind: 'engine-gone',
         title: 'HotspotShade',
-        body: 'The engine stopped. Open HotspotShade to start it again.'
+        body: 'The engine did not answer. Open HotspotShade to check its status.'
       });
     }
   }
@@ -84,31 +97,35 @@ function createStatusMonitor(options) {
     }
   }
 
-  async function poll() {
-    if (stopped || inFlight) return;
-    inFlight = true;
+  async function runPoll(generation) {
+    if (stopped) return;
     try {
       let nextStatus = null;
       let nextPair = null;
       try {
         nextStatus = await backend.status();
       } catch (error) {
+        /* A stop can happen while the status request is pending. A late
+         * rejection must not publish an empty state or send an engine-gone
+         * message after the monitor has stopped. */
+        if (stopped || generation !== refreshGeneration) return;
         failures += 1;
         if (failures >= ENGINE_GONE_AFTER) {
-          state = { status: null, pair: null };
+          state = { status: null, pair: null, unavailable: true };
           publish();
           notifyEngineGone();
         }
         return;
       }
-      failures = 0;
-      engineGoneNotified = false;
+      if (stopped || generation !== refreshGeneration) return;
       try {
         nextPair = await backend.pairState();
       } catch (error) {
         nextPair = state.pair;
       }
-      if (stopped) return;
+      if (stopped || generation !== refreshGeneration) return;
+      failures = 0;
+      engineGoneNotified = false;
       state = {
         status: nextStatus && typeof nextStatus === 'object' ? nextStatus : {},
         pair: nextPair && typeof nextPair === 'object' ? nextPair : {}
@@ -116,10 +133,19 @@ function createStatusMonitor(options) {
       evaluateNotifications(state.status, state.pair);
       publish();
     } catch (error) {
-      if (onError) onError(error);
-    } finally {
-      inFlight = false;
+      reportError(error);
     }
+  }
+
+  function poll() {
+    if (stopped) return Promise.resolve();
+    if (activePoll) return activePoll;
+    const current = runPoll(refreshGeneration);
+    activePoll = current;
+    current.then(function () {
+      if (activePoll === current) activePoll = null;
+    });
+    return current;
   }
 
   function start() {
@@ -140,7 +166,22 @@ function createStatusMonitor(options) {
   }
 
   function refreshNow() {
-    return poll();
+    if (stopped) return Promise.resolve();
+    if (!activePoll) return poll();
+    // Do not publish a poll started before this refresh request. A request
+    // made during the queued poll needs its own subsequent poll as well.
+    refreshGeneration += 1;
+    if (!queuedRefresh || queuedRefresh.after !== activePoll) {
+      const after = activePoll;
+      const queued = { after: after, promise: null };
+      queued.promise = after.then(function () {
+        return poll();
+      }).finally(function () {
+        if (queuedRefresh === queued) queuedRefresh = null;
+      });
+      queuedRefresh = queued;
+    }
+    return queuedRefresh.promise;
   }
 
   return Object.freeze({
@@ -154,6 +195,7 @@ function createStatusMonitor(options) {
 module.exports = {
   DEFAULT_INTERVAL_MS: DEFAULT_INTERVAL_MS,
   ENGINE_GONE_AFTER: ENGINE_GONE_AFTER,
+  notificationsAllowedForConfig: notificationsAllowedForConfig,
   createStatusMonitor: createStatusMonitor,
   sanitize: sanitize
 };

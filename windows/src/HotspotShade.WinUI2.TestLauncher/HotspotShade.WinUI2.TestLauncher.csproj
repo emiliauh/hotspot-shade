@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- A console test launcher for the first real Windows test. It is not the
+       finished app, not packaged, and not in the solution. It reuses the
+       reviewed broker engine host and endpoint sources. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.17763.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <RootNamespace>HotspotShade.WinUI2.TestLauncher</RootNamespace>
+    <AssemblyName>HotspotShade.WinUI2.TestLauncher</AssemblyName>
+    <LangVersion>7.3</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Deterministic>true</Deterministic>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <Prefer32Bit>false</Prefer32Bit>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\HotspotShade.WinUI2.Broker\Win32EngineHost.cs" Link="Broker\Win32EngineHost.cs" />
+    <Compile Include="..\HotspotShade.WinUI2.Broker\EngineHttpEndpoint.cs" Link="Broker\EngineHttpEndpoint.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\HotspotShade.WinUI2.Core\HotspotShade.WinUI2.Core.csproj" />
+  </ItemGroup>
+</Project>

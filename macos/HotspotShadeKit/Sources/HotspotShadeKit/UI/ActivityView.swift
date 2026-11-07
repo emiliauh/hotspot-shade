@@ -5,13 +5,15 @@ import SwiftUI
 public struct ActivityView: View {
     public var lines: [LogLine]
     public var unavailable: Bool
+    public var error: String?
     public var isLoading: Bool
     private let onRefresh: () -> Void
     @State private var showDetails = false
 
-    public init(lines: [LogLine], unavailable: Bool = false, isLoading: Bool = false, onRefresh: @escaping () -> Void = {}) {
+    public init(lines: [LogLine], unavailable: Bool = false, error: String? = nil, isLoading: Bool = false, onRefresh: @escaping () -> Void = {}) {
         self.lines = lines
         self.unavailable = unavailable
+        self.error = error
         self.isLoading = isLoading
         self.onRefresh = onRefresh
     }
@@ -56,6 +58,10 @@ public struct ActivityView: View {
     @ViewBuilder private var content: some View {
         if unavailable {
             stateView(symbol: "clock.badge.exclamationmark", title: UIStrings.activityUnavailable, detail: UIStrings.statusUnavailableLine, showRefresh: true)
+        } else if let error {
+            // A failed read is a real error. It must not look like the calm
+            // empty state, and Retry stays on the screen.
+            stateView(symbol: "exclamationmark.triangle", title: UIStrings.activityError, detail: Strings.sanitized(error) ?? error, showRefresh: true)
         } else if messages.isEmpty {
             if isLoading {
                 VStack(spacing: HSMetrics.space8) {

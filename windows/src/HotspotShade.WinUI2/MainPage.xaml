@@ -25,6 +25,18 @@
         </Grid.RowDefinitions>
 
         <muxc:MenuBar x:Name="AppMenu" Grid.Row="0" AutomationProperties.Name="Application menu">
+            <muxc:MenuBarItem Title="HotspotShade">
+                <MenuFlyoutItem x:Name="TurnOnMenu" Text="Turn on" Click="TurnOnMenu_Click" />
+                <MenuFlyoutItem x:Name="TurnOffMenu" Text="Turn off" Click="TurnOffMenu_Click" />
+                <MenuFlyoutSeparator />
+                <MenuFlyoutItem x:Name="PairMenu" Text="Pair with source device" Click="PairMenu_Click" />
+                <MenuFlyoutItem x:Name="CancelPairingMenu" Text="Cancel pairing" Click="CancelPairingMenu_Click" />
+                <MenuFlyoutSeparator />
+                <MenuFlyoutItem Text="Settings" Click="SettingsMenu_Click" KeyboardAcceleratorTextOverride="Ctrl+3" />
+                <MenuFlyoutSeparator />
+                <MenuFlyoutItem Text="Quit HotspotShade" Click="QuitMenu_Click" />
+            </muxc:MenuBarItem>
+
             <muxc:MenuBarItem Title="View">
                 <MenuFlyoutItem Text="Dashboard" Click="DashboardMenu_Click" KeyboardAcceleratorTextOverride="Ctrl+1" />
                 <MenuFlyoutItem Text="Activity" Click="ActivityMenu_Click" KeyboardAcceleratorTextOverride="Ctrl+2" />
@@ -33,34 +45,13 @@
                 <MenuFlyoutItem x:Name="RefreshStatusMenu" Text="Refresh status" Click="RefreshStatusMenu_Click" KeyboardAcceleratorTextOverride="F5" />
                 <MenuFlyoutItem x:Name="CheckSourceNowMenu" Text="Check source device now" Click="CheckSourceNowMenu_Click" KeyboardAcceleratorTextOverride="Ctrl+K" />
                 <MenuFlyoutSeparator />
-                <MenuFlyoutItem x:Name="ThemeSystemMenu" Text="Use system setting" Click="ThemeSystemMenu_Click" />
+                <MenuFlyoutItem x:Name="ThemeSystemMenu" Text="Use the Windows setting" Click="ThemeSystemMenu_Click" />
                 <MenuFlyoutItem x:Name="ThemeLightMenu" Text="Light appearance" Click="ThemeLightMenu_Click" />
                 <MenuFlyoutItem x:Name="ThemeDarkMenu" Text="Dark appearance" Click="ThemeDarkMenu_Click" />
             </muxc:MenuBarItem>
 
-            <muxc:MenuBarItem Title="Demo">
-                <MenuFlyoutSubItem Text="Scenarios">
-                    <MenuFlyoutItem Text="Unpaired" Tag="Unpaired" Click="ScenarioMenu_Click" />
-                    <MenuFlyoutItem Text="Pairing code" Tag="PairingCode" Click="ScenarioMenu_Click" />
-                    <MenuFlyoutItem Text="Pairing failed" Tag="PairingFailed" Click="ScenarioMenu_Click" />
-                    <MenuFlyoutItem Text="Not trusted" Tag="NotTrusted" Click="ScenarioMenu_Click" />
-                    <MenuFlyoutItem Text="Waiting for source device" Tag="Waiting" Click="ScenarioMenu_Click" />
-                    <MenuFlyoutItem Text="Ready" Tag="Ready" Click="ScenarioMenu_Click" />
-                    <MenuFlyoutItem Text="On" Tag="On" Click="ScenarioMenu_Click" />
-                    <MenuFlyoutItem Text="On, source device stopped" Tag="OnSourceStopped" Click="ScenarioMenu_Click" />
-                    <MenuFlyoutItem Text="On, not trusted" Tag="OnNotTrusted" Click="ScenarioMenu_Click" />
-                    <MenuFlyoutItem Text="On, stale status" Tag="Stale" Click="ScenarioMenu_Click" />
-                    <MenuFlyoutItem Text="Status unavailable" Tag="Unavailable" Click="ScenarioMenu_Click" />
-                    <MenuFlyoutItem Text="Error" Tag="Error" Click="ScenarioMenu_Click" />
-                    <MenuFlyoutItem Text="Activity empty" Tag="ActivityEmpty" Click="ScenarioMenu_Click" />
-                    <MenuFlyoutItem Text="After forget" Tag="ForgetConfirmed" Click="ScenarioMenu_Click" />
-                </MenuFlyoutSubItem>
-                <MenuFlyoutSeparator />
-                <MenuFlyoutItem Text="Reset demo" Click="ResetDemoMenu_Click" />
-            </muxc:MenuBarItem>
-
             <muxc:MenuBarItem Title="Help">
-                <MenuFlyoutItem Text="Demo limitations" Click="DemoLimitations_Click" />
+                <MenuFlyoutItem Text="Not available on Windows yet" Click="Unavailable_Click" />
                 <MenuFlyoutItem Text="About HotspotShade" Click="About_Click" />
             </muxc:MenuBarItem>
         </muxc:MenuBar>
@@ -93,662 +84,646 @@
             </muxc:NavigationView.MenuItems>
 
             <Grid>
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="*" />
-                </Grid.RowDefinitions>
+                <ScrollViewer
+                    x:Name="DashboardScroll"
+                    MaxWidth="768"
+                    HorizontalAlignment="Stretch"
+                    HorizontalContentAlignment="Stretch"
+                    HorizontalScrollBarVisibility="Disabled"
+                    IsTabStop="True"
+                    Padding="24"
+                    TabFocusNavigation="Local"
+                    VerticalScrollBarVisibility="Auto"
+                    AutomationProperties.Name="Dashboard">
+                    <StackPanel Spacing="16" HorizontalAlignment="Stretch">
+                        <StackPanel
+                            Spacing="16"
+                            Visibility="{x:Bind ViewModel.State.ShowDashboardCards, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
 
-                <Grid Grid.Row="0" MaxWidth="720" Margin="24,16,24,0" HorizontalAlignment="Stretch">
-                    <muxc:InfoBar
-                        IsClosable="False"
-                        IsOpen="True"
-                        Severity="Informational"
-                        Title="Demo mode. All data is simulated."
-                        Message="No tunnel, routes, network listener, or credentials. This prototype is not production ready."
-                        AutomationProperties.Name="Demo mode. All data is simulated. No tunnel, routes, network listener, or credentials. This prototype is not production ready." />
-                </Grid>
-
-                <Grid Grid.Row="1">
-                    <ScrollViewer
-                        x:Name="DashboardScroll"
-                        MaxWidth="768"
-                        HorizontalAlignment="Stretch"
-                        HorizontalContentAlignment="Stretch"
-                        HorizontalScrollBarVisibility="Disabled"
-                        IsTabStop="True"
-                        Padding="24"
-                        TabFocusNavigation="Local"
-                        VerticalScrollBarVisibility="Auto"
-                        AutomationProperties.Name="Dashboard">
-                        <StackPanel Spacing="16" HorizontalAlignment="Stretch">
-                            <StackPanel
-                                Spacing="16"
-                                Visibility="{x:Bind ViewModel.Dashboard.IsPairing, Mode=OneWay, Converter={StaticResource BoolToVisibility}, ConverterParameter=Invert}">
-
-                                <Border Style="{StaticResource CardStyle}" Padding="24">
-                                    <StackPanel Spacing="12">
-                                        <Grid ColumnSpacing="8">
-                                            <Grid.ColumnDefinitions>
-                                                <ColumnDefinition Width="Auto" />
-                                                <ColumnDefinition Width="*" />
-                                                <ColumnDefinition Width="Auto" />
-                                            </Grid.ColumnDefinitions>
-                                            <Grid Grid.Column="0" Width="12" Height="12" Margin="0,8,0,0" VerticalAlignment="Top" AutomationProperties.AccessibilityView="Raw">
-                                                <Ellipse Style="{StaticResource StatusDotStyle}" Fill="{ThemeResource StatusOffBrush}" Visibility="{x:Bind ViewModel.Dashboard.StatusDot, Mode=OneWay, Converter={StaticResource EnumNameToVisibility}, ConverterParameter=Off}" />
-                                                <Ellipse Style="{StaticResource StatusDotStyle}" Fill="{ThemeResource StatusOnBrush}" Visibility="{x:Bind ViewModel.Dashboard.StatusDot, Mode=OneWay, Converter={StaticResource EnumNameToVisibility}, ConverterParameter=On}" />
-                                                <Ellipse Style="{StaticResource StatusDotStyle}" Fill="{ThemeResource StatusAttentionBrush}" Visibility="{x:Bind ViewModel.Dashboard.StatusDot, Mode=OneWay, Converter={StaticResource EnumNameToVisibility}, ConverterParameter=Attention}" />
-                                                <Ellipse Style="{StaticResource StatusDotStyle}" Fill="{ThemeResource StatusPairingBrush}" Visibility="{x:Bind ViewModel.Dashboard.StatusDot, Mode=OneWay, Converter={StaticResource EnumNameToVisibility}, ConverterParameter=Pairing}" />
-                                            </Grid>
-                                            <TextBlock
-                                                Grid.Column="1"
-                                                Text="{x:Bind ViewModel.Dashboard.Title, Mode=OneWay}"
-                                                Style="{StaticResource PageTitleTextBlockStyle}"
-                                                AutomationProperties.HeadingLevel="Level1"
-                                                AutomationProperties.LiveSetting="Polite" />
-                                            <Button
-                                                Grid.Column="2"
-                                                Content="Check now"
-                                                Click="CheckNowFromDashboard_Click"
-                                                IsEnabled="{x:Bind ViewModel.Dashboard.CanCheckNow, Mode=OneWay}"
-                                                VerticalAlignment="Top"
-                                                AutomationProperties.Name="Check now" />
+                            <Border Style="{StaticResource CardStyle}" Padding="24">
+                                <StackPanel Spacing="12">
+                                    <Grid ColumnSpacing="8">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <Grid Grid.Column="0" Width="12" Height="12" Margin="0,8,0,0" VerticalAlignment="Top" AutomationProperties.AccessibilityView="Raw">
+                                            <Ellipse Style="{StaticResource StatusDotStyle}" Fill="{ThemeResource StatusOffBrush}" Visibility="{x:Bind ViewModel.State.StatusDot, Mode=OneWay, Converter={StaticResource EnumNameToVisibility}, ConverterParameter=Off}" />
+                                            <Ellipse Style="{StaticResource StatusDotStyle}" Fill="{ThemeResource StatusOnBrush}" Visibility="{x:Bind ViewModel.State.StatusDot, Mode=OneWay, Converter={StaticResource EnumNameToVisibility}, ConverterParameter=On}" />
+                                            <Ellipse Style="{StaticResource StatusDotStyle}" Fill="{ThemeResource StatusAttentionBrush}" Visibility="{x:Bind ViewModel.State.StatusDot, Mode=OneWay, Converter={StaticResource EnumNameToVisibility}, ConverterParameter=Attention}" />
+                                            <Ellipse Style="{StaticResource StatusDotStyle}" Fill="{ThemeResource StatusPairingBrush}" Visibility="{x:Bind ViewModel.State.StatusDot, Mode=OneWay, Converter={StaticResource EnumNameToVisibility}, ConverterParameter=Pairing}" />
+                                            <Ellipse Style="{StaticResource StatusDotStyle}" Fill="{ThemeResource StatusPairingBrush}" Visibility="{x:Bind ViewModel.State.StatusDot, Mode=OneWay, Converter={StaticResource EnumNameToVisibility}, ConverterParameter=Busy}" />
                                         </Grid>
-
                                         <TextBlock
-                                            Text="{x:Bind ViewModel.Dashboard.Subtitle, Mode=OneWay}"
-                                            Style="{StaticResource SubtitleTextBlockStyle}"
-                                            Foreground="{ThemeResource SecondaryTextBrush}"
-                                            TextWrapping="Wrap" />
+                                            Grid.Column="1"
+                                            Text="{x:Bind ViewModel.State.Title, Mode=OneWay}"
+                                            Style="{StaticResource PageTitleTextBlockStyle}"
+                                            AutomationProperties.Name="{x:Bind ViewModel.State.AccessibilityStatus, Mode=OneWay}"
+                                            AutomationProperties.HeadingLevel="Level1"
+                                            AutomationProperties.LiveSetting="Polite" />
+                                        <Button
+                                            Grid.Column="2"
+                                            Content="Check now"
+                                            Click="CheckNowFromDashboard_Click"
+                                            IsEnabled="{x:Bind ViewModel.State.CanCheckNow, Mode=OneWay}"
+                                            VerticalAlignment="Top"
+                                            ToolTipService.ToolTip="Ask the source device now and refresh the status. Ctrl+K."
+                                            AutomationProperties.Name="Check now" />
+                                    </Grid>
 
-                                        <TextBlock
-                                            Text="{x:Bind ViewModel.Dashboard.CheckedText, Mode=OneWay}"
-                                            Style="{StaticResource CaptionSecondaryTextBlockStyle}"
-                                            Visibility="{x:Bind ViewModel.Dashboard.CheckedText, Mode=OneWay, Converter={StaticResource StringToVisibility}}" />
+                                    <TextBlock
+                                        Text="{x:Bind ViewModel.State.Subtitle, Mode=OneWay}"
+                                        Style="{StaticResource SubtitleTextBlockStyle}"
+                                        Foreground="{ThemeResource SecondaryTextBrush}"
+                                        TextWrapping="Wrap" />
 
-                                        <TextBlock
-                                            Text="Simulated data. This prototype has no engine."
-                                            Style="{StaticResource CaptionSecondaryTextBlockStyle}" />
+                                    <TextBlock
+                                        Text="{x:Bind ViewModel.State.CheckedText, Mode=OneWay}"
+                                        Style="{StaticResource CaptionSecondaryTextBlockStyle}"
+                                        Visibility="{x:Bind ViewModel.State.CheckedText, Mode=OneWay, Converter={StaticResource StringToVisibility}}" />
 
-                                        <StackPanel
-                                            Orientation="Horizontal"
-                                            Spacing="8"
-                                            Visibility="{x:Bind ViewModel.Dashboard.IsBusy, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
-                                            <muxc:ProgressRing Width="16" Height="16" IsActive="True" AutomationProperties.AccessibilityView="Raw" />
-                                            <TextBlock Text="The simulated state is updating." Style="{StaticResource CaptionSecondaryTextBlockStyle}" />
-                                        </StackPanel>
+                                    <muxc:ProgressBar
+                                        IsIndeterminate="True"
+                                        Visibility="{x:Bind ViewModel.State.IsBusy, Mode=OneWay, Converter={StaticResource BoolToVisibility}}"
+                                        AutomationProperties.Name="Working" />
 
-                                        <StackPanel Orientation="Horizontal" Spacing="12" Margin="0,4,0,0">
-                                            <Button
-                                                Content="{x:Bind ViewModel.Dashboard.PrimaryActionLabel, Mode=OneWay}"
-                                                Style="{StaticResource AccentButtonStyle}"
-                                                Click="PrimaryAction_Click"
-                                                IsEnabled="{x:Bind ViewModel.Dashboard.CanAct, Mode=OneWay}"
-                                                Visibility="{x:Bind ViewModel.Dashboard.HasPrimaryAction, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
-                                            <Button
-                                                Content="{x:Bind ViewModel.Dashboard.SecondaryActionLabel, Mode=OneWay}"
-                                                Click="SecondaryAction_Click"
-                                                IsEnabled="{x:Bind ViewModel.Dashboard.CanAct, Mode=OneWay}"
-                                                Visibility="{x:Bind ViewModel.Dashboard.HasNonDestructiveSecondaryAction, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
-                                            <Button
-                                                Content="{x:Bind ViewModel.Dashboard.SecondaryActionLabel, Mode=OneWay}"
-                                                Foreground="{ThemeResource DangerTextBrush}"
-                                                Click="SecondaryAction_Click"
-                                                IsEnabled="{x:Bind ViewModel.Dashboard.CanAct, Mode=OneWay}"
-                                                Visibility="{x:Bind ViewModel.Dashboard.SecondaryActionIsDestructive, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
-                                        </StackPanel>
-
-                                        <TextBlock
-                                            Text="Pair when you are ready."
-                                            Style="{StaticResource CaptionSecondaryTextBlockStyle}"
-                                            Visibility="{x:Bind ViewModel.Dashboard.ShowPairHint, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
+                                    <StackPanel Orientation="Horizontal" Spacing="12" Margin="0,4,0,0">
+                                        <Button
+                                            x:Name="PrimaryButton"
+                                            Content="{x:Bind ViewModel.State.PrimaryLabel, Mode=OneWay}"
+                                            Style="{StaticResource AccentButtonStyle}"
+                                            Click="PrimaryAction_Click"
+                                            Visibility="{x:Bind ViewModel.State.HasPrimary, Mode=OneWay, Converter={StaticResource BoolToVisibility}}"
+                                            AutomationProperties.Name="{x:Bind ViewModel.State.PrimaryLabel, Mode=OneWay}" />
+                                        <Button
+                                            Content="{x:Bind ViewModel.State.SecondaryLabel, Mode=OneWay}"
+                                            Click="SecondaryAction_Click"
+                                            Visibility="{x:Bind ViewModel.State.HasPlainSecondary, Mode=OneWay, Converter={StaticResource BoolToVisibility}}"
+                                            AutomationProperties.Name="{x:Bind ViewModel.State.SecondaryLabel, Mode=OneWay}" />
+                                        <Button
+                                            Content="{x:Bind ViewModel.State.SecondaryLabel, Mode=OneWay}"
+                                            Foreground="{ThemeResource DangerTextBrush}"
+                                            Click="SecondaryAction_Click"
+                                            Visibility="{x:Bind ViewModel.State.SecondaryIsDestructive, Mode=OneWay, Converter={StaticResource BoolToVisibility}}"
+                                            AutomationProperties.Name="{x:Bind ViewModel.State.SecondaryLabel, Mode=OneWay}" />
                                     </StackPanel>
-                                </Border>
 
-                                <Grid ColumnSpacing="16">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="*" />
-                                        <ColumnDefinition Width="*" />
-                                    </Grid.ColumnDefinitions>
+                                    <TextBlock
+                                        Text="Windows asks for administrator approval when you turn on the tunnel."
+                                        Style="{StaticResource CaptionSecondaryTextBlockStyle}"
+                                        TextWrapping="Wrap"
+                                        Visibility="{x:Bind ViewModel.State.ShowAdminNote, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
 
-                                    <Border Grid.Column="0" Style="{StaticResource CardStyle}">
-                                        <StackPanel Spacing="8">
-                                            <TextBlock Text="Source device" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
-                                            <TextBlock Text="{x:Bind ViewModel.Dashboard.SourceDevice.Value, Mode=OneWay}" Style="{StaticResource SubtitleTextBlockStyle}" TextWrapping="Wrap" />
-                                            <ItemsControl ItemsSource="{x:Bind ViewModel.Dashboard.SourceDevice.Details, Mode=OneWay}">
-                                                <ItemsControl.ItemTemplate>
-                                                    <DataTemplate>
-                                                        <TextBlock Text="{Binding}" Style="{StaticResource SecondaryTextBlockStyle}" TextWrapping="Wrap" Margin="0,4,0,0" />
-                                                    </DataTemplate>
-                                                </ItemsControl.ItemTemplate>
-                                            </ItemsControl>
-                                        </StackPanel>
-                                    </Border>
+                                    <TextBlock
+                                        Text="Pair when you are ready."
+                                        Style="{StaticResource CaptionSecondaryTextBlockStyle}"
+                                        Visibility="{x:Bind ViewModel.State.ShowPairHint, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
 
-                                    <Border Grid.Column="1" Style="{StaticResource CardStyle}">
-                                        <StackPanel Spacing="8">
-                                            <TextBlock Text="Connection" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
-                                            <TextBlock Text="{x:Bind ViewModel.Dashboard.Connection.Value, Mode=OneWay}" Style="{StaticResource SubtitleTextBlockStyle}" TextWrapping="Wrap" />
-                                            <ItemsControl ItemsSource="{x:Bind ViewModel.Dashboard.Connection.Details, Mode=OneWay}">
-                                                <ItemsControl.ItemTemplate>
-                                                    <DataTemplate>
-                                                        <TextBlock Text="{Binding}" Style="{StaticResource SecondaryTextBlockStyle}" TextWrapping="Wrap" Margin="0,4,0,0" />
-                                                    </DataTemplate>
-                                                </ItemsControl.ItemTemplate>
-                                            </ItemsControl>
-                                        </StackPanel>
-                                    </Border>
-                                </Grid>
+                                </StackPanel>
+                            </Border>
 
-                                <Border
-                                    Style="{StaticResource CardStyle}"
-                                    Visibility="{x:Bind ViewModel.Dashboard.HasAttention, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
-                                    <StackPanel Spacing="12">
-                                        <TextBlock Text="Needs attention" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" AutomationProperties.LiveSetting="Polite" />
-                                        <ItemsControl ItemsSource="{x:Bind ViewModel.AttentionRows, Mode=OneWay}">
+                            <Grid ColumnSpacing="16">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+
+                                <Border Grid.Column="0" Style="{StaticResource CardStyle}" AutomationProperties.Name="{x:Bind ViewModel.State.SourceAccessibility, Mode=OneWay}">
+                                    <StackPanel Spacing="8">
+                                        <TextBlock Text="Source device" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
+                                        <TextBlock Text="{x:Bind ViewModel.State.SourceValue, Mode=OneWay}" Style="{StaticResource SubtitleTextBlockStyle}" TextWrapping="Wrap" />
+                                        <ItemsControl ItemsSource="{x:Bind ViewModel.State.SourceDetails, Mode=OneWay}" IsTabStop="False">
                                             <ItemsControl.ItemTemplate>
                                                 <DataTemplate>
-                                                    <Grid ColumnSpacing="12" Margin="0,4,0,4">
-                                                        <Grid.ColumnDefinitions>
-                                                            <ColumnDefinition Width="Auto" />
-                                                            <ColumnDefinition Width="*" />
-                                                            <ColumnDefinition Width="Auto" />
-                                                        </Grid.ColumnDefinitions>
-                                                        <FontIcon
-                                                            Grid.Column="0"
-                                                            Margin="0,4,0,0"
-                                                            VerticalAlignment="Top"
-                                                            Glyph="&#xE7BA;"
-                                                            FontSize="14"
-                                                            Foreground="{ThemeResource SecondaryTextBrush}"
-                                                            AutomationProperties.AccessibilityView="Raw" />
-                                                        <TextBlock Grid.Column="1" Text="{Binding Text}" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
-                                                        <HyperlinkButton
-                                                            Grid.Column="2"
-                                                            Content="{Binding ActionLabel}"
-                                                            Click="AttentionAction_Click"
-                                                            Visibility="{Binding ActionVisibility}" />
-                                                    </Grid>
+                                                    <TextBlock Text="{Binding}" Style="{StaticResource SecondaryTextBlockStyle}" TextWrapping="Wrap" Margin="0,4,0,0" />
                                                 </DataTemplate>
                                             </ItemsControl.ItemTemplate>
                                         </ItemsControl>
                                     </StackPanel>
                                 </Border>
-                            </StackPanel>
 
-                            <Border
-                                Style="{StaticResource CardStyle}"
-                                Padding="24"
-                                Visibility="{x:Bind ViewModel.Dashboard.IsPairing, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
-                                <StackPanel Spacing="24">
+                                <Border Grid.Column="1" Style="{StaticResource CardStyle}" AutomationProperties.Name="{x:Bind ViewModel.State.ConnectionAccessibility, Mode=OneWay}">
                                     <StackPanel Spacing="8">
-                                        <TextBlock Text="Pair your source device" Style="{StaticResource PageTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level1" />
-                                        <TextBlock Text="Check both screens." Style="{StaticResource SubtitleTextBlockStyle}" Foreground="{ThemeResource SecondaryTextBrush}" TextWrapping="Wrap" />
+                                        <TextBlock Text="Connection" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
+                                        <TextBlock Text="{x:Bind ViewModel.State.ConnectionValue, Mode=OneWay}" Style="{StaticResource SubtitleTextBlockStyle}" TextWrapping="Wrap" />
+                                        <ItemsControl ItemsSource="{x:Bind ViewModel.State.ConnectionDetails, Mode=OneWay}" IsTabStop="False">
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate>
+                                                    <TextBlock Text="{Binding}" Style="{StaticResource SecondaryTextBlockStyle}" TextWrapping="Wrap" Margin="0,4,0,0" />
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
                                     </StackPanel>
-
-                                    <Border Background="{ThemeResource CodeBackgroundBrush}" CornerRadius="8" Padding="16">
-                                        <StackPanel Spacing="12">
-                                            <StackPanel
-                                                Orientation="Horizontal"
-                                                Spacing="8"
-                                                Visibility="{x:Bind ViewModel.Dashboard.PairingCodeReady, Mode=OneWay, Converter={StaticResource BoolToVisibility}, ConverterParameter=Invert}">
-                                                <muxc:ProgressRing Width="16" Height="16" IsActive="True" AutomationProperties.AccessibilityView="Raw" />
-                                                <TextBlock Text="Waiting for the code." Style="{StaticResource SecondaryTextBlockStyle}" />
-                                            </StackPanel>
-
-                                            <TextBlock
-                                                Text="{x:Bind ViewModel.Dashboard.PairingCode, Mode=OneWay}"
-                                                FontFamily="Consolas"
-                                                FontSize="40"
-                                                FontWeight="SemiBold"
-                                                IsTextSelectionEnabled="True"
-                                                TextWrapping="Wrap"
-                                                AutomationProperties.Name="{x:Bind ViewModel.Dashboard.PairingCodeAccessibility, Mode=OneWay}"
-                                                AutomationProperties.LiveSetting="Polite"
-                                                Visibility="{x:Bind ViewModel.Dashboard.PairingCodeReady, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
-
-                                            <TextBlock Text="Tap Allow on the source device." Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
-                                        </StackPanel>
-                                    </Border>
-
-                                    <StackPanel Spacing="8">
-                                        <Grid ColumnSpacing="8">
-                                            <Grid.ColumnDefinitions>
-                                                <ColumnDefinition Width="24" />
-                                                <ColumnDefinition Width="*" />
-                                            </Grid.ColumnDefinitions>
-                                            <TextBlock Grid.Column="0" Text="1" FontWeight="SemiBold" Foreground="{ThemeResource SecondaryTextBrush}" AutomationProperties.AccessibilityView="Raw" />
-                                            <TextBlock Grid.Column="1" Text="Open HotspotShade on your source device." TextWrapping="Wrap" />
-                                        </Grid>
-                                        <Grid ColumnSpacing="8">
-                                            <Grid.ColumnDefinitions>
-                                                <ColumnDefinition Width="24" />
-                                                <ColumnDefinition Width="*" />
-                                            </Grid.ColumnDefinitions>
-                                            <TextBlock Grid.Column="0" Text="2" FontWeight="SemiBold" Foreground="{ThemeResource SecondaryTextBrush}" AutomationProperties.AccessibilityView="Raw" />
-                                            <TextBlock Grid.Column="1" Text="Check that both screens show the same code." TextWrapping="Wrap" />
-                                        </Grid>
-                                        <Grid ColumnSpacing="8">
-                                            <Grid.ColumnDefinitions>
-                                                <ColumnDefinition Width="24" />
-                                                <ColumnDefinition Width="*" />
-                                            </Grid.ColumnDefinitions>
-                                            <TextBlock Grid.Column="0" Text="3" FontWeight="SemiBold" Foreground="{ThemeResource SecondaryTextBrush}" AutomationProperties.AccessibilityView="Raw" />
-                                            <TextBlock Grid.Column="1" Text="Tap Allow on the source device." TextWrapping="Wrap" />
-                                        </Grid>
-                                    </StackPanel>
-
-                                    <StackPanel Orientation="Horizontal" Spacing="12">
-                                        <Button Content="Copy code" Click="CopyCode_Click" IsEnabled="{x:Bind ViewModel.Dashboard.PairingCodeReady, Mode=OneWay}" />
-                                        <Button Content="Simulate approval" Style="{StaticResource AccentButtonStyle}" Click="ApprovePairing_Click" IsEnabled="{x:Bind ViewModel.Dashboard.PairingCodeReady, Mode=OneWay}" />
-                                        <Button Content="Cancel" Click="CancelPairing_Click" />
-                                    </StackPanel>
-
-                                    <StackPanel Spacing="8">
-                                        <TextBlock x:Name="CodeCopiedText" Text="" Style="{StaticResource CaptionSecondaryTextBlockStyle}" Visibility="Collapsed" AutomationProperties.LiveSetting="Polite" />
-                                        <TextBlock Text="The source device is simulated. No device is contacted." Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
-                                        <HyperlinkButton Content="Simulate a failed pairing" Click="SimulatePairingFailure_Click" IsEnabled="{x:Bind ViewModel.Dashboard.PairingCodeReady, Mode=OneWay}" />
-                                    </StackPanel>
-                                </StackPanel>
-                            </Border>
-                        </StackPanel>
-                    </ScrollViewer>
-
-                    <ScrollViewer
-                        x:Name="ActivityScroll"
-                        MaxWidth="768"
-                        HorizontalAlignment="Stretch"
-                        HorizontalContentAlignment="Stretch"
-                        HorizontalScrollBarVisibility="Disabled"
-                        IsTabStop="True"
-                        Padding="24"
-                        TabFocusNavigation="Local"
-                        VerticalScrollBarVisibility="Auto"
-                        Visibility="Collapsed"
-                        AutomationProperties.Name="Activity">
-                        <StackPanel HorizontalAlignment="Stretch">
-                            <Grid Margin="0,0,0,16">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <StackPanel Grid.Column="0" Spacing="4">
-                                    <TextBlock Text="Activity" Style="{StaticResource PageTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level1" />
-                                    <TextBlock Text="Simulated activity. No engine logs." Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
-                                </StackPanel>
-                                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Top">
-                                    <ToggleButton
-                                        x:Name="ActivityDetailsToggle"
-                                        Content="Details"
-                                        Checked="ActivityDetails_Changed"
-                                        Unchecked="ActivityDetails_Changed"
-                                        AutomationProperties.HelpText="Show or hide the level and the sequence number." />
-                                    <Button Click="RefreshActivity_Click" AutomationProperties.Name="Refresh activity" ToolTipService.ToolTip="Refresh the simulated activity." MinWidth="96" IsEnabled="{x:Bind ViewModel.Activity.CanRefresh, Mode=OneWay}">
-                                        <StackPanel Orientation="Horizontal" Spacing="8">
-                                            <muxc:ProgressRing
-                                                Width="16"
-                                                Height="16"
-                                                IsActive="{x:Bind ViewModel.Activity.IsLoading, Mode=OneWay}"
-                                                Visibility="{x:Bind ViewModel.Activity.IsLoading, Mode=OneWay, Converter={StaticResource BoolToVisibility}}"
-                                                AutomationProperties.AccessibilityView="Raw" />
-                                            <FontIcon
-                                                Glyph="&#xE72C;"
-                                                FontSize="16"
-                                                Visibility="{x:Bind ViewModel.Activity.IsLoading, Mode=OneWay, Converter={StaticResource BoolToVisibility}, ConverterParameter=Invert}"
-                                                AutomationProperties.AccessibilityView="Raw" />
-                                            <TextBlock
-                                                Text="Refresh"
-                                                Visibility="{x:Bind ViewModel.Activity.IsLoading, Mode=OneWay, Converter={StaticResource BoolToVisibility}, ConverterParameter=Invert}" />
-                                        </StackPanel>
-                                    </Button>
-                                </StackPanel>
+                                </Border>
                             </Grid>
 
                             <Border
                                 Style="{StaticResource CardStyle}"
-                                Visibility="{x:Bind ViewModel.Activity.IsLoading, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
-                                <StackPanel Orientation="Horizontal" Spacing="12">
-                                    <muxc:ProgressRing Width="20" Height="20" IsActive="{x:Bind ViewModel.Activity.IsLoading, Mode=OneWay}" AutomationProperties.AccessibilityView="Raw" />
-                                    <TextBlock Text="Loading activity..." Style="{StaticResource SecondaryTextBlockStyle}" AutomationProperties.LiveSetting="Polite" />
-                                </StackPanel>
-                            </Border>
-
-                            <Border
-                                Style="{StaticResource CardStyle}"
-                                Visibility="{x:Bind ViewModel.Activity.IsEmpty, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
-                                <StackPanel Spacing="12" HorizontalAlignment="Center" Padding="16">
-                                    <FontIcon Glyph="&#xE81C;" FontSize="28" Foreground="{ThemeResource SecondaryTextBrush}" HorizontalAlignment="Center" AutomationProperties.AccessibilityView="Raw" />
-                                    <TextBlock Text="No activity yet." Style="{StaticResource CardTitleTextBlockStyle}" HorizontalAlignment="Center" AutomationProperties.LiveSetting="Polite" />
-                                    <TextBlock Text="Turn on the simulated tunnel to add entries." Style="{StaticResource SecondaryTextBlockStyle}" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" />
-                                    <Button Content="Refresh" Click="RefreshActivity_Click" HorizontalAlignment="Center" />
-                                </StackPanel>
-                            </Border>
-
-                            <Border
-                                Style="{StaticResource CardStyle}"
-                                Visibility="{x:Bind ViewModel.Activity.IsUnavailable, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
-                                <StackPanel Spacing="12" HorizontalAlignment="Center" Padding="16">
-                                    <FontIcon Glyph="&#xE7BA;" FontSize="28" Foreground="{ThemeResource SecondaryTextBrush}" HorizontalAlignment="Center" AutomationProperties.AccessibilityView="Raw" />
-                                    <TextBlock Text="The app cannot read simulated activity now." Style="{StaticResource CardTitleTextBlockStyle}" HorizontalAlignment="Center" TextAlignment="Center" AutomationProperties.LiveSetting="Polite" />
-                                    <TextBlock Text="The status is unavailable." Style="{StaticResource SecondaryTextBlockStyle}" HorizontalAlignment="Center" TextAlignment="Center" />
-                                    <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
-                                        <Button Content="Check now" Click="CheckNowFromActivity_Click" IsEnabled="{x:Bind ViewModel.Dashboard.CanCheckNow, Mode=OneWay}" />
-                                        <Button Content="Refresh" Click="RefreshActivity_Click" />
-                                    </StackPanel>
-                                </StackPanel>
-                            </Border>
-
-                            <Border
-                                Style="{StaticResource CardStyle}"
-                                Padding="8"
-                                Visibility="{x:Bind ViewModel.Activity.ShowsLines, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
-                                <ItemsControl ItemsSource="{x:Bind ViewModel.ActivityRows, Mode=OneWay}">
-                                    <ItemsControl.ItemTemplate>
-                                        <DataTemplate>
-                                            <Grid ColumnSpacing="12" Padding="8,8">
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="72" />
-                                                    <ColumnDefinition Width="*" />
-                                                </Grid.ColumnDefinitions>
-                                                <TextBlock
-                                                    Grid.Column="0"
-                                                    Text="{Binding Time}"
-                                                    FontFamily="Consolas"
-                                                    Style="{StaticResource CaptionSecondaryTextBlockStyle}"
-                                                    VerticalAlignment="Top" />
-                                                <StackPanel Grid.Column="1">
-                                                    <TextBlock Text="{Binding Message}" TextWrapping="Wrap" />
-                                                    <TextBlock
-                                                        Text="{Binding Details}"
-                                                        FontFamily="Consolas"
-                                                        Style="{StaticResource CaptionSecondaryTextBlockStyle}"
-                                                        TextWrapping="Wrap"
-                                                        Margin="0,4,0,0"
-                                                        Visibility="{Binding DetailsVisibility}" />
-                                                </StackPanel>
-                                            </Grid>
-                                        </DataTemplate>
-                                    </ItemsControl.ItemTemplate>
-                                </ItemsControl>
-                            </Border>
-
-                            <TextBlock Text="Details add the level and the sequence number." Style="{StaticResource CaptionSecondaryTextBlockStyle}" Margin="0,16,0,0" />
-                        </StackPanel>
-                    </ScrollViewer>
-
-                    <ScrollViewer
-                        x:Name="SettingsScroll"
-                        MaxWidth="768"
-                        HorizontalAlignment="Stretch"
-                        HorizontalContentAlignment="Stretch"
-                        HorizontalScrollBarVisibility="Disabled"
-                        IsTabStop="True"
-                        Padding="24"
-                        TabFocusNavigation="Local"
-                        VerticalScrollBarVisibility="Auto"
-                        Visibility="Collapsed"
-                        AutomationProperties.Name="Settings">
-                        <StackPanel Spacing="16" HorizontalAlignment="Stretch">
-                            <StackPanel Spacing="4">
-                                <TextBlock Text="Settings" Style="{StaticResource PageTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level1" />
-                                <TextBlock Text="These settings affect the simulated prototype only." Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
-                            </StackPanel>
-
-                            <Pivot x:Name="SettingsPivot" Margin="0,8,0,0">
-                                <PivotItem Header="General">
-                                    <StackPanel Spacing="16" Padding="0,8,0,0">
-                                        <Border Style="{StaticResource CardStyle}">
-                                            <StackPanel Spacing="8">
-                                                <ToggleSwitch
-                                                    x:Name="PingSwitch"
-                                                    Header="Let ping work"
-                                                    OnContent="On"
-                                                    OffContent="Off"
-                                                    Toggled="PingSwitch_Toggled"
-                                                    AutomationProperties.HelpText="The setting applies to the next simulated start. No echo path is implemented." />
-                                                <TextBlock Text="The echo path is not implemented. The setting changes only the simulated status line." Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
-                                                <TextBlock Text="{x:Bind ViewModel.Settings.PingStateText, Mode=OneWay}" Style="{StaticResource SecondaryTextBlockStyle}" TextWrapping="Wrap" />
-                                            </StackPanel>
-                                        </Border>
-
-                                        <Border Style="{StaticResource CardStyle}">
-                                            <StackPanel Spacing="12">
-                                                <TextBlock Text="Appearance" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
-                                                <ComboBox x:Name="ThemeCombo" Header="Theme" MinWidth="200" SelectionChanged="ThemeCombo_SelectionChanged">
-                                                    <ComboBoxItem Content="Use system setting" />
-                                                    <ComboBoxItem Content="Light" />
-                                                    <ComboBoxItem Content="Dark" />
-                                                </ComboBox>
-                                                <TextBlock Text="The content follows the choice at once. High contrast follows the Windows setting." Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
-                                            </StackPanel>
-                                        </Border>
-
-                                        <Border Style="{StaticResource CardStyle}">
-                                            <StackPanel Spacing="8">
-                                                <TextBlock Text="Notifications" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
-                                                <TextBlock Text="{x:Bind ViewModel.Settings.NotificationsText, Mode=OneWay}" TextWrapping="Wrap" />
-                                                <TextBlock Text="Toast notifications need package identity and a manifest declaration. This prototype does not request them." Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
-                                            </StackPanel>
-                                        </Border>
-
-                                        <Border Style="{StaticResource CardStyle}">
-                                            <StackPanel Spacing="8">
-                                                <TextBlock Text="Launch at login" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
-                                                <ToggleSwitch Header="Launch at login" IsOn="False" IsEnabled="False" AutomationProperties.HelpText="Not available in this prototype." />
-                                                <TextBlock Text="{x:Bind ViewModel.Settings.LoginText, Mode=OneWay}" Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
-                                            </StackPanel>
-                                        </Border>
-                                    </StackPanel>
-                                </PivotItem>
-
-                                <PivotItem Header="Pairing">
-                                    <StackPanel Spacing="16" Padding="0,8,0,0">
-                                        <Border Style="{StaticResource CardStyle}">
-                                            <StackPanel Spacing="8">
-                                                <Grid ColumnSpacing="8">
+                                Visibility="{x:Bind ViewModel.State.HasAttention, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
+                                <StackPanel Spacing="12">
+                                    <TextBlock Text="Needs attention" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" AutomationProperties.LiveSetting="Polite" />
+                                    <ItemsControl ItemsSource="{x:Bind ViewModel.AttentionRows, Mode=OneWay}" IsTabStop="False">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate>
+                                                <Grid ColumnSpacing="12" Margin="0,4,0,4">
                                                     <Grid.ColumnDefinitions>
                                                         <ColumnDefinition Width="Auto" />
                                                         <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="Auto" />
                                                     </Grid.ColumnDefinitions>
                                                     <FontIcon
                                                         Grid.Column="0"
-                                                        Glyph="{x:Bind ViewModel.Settings.PairingGlyph, Mode=OneWay}"
-                                                        FontSize="16"
-                                                        VerticalAlignment="Center"
+                                                        Margin="0,4,0,0"
+                                                        VerticalAlignment="Top"
+                                                        Glyph="&#xE7BA;"
+                                                        FontSize="14"
                                                         Foreground="{ThemeResource SecondaryTextBrush}"
                                                         AutomationProperties.AccessibilityView="Raw" />
-                                                    <TextBlock
-                                                        Grid.Column="1"
-                                                        Text="{x:Bind ViewModel.Settings.PairingStateText, Mode=OneWay}"
-                                                        Style="{StaticResource SubtitleTextBlockStyle}"
-                                                        TextWrapping="Wrap"
-                                                        AutomationProperties.HeadingLevel="Level2"
-                                                        AutomationProperties.LiveSetting="Polite" />
+                                                    <TextBlock Grid.Column="1" Text="{Binding Text}" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
+                                                    <HyperlinkButton
+                                                        Grid.Column="2"
+                                                        Content="{Binding ActionLabel}"
+                                                        Click="AttentionAction_Click"
+                                                        Visibility="{Binding ActionVisibility}"
+                                                        AutomationProperties.Name="{Binding ActionLabel}" />
                                                 </Grid>
-                                                <TextBlock Text="{x:Bind ViewModel.Dashboard.Subtitle, Mode=OneWay}" Style="{StaticResource SecondaryTextBlockStyle}" TextWrapping="Wrap" />
-                                            </StackPanel>
-                                        </Border>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
 
-                                        <Border Style="{StaticResource CardStyle}">
-                                            <StackPanel Spacing="12">
-                                                <Button Content="Pair with source device" Style="{StaticResource AccentButtonStyle}" Click="PairFromSettings_Click" IsEnabled="{x:Bind ViewModel.Settings.PairActionEnabled, Mode=OneWay}" />
+                        <Border
+                            Style="{StaticResource CardStyle}"
+                            Padding="24"
+                            Visibility="{x:Bind ViewModel.State.IsPairing, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
+                            <StackPanel Spacing="24">
+                                <StackPanel Spacing="8">
+                                    <TextBlock Text="Pair your source device" Style="{StaticResource PageTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level1" />
+                                    <TextBlock Text="Check both screens." Style="{StaticResource SubtitleTextBlockStyle}" Foreground="{ThemeResource SecondaryTextBrush}" TextWrapping="Wrap" />
+                                </StackPanel>
+
+                                <Border Background="{ThemeResource CodeBackgroundBrush}" CornerRadius="8" Padding="16">
+                                    <StackPanel Spacing="12">
+                                        <StackPanel
+                                            Orientation="Horizontal"
+                                            Spacing="8"
+                                            Visibility="{x:Bind ViewModel.State.PairingCodeReady, Mode=OneWay, Converter={StaticResource BoolToVisibility}, ConverterParameter=Invert}">
+                                            <muxc:ProgressRing Width="16" Height="16" IsActive="True" AutomationProperties.AccessibilityView="Raw" />
+                                            <TextBlock Text="Waiting for the code." Style="{StaticResource SecondaryTextBlockStyle}" AutomationProperties.LiveSetting="Polite" />
+                                        </StackPanel>
+
+                                        <TextBlock
+                                            Text="{x:Bind ViewModel.State.PairingCode, Mode=OneWay}"
+                                            FontFamily="Consolas"
+                                            FontSize="40"
+                                            FontWeight="SemiBold"
+                                            IsTextSelectionEnabled="True"
+                                            TextWrapping="Wrap"
+                                            AutomationProperties.Name="{x:Bind ViewModel.State.PairingCodeAccessibility, Mode=OneWay}"
+                                            AutomationProperties.LiveSetting="Assertive"
+                                            Visibility="{x:Bind ViewModel.State.PairingCodeReady, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
+
+                                        <TextBlock Text="Tap Allow on the source device." Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                                    </StackPanel>
+                                </Border>
+
+                                <StackPanel Spacing="8">
+                                    <Grid ColumnSpacing="8" AutomationProperties.Name="Step 1. Open HotspotShade on your source device.">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="24" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Grid.Column="0" Text="1" FontWeight="SemiBold" Foreground="{ThemeResource SecondaryTextBrush}" AutomationProperties.AccessibilityView="Raw" />
+                                        <TextBlock Grid.Column="1" Text="Open HotspotShade on your source device." TextWrapping="Wrap" />
+                                    </Grid>
+                                    <Grid ColumnSpacing="8" AutomationProperties.Name="Step 2. Check that both screens show the same code.">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="24" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Grid.Column="0" Text="2" FontWeight="SemiBold" Foreground="{ThemeResource SecondaryTextBrush}" AutomationProperties.AccessibilityView="Raw" />
+                                        <TextBlock Grid.Column="1" Text="Check that both screens show the same code." TextWrapping="Wrap" />
+                                    </Grid>
+                                    <Grid ColumnSpacing="8" AutomationProperties.Name="Step 3. Tap Allow on the source device.">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="24" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Grid.Column="0" Text="3" FontWeight="SemiBold" Foreground="{ThemeResource SecondaryTextBrush}" AutomationProperties.AccessibilityView="Raw" />
+                                        <TextBlock Grid.Column="1" Text="Tap Allow on the source device." TextWrapping="Wrap" />
+                                    </Grid>
+                                </StackPanel>
+
+                                <StackPanel Orientation="Horizontal" Spacing="12">
+                                    <Button Content="Copy code" Click="CopyCode_Click" IsEnabled="{x:Bind ViewModel.State.PairingCodeReady, Mode=OneWay}" />
+                                    <Button Content="Cancel" Click="CancelPairing_Click" IsEnabled="{x:Bind ViewModel.State.CanCancelPairing, Mode=OneWay}">
+                                        <Button.KeyboardAccelerators>
+                                            <KeyboardAccelerator Key="Escape" />
+                                        </Button.KeyboardAccelerators>
+                                    </Button>
+                                    <TextBlock x:Name="CodeCopiedText" Text="" Style="{StaticResource CaptionSecondaryTextBlockStyle}" VerticalAlignment="Center" Visibility="Collapsed" AutomationProperties.LiveSetting="Polite" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                </ScrollViewer>
+
+                <ScrollViewer
+                    x:Name="ActivityScroll"
+                    MaxWidth="768"
+                    HorizontalAlignment="Stretch"
+                    HorizontalContentAlignment="Stretch"
+                    HorizontalScrollBarVisibility="Disabled"
+                    IsTabStop="True"
+                    Padding="24"
+                    TabFocusNavigation="Local"
+                    VerticalScrollBarVisibility="Auto"
+                    Visibility="Collapsed"
+                    AutomationProperties.Name="Activity">
+                    <StackPanel HorizontalAlignment="Stretch">
+                        <Grid Margin="0,0,0,16">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column="0" Spacing="4">
+                                <TextBlock Text="Activity" Style="{StaticResource PageTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level1" />
+                                <TextBlock Text="The engine log on this target device. Newest first." Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Top">
+                                <ToggleButton
+                                    x:Name="ActivityDetailsToggle"
+                                    Content="Details"
+                                    Checked="ActivityDetails_Changed"
+                                    Unchecked="ActivityDetails_Changed"
+                                    AutomationProperties.HelpText="Show or hide the level and the sequence number." />
+                                <Button Click="RefreshActivity_Click" AutomationProperties.Name="Refresh activity" ToolTipService.ToolTip="Refresh the activity." MinWidth="96">
+                                    <StackPanel Orientation="Horizontal" Spacing="8">
+                                        <muxc:ProgressRing
+                                            Width="16"
+                                            Height="16"
+                                            IsActive="{x:Bind ViewModel.State.ActivityLoading, Mode=OneWay}"
+                                            Visibility="{x:Bind ViewModel.State.ActivityLoading, Mode=OneWay, Converter={StaticResource BoolToVisibility}}"
+                                            AutomationProperties.AccessibilityView="Raw" />
+                                        <FontIcon
+                                            Glyph="&#xE72C;"
+                                            FontSize="16"
+                                            Visibility="{x:Bind ViewModel.State.ActivityLoading, Mode=OneWay, Converter={StaticResource BoolToVisibility}, ConverterParameter=Invert}"
+                                            AutomationProperties.AccessibilityView="Raw" />
+                                        <TextBlock Text="Refresh" />
+                                    </StackPanel>
+                                </Button>
+                            </StackPanel>
+                        </Grid>
+
+                        <Border
+                            Style="{StaticResource CardStyle}"
+                            Visibility="{x:Bind ViewModel.State.ActivityLoading, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
+                            <StackPanel Orientation="Horizontal" Spacing="12">
+                                <muxc:ProgressRing Width="20" Height="20" IsActive="{x:Bind ViewModel.State.ActivityLoading, Mode=OneWay}" AutomationProperties.AccessibilityView="Raw" />
+                                <TextBlock Text="Loading activity..." Style="{StaticResource SecondaryTextBlockStyle}" AutomationProperties.LiveSetting="Polite" />
+                            </StackPanel>
+                        </Border>
+
+                        <Border
+                            Style="{StaticResource CardStyle}"
+                            Visibility="{x:Bind ViewModel.State.ActivityEmpty, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
+                            <StackPanel Spacing="12" HorizontalAlignment="Center" Padding="16">
+                                <FontIcon Glyph="&#xE81C;" FontSize="28" Foreground="{ThemeResource SecondaryTextBrush}" HorizontalAlignment="Center" AutomationProperties.AccessibilityView="Raw" />
+                                <TextBlock Text="No activity yet." Style="{StaticResource CardTitleTextBlockStyle}" HorizontalAlignment="Center" AutomationProperties.LiveSetting="Polite" />
+                                <Button Content="Refresh" Click="RefreshActivity_Click" HorizontalAlignment="Center" />
+                            </StackPanel>
+                        </Border>
+
+                        <Border
+                            Style="{StaticResource CardStyle}"
+                            Visibility="{x:Bind ViewModel.State.ActivityUnavailable, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
+                            <StackPanel Spacing="12" HorizontalAlignment="Center" Padding="16">
+                                <FontIcon Glyph="&#xE7BA;" FontSize="28" Foreground="{ThemeResource SecondaryTextBrush}" HorizontalAlignment="Center" AutomationProperties.AccessibilityView="Raw" />
+                                <TextBlock Text="The app cannot read activity now." Style="{StaticResource CardTitleTextBlockStyle}" HorizontalAlignment="Center" TextAlignment="Center" AutomationProperties.LiveSetting="Polite" />
+                                <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
+                                    <Button Content="Check now" Click="CheckNowFromActivity_Click" IsEnabled="{x:Bind ViewModel.State.CanCheckNow, Mode=OneWay}" />
+                                    <Button Content="Refresh" Click="RefreshActivity_Click" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <Border
+                            Style="{StaticResource CardStyle}"
+                            Padding="8"
+                            Visibility="{x:Bind ViewModel.State.ActivityShowsLines, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
+                            <ItemsControl ItemsSource="{x:Bind ViewModel.ActivityRows, Mode=OneWay}" IsTabStop="False">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Grid ColumnSpacing="12" Padding="8,8" AutomationProperties.Name="{Binding AccessibilityLabel}">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="72" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock
+                                                Grid.Column="0"
+                                                Text="{Binding Time}"
+                                                FontFamily="Consolas"
+                                                Style="{StaticResource CaptionSecondaryTextBlockStyle}"
+                                                VerticalAlignment="Top" />
+                                            <StackPanel Grid.Column="1">
+                                                <TextBlock Text="{Binding Message}" TextWrapping="Wrap" IsTextSelectionEnabled="True" />
                                                 <TextBlock
-                                                    Text="{x:Bind ViewModel.Settings.PairActionReason, Mode=OneWay}"
+                                                    Text="{Binding Details}"
+                                                    FontFamily="Consolas"
                                                     Style="{StaticResource CaptionSecondaryTextBlockStyle}"
                                                     TextWrapping="Wrap"
-                                                    Visibility="{x:Bind ViewModel.Settings.PairActionReason, Mode=OneWay, Converter={StaticResource StringToVisibility}}" />
-                                                <StackPanel
-                                                    Orientation="Horizontal"
-                                                    Spacing="8"
-                                                    Visibility="{x:Bind ViewModel.Settings.IsPairing, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
-                                                    <muxc:ProgressRing Width="16" Height="16" IsActive="True" AutomationProperties.AccessibilityView="Raw" />
-                                                    <TextBlock Text="Pairing is running." Style="{StaticResource SecondaryTextBlockStyle}" />
-                                                </StackPanel>
-                                                <Button
-                                                    Content="Cancel"
-                                                    Click="CancelPairingSettings_Click"
-                                                    Visibility="{x:Bind ViewModel.Settings.IsPairing, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
+                                                    Margin="0,4,0,0"
+                                                    Visibility="{Binding DetailsVisibility}" />
                                             </StackPanel>
-                                        </Border>
+                                        </Grid>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </Border>
 
-                                        <Border
-                                            Style="{StaticResource CardStyle}"
-                                            Visibility="{x:Bind ViewModel.Settings.ShowForget, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
-                                            <StackPanel Spacing="12">
-                                                <TextBlock Text="Forget this source device" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
-                                                <TextBlock Text="Forget removes this pairing from this target device." Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                        <TextBlock Text="Details add the level and the sequence number." Style="{StaticResource CaptionSecondaryTextBlockStyle}" Margin="0,16,0,0" />
+                    </StackPanel>
+                </ScrollViewer>
+
+                <ScrollViewer
+                    x:Name="SettingsScroll"
+                    MaxWidth="768"
+                    HorizontalAlignment="Stretch"
+                    HorizontalContentAlignment="Stretch"
+                    HorizontalScrollBarVisibility="Disabled"
+                    IsTabStop="True"
+                    Padding="24"
+                    TabFocusNavigation="Local"
+                    VerticalScrollBarVisibility="Auto"
+                    Visibility="Collapsed"
+                    AutomationProperties.Name="Settings">
+                    <StackPanel Spacing="16" HorizontalAlignment="Stretch">
+                        <TextBlock Text="Settings" Style="{StaticResource PageTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level1" />
+
+                        <Pivot x:Name="SettingsPivot" Margin="0,8,0,0" SelectionChanged="SettingsPivot_SelectionChanged">
+                            <PivotItem Header="General">
+                                <StackPanel Spacing="16" Padding="0,8,0,0">
+                                    <Border Style="{StaticResource CardStyle}">
+                                        <StackPanel Spacing="8">
+                                            <ToggleSwitch
+                                                x:Name="PingSwitch"
+                                                Header="Let ping work"
+                                                OnContent="On"
+                                                OffContent="Off"
+                                                Toggled="PingSwitch_Toggled"
+                                                AutomationProperties.HelpText="Uses an experimental echo relay on the source device. Applies the next time you turn the tunnel on." />
+                                            <TextBlock Text="Uses an experimental echo relay on the source device. Applies the next time you turn the tunnel on." Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                                            <TextBlock Text="{x:Bind ViewModel.State.PingStateText, Mode=OneWay}" Style="{StaticResource SecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                                        </StackPanel>
+                                    </Border>
+
+                                    <Border Style="{StaticResource CardStyle}">
+                                        <StackPanel Spacing="12">
+                                            <TextBlock Text="Appearance" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
+                                            <ComboBox x:Name="ThemeCombo" Header="Theme" MinWidth="200" SelectionChanged="ThemeCombo_SelectionChanged">
+                                                <ComboBoxItem Content="Use the Windows setting" />
+                                                <ComboBoxItem Content="Light" />
+                                                <ComboBoxItem Content="Dark" />
+                                            </ComboBox>
+                                            <TextBlock Text="The content follows the choice at once. High contrast follows the Windows setting." Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                                        </StackPanel>
+                                    </Border>
+
+                                    <Border Style="{StaticResource CardStyle}">
+                                        <StackPanel Spacing="8">
+                                            <TextBlock Text="Not available on Windows yet" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
+                                            <TextBlock Text="These features are not built for Windows. HotspotShade does not offer them here." Style="{StaticResource SecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                                            <TextBlock Text="Notifications." TextWrapping="Wrap" />
+                                            <TextBlock Text="Launch at login." TextWrapping="Wrap" />
+                                            <TextBlock Text="A notification area icon." TextWrapping="Wrap" />
+                                            <TextBlock Text="Direct mode without the source device app." TextWrapping="Wrap" />
+                                        </StackPanel>
+                                    </Border>
+                                </StackPanel>
+                            </PivotItem>
+
+                            <PivotItem Header="Pairing">
+                                <StackPanel Spacing="16" Padding="0,8,0,0">
+                                    <Border Style="{StaticResource CardStyle}">
+                                        <StackPanel Spacing="8">
+                                            <Grid ColumnSpacing="8">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto" />
+                                                    <ColumnDefinition Width="*" />
+                                                </Grid.ColumnDefinitions>
+                                                <FontIcon
+                                                    Grid.Column="0"
+                                                    Glyph="{x:Bind ViewModel.State.PairingGlyph, Mode=OneWay}"
+                                                    FontSize="16"
+                                                    VerticalAlignment="Center"
+                                                    Foreground="{ThemeResource SecondaryTextBrush}"
+                                                    AutomationProperties.AccessibilityView="Raw" />
                                                 <TextBlock
-                                                    Text="{x:Bind ViewModel.Settings.ForgetMessage, Mode=OneWay}"
-                                                    Style="{StaticResource SecondaryTextBlockStyle}"
+                                                    Grid.Column="1"
+                                                    Text="{x:Bind ViewModel.State.PairingStateText, Mode=OneWay}"
+                                                    Style="{StaticResource SubtitleTextBlockStyle}"
                                                     TextWrapping="Wrap"
-                                                    Visibility="{x:Bind ViewModel.Settings.ForgetMessage, Mode=OneWay, Converter={StaticResource StringToVisibility}}" />
-                                                <Button
-                                                    Content="{x:Bind ViewModel.Settings.ForgetButtonLabel, Mode=OneWay}"
-                                                    Foreground="{ThemeResource DangerTextBrush}"
-                                                    Click="ForgetButton_Click" />
+                                                    AutomationProperties.HeadingLevel="Level2"
+                                                    AutomationProperties.LiveSetting="Polite" />
+                                            </Grid>
+                                            <TextBlock Text="{x:Bind ViewModel.State.Subtitle, Mode=OneWay}" Style="{StaticResource SecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                                        </StackPanel>
+                                    </Border>
+
+                                    <Border Style="{StaticResource CardStyle}">
+                                        <StackPanel Spacing="12">
+                                            <Button Content="Pair with source device" Style="{StaticResource AccentButtonStyle}" Click="PairFromSettings_Click" IsEnabled="{x:Bind ViewModel.State.CanPair, Mode=OneWay}" />
+                                            <TextBlock
+                                                Text="{x:Bind ViewModel.State.PairReason, Mode=OneWay}"
+                                                Style="{StaticResource CaptionSecondaryTextBlockStyle}"
+                                                TextWrapping="Wrap"
+                                                Visibility="{x:Bind ViewModel.State.PairReason, Mode=OneWay, Converter={StaticResource StringToVisibility}}" />
+                                            <StackPanel
+                                                Orientation="Horizontal"
+                                                Spacing="8"
+                                                Visibility="{x:Bind ViewModel.State.IsPairing, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
+                                                <muxc:ProgressRing Width="16" Height="16" IsActive="True" AutomationProperties.AccessibilityView="Raw" />
+                                                <TextBlock Text="Pairing is running. The code is on the Dashboard." Style="{StaticResource SecondaryTextBlockStyle}" TextWrapping="Wrap" />
                                             </StackPanel>
-                                        </Border>
-                                    </StackPanel>
-                                </PivotItem>
+                                            <Button
+                                                Content="Cancel"
+                                                Click="CancelPairing_Click"
+                                                IsEnabled="{x:Bind ViewModel.State.CanCancelPairing, Mode=OneWay}"
+                                                Visibility="{x:Bind ViewModel.State.IsPairing, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
+                                        </StackPanel>
+                                    </Border>
 
-                                <PivotItem Header="Advanced">
-                                    <StackPanel Spacing="16" Padding="0,8,0,0">
-                                        <Border Style="{StaticResource CardStyle}">
-                                            <StackPanel Spacing="12">
-                                                <TextBlock Text="Recent failures" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
-                                                <TextBlock Text="Simulated. This data stays in the prototype session." Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
-                                                <StackPanel Orientation="Horizontal" Spacing="8">
-                                                    <Button Content="Refresh" Click="RefreshFailures_Click" IsEnabled="{x:Bind ViewModel.Settings.Failures.CanRefresh, Mode=OneWay}" />
-                                                    <Button Content="Copy report" Click="CopyFailureReport_Click" IsEnabled="{x:Bind ViewModel.Settings.Failures.HasRows, Mode=OneWay}" />
-                                                    <HyperlinkButton
-                                                        Content="Clear simulated failures"
-                                                        Click="ClearFailures_Click"
-                                                        Visibility="{x:Bind ViewModel.Settings.Failures.HasRows, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
-                                                </StackPanel>
+                                    <Border
+                                        Style="{StaticResource CardStyle}"
+                                        Visibility="{x:Bind ViewModel.State.ShowForget, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
+                                        <StackPanel Spacing="12">
+                                            <TextBlock Text="Forget this source device" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
+                                            <TextBlock Text="Forget removes this pairing from this target device." Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                                            <TextBlock
+                                                Text="{x:Bind ViewModel.State.ForgetMessage, Mode=OneWay}"
+                                                Style="{StaticResource SecondaryTextBlockStyle}"
+                                                TextWrapping="Wrap"
+                                                Visibility="{x:Bind ViewModel.State.ForgetMessage, Mode=OneWay, Converter={StaticResource StringToVisibility}}" />
+                                            <Button
+                                                Content="{x:Bind ViewModel.State.ForgetLabel, Mode=OneWay}"
+                                                Foreground="{ThemeResource DangerTextBrush}"
+                                                IsEnabled="{x:Bind ViewModel.State.ForgetEnabled, Mode=OneWay}"
+                                                Click="ForgetButton_Click"
+                                                AutomationProperties.Name="{x:Bind ViewModel.State.ForgetLabel, Mode=OneWay}" />
+                                        </StackPanel>
+                                    </Border>
+                                </StackPanel>
+                            </PivotItem>
 
-                                                <StackPanel
-                                                    Orientation="Horizontal"
-                                                    Spacing="12"
-                                                    Visibility="{x:Bind ViewModel.Settings.Failures.IsLoading, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
-                                                    <muxc:ProgressRing Width="20" Height="20" IsActive="{x:Bind ViewModel.Settings.Failures.IsLoading, Mode=OneWay}" AutomationProperties.AccessibilityView="Raw" />
-                                                    <TextBlock Text="Loading simulated failures..." Style="{StaticResource SecondaryTextBlockStyle}" AutomationProperties.LiveSetting="Polite" />
-                                                </StackPanel>
-
-                                                <TextBlock
-                                                    Text="{x:Bind ViewModel.Settings.Failures.Message, Mode=OneWay}"
-                                                    Style="{StaticResource SecondaryTextBlockStyle}"
-                                                    TextWrapping="Wrap"
-                                                    AutomationProperties.LiveSetting="Polite"
-                                                    Visibility="{x:Bind ViewModel.Settings.Failures.ShowMessage, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
-
-                                                <StackPanel
-                                                    Spacing="4"
-                                                    Visibility="{x:Bind ViewModel.Settings.Failures.HasRows, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
-                                                    <Grid ColumnSpacing="12" Padding="0,4,0,4">
-                                                        <Grid.ColumnDefinitions>
-                                                            <ColumnDefinition Width="48" />
-                                                            <ColumnDefinition Width="110" />
-                                                            <ColumnDefinition Width="*" />
-                                                            <ColumnDefinition Width="130" />
-                                                            <ColumnDefinition Width="*" />
-                                                        </Grid.ColumnDefinitions>
-                                                        <TextBlock Grid.Column="0" Text="Count" Style="{StaticResource CaptionSecondaryTextBlockStyle}" FontWeight="SemiBold" />
-                                                        <TextBlock Grid.Column="1" Text="Kind" Style="{StaticResource CaptionSecondaryTextBlockStyle}" FontWeight="SemiBold" />
-                                                        <TextBlock Grid.Column="2" Text="Target" Style="{StaticResource CaptionSecondaryTextBlockStyle}" FontWeight="SemiBold" />
-                                                        <TextBlock Grid.Column="3" Text="Stage" Style="{StaticResource CaptionSecondaryTextBlockStyle}" FontWeight="SemiBold" />
-                                                        <TextBlock Grid.Column="4" Text="Reason" Style="{StaticResource CaptionSecondaryTextBlockStyle}" FontWeight="SemiBold" />
-                                                    </Grid>
-                                                    <ItemsControl ItemsSource="{x:Bind ViewModel.Settings.Failures.Rows, Mode=OneWay}">
-                                                        <ItemsControl.ItemTemplate>
-                                                            <DataTemplate>
-                                                                <Grid ColumnSpacing="12" Padding="0,8,0,8">
-                                                                    <Grid.ColumnDefinitions>
-                                                                        <ColumnDefinition Width="48" />
-                                                                        <ColumnDefinition Width="110" />
-                                                                        <ColumnDefinition Width="*" />
-                                                                        <ColumnDefinition Width="130" />
-                                                                        <ColumnDefinition Width="*" />
-                                                                    </Grid.ColumnDefinitions>
-                                                                    <TextBlock Grid.Column="0" Text="{Binding Count}" />
-                                                                    <TextBlock Grid.Column="1" Text="{Binding Kind}" TextWrapping="Wrap" />
-                                                                    <TextBlock Grid.Column="2" Text="{Binding Target}" TextWrapping="Wrap" />
-                                                                    <TextBlock Grid.Column="3" Text="{Binding PhaseLabel}" TextWrapping="Wrap" />
-                                                                    <TextBlock Grid.Column="4" Text="{Binding Reason}" TextWrapping="Wrap" />
-                                                                </Grid>
-                                                            </DataTemplate>
-                                                        </ItemsControl.ItemTemplate>
-                                                    </ItemsControl>
-                                                </StackPanel>
-
-                                                <TextBlock Text="The simulated data stays in this target device session." Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
-                                                <TextBlock x:Name="ReportCopiedText" Text="" Style="{StaticResource CaptionSecondaryTextBlockStyle}" Visibility="Collapsed" AutomationProperties.LiveSetting="Polite" />
+                            <PivotItem Header="Advanced">
+                                <StackPanel Spacing="16" Padding="0,8,0,0">
+                                    <Border Style="{StaticResource CardStyle}">
+                                        <StackPanel Spacing="12">
+                                            <TextBlock Text="Recent failures" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
+                                            <TextBlock Text="The data stays on this target device." Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                                <Button Content="Refresh" Click="RefreshFailures_Click" IsEnabled="{x:Bind ViewModel.State.FailuresLoading, Mode=OneWay, Converter={StaticResource InvertBool}}" />
+                                                <Button Content="Copy report" Click="CopyFailureReport_Click" IsEnabled="{x:Bind ViewModel.State.FailuresHasRows, Mode=OneWay}" />
                                             </StackPanel>
-                                        </Border>
 
-                                        <Border Style="{StaticResource CardStyle}">
-                                            <StackPanel Spacing="8">
-                                                <TextBlock Text="Wi-Fi" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
-                                                <TextBlock Text="This prototype does not read the network. No Wi-Fi advice." Style="{StaticResource SecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                                            <StackPanel
+                                                Orientation="Horizontal"
+                                                Spacing="12"
+                                                Visibility="{x:Bind ViewModel.State.FailuresLoading, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
+                                                <muxc:ProgressRing Width="20" Height="20" IsActive="{x:Bind ViewModel.State.FailuresLoading, Mode=OneWay}" AutomationProperties.AccessibilityView="Raw" />
+                                                <TextBlock Text="Loading failures..." Style="{StaticResource SecondaryTextBlockStyle}" AutomationProperties.LiveSetting="Polite" />
                                             </StackPanel>
-                                        </Border>
 
-                                        <Border Style="{StaticResource CardStyle}">
-                                            <StackPanel Spacing="12">
-                                                <TextBlock Text="App details" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
-                                                <StackPanel Spacing="4">
-                                                    <TextBlock Text="App version" Style="{StaticResource CaptionSecondaryTextBlockStyle}" />
-                                                    <TextBlock Text="0.1.0 (prototype)" />
-                                                </StackPanel>
-                                                <StackPanel Spacing="4">
-                                                    <TextBlock Text="Platform" Style="{StaticResource CaptionSecondaryTextBlockStyle}" />
-                                                    <TextBlock Text="Windows 10 or Windows 11. WinUI 2 for UWP." TextWrapping="Wrap" />
-                                                </StackPanel>
-                                                <StackPanel Spacing="4">
-                                                    <TextBlock Text="Mode" Style="{StaticResource CaptionSecondaryTextBlockStyle}" />
-                                                    <TextBlock Text="Demo. Data is simulated." />
-                                                </StackPanel>
-                                                <StackPanel Spacing="4">
-                                                    <TextBlock Text="Status" Style="{StaticResource CaptionSecondaryTextBlockStyle}" />
-                                                    <TextBlock Text="{x:Bind ViewModel.Settings.StatusText, Mode=OneWay}" TextWrapping="Wrap" />
-                                                </StackPanel>
-                                                <StackPanel Spacing="4">
-                                                    <TextBlock Text="Engine" Style="{StaticResource CaptionSecondaryTextBlockStyle}" />
-                                                    <TextBlock Text="{x:Bind ViewModel.Settings.EngineText, Mode=OneWay}" TextWrapping="Wrap" />
-                                                </StackPanel>
-                                                <StackPanel Orientation="Horizontal" Spacing="12" Margin="0,4,0,0">
-                                                    <Button Content="Copy diagnostics" Click="CopyDiagnostics_Click" />
-                                                    <TextBlock x:Name="DiagnosticsCopiedText" Text="" Style="{StaticResource CaptionSecondaryTextBlockStyle}" VerticalAlignment="Center" Visibility="Collapsed" AutomationProperties.LiveSetting="Polite" />
-                                                </StackPanel>
-                                            </StackPanel>
-                                        </Border>
+                                            <TextBlock
+                                                Text="{x:Bind ViewModel.State.FailuresMessage, Mode=OneWay}"
+                                                Style="{StaticResource SecondaryTextBlockStyle}"
+                                                TextWrapping="Wrap"
+                                                AutomationProperties.LiveSetting="Polite"
+                                                Visibility="{x:Bind ViewModel.State.ShowFailuresMessage, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
 
-                                        <Border Style="{StaticResource CardStyle}">
-                                            <StackPanel Spacing="12">
-                                                <TextBlock Text="Demo lab (prototype only)" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
-                                                <TextBlock Text="Select a simulated state. No engine is contacted." Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
-                                                <ComboBox
-                                                    x:Name="ScenarioCombo"
-                                                    Header="Scenario"
-                                                    DisplayMemberPath="Title"
-                                                    ItemsSource="{x:Bind ViewModel.Scenarios}"
-                                                    MinWidth="240"
-                                                    SelectionChanged="ScenarioCombo_SelectionChanged" />
-                                                <TextBlock x:Name="ScenarioDescriptionText" Text="" Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
-                                                <Button Content="Reset demo" Click="ResetDemoButton_Click" />
+                                            <StackPanel
+                                                Spacing="4"
+                                                Visibility="{x:Bind ViewModel.State.FailuresHasRows, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
+                                                <Grid ColumnSpacing="12" Padding="0,4,0,4" AutomationProperties.AccessibilityView="Raw">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="48" />
+                                                        <ColumnDefinition Width="110" />
+                                                        <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="110" />
+                                                        <ColumnDefinition Width="*" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBlock Grid.Column="0" Text="Count" Style="{StaticResource CaptionSecondaryTextBlockStyle}" FontWeight="SemiBold" />
+                                                    <TextBlock Grid.Column="1" Text="Kind" Style="{StaticResource CaptionSecondaryTextBlockStyle}" FontWeight="SemiBold" />
+                                                    <TextBlock Grid.Column="2" Text="Target" Style="{StaticResource CaptionSecondaryTextBlockStyle}" FontWeight="SemiBold" />
+                                                    <TextBlock Grid.Column="3" Text="Stage" Style="{StaticResource CaptionSecondaryTextBlockStyle}" FontWeight="SemiBold" />
+                                                    <TextBlock Grid.Column="4" Text="Reason" Style="{StaticResource CaptionSecondaryTextBlockStyle}" FontWeight="SemiBold" />
+                                                </Grid>
+                                                <ItemsControl ItemsSource="{x:Bind ViewModel.FailureRows, Mode=OneWay}" IsTabStop="False">
+                                                    <ItemsControl.ItemTemplate>
+                                                        <DataTemplate>
+                                                            <Grid ColumnSpacing="12" Padding="0,8,0,8" AutomationProperties.Name="{Binding AccessibilityLabel}">
+                                                                <Grid.ColumnDefinitions>
+                                                                    <ColumnDefinition Width="48" />
+                                                                    <ColumnDefinition Width="110" />
+                                                                    <ColumnDefinition Width="*" />
+                                                                    <ColumnDefinition Width="110" />
+                                                                    <ColumnDefinition Width="*" />
+                                                                </Grid.ColumnDefinitions>
+                                                                <TextBlock Grid.Column="0" Text="{Binding Count}" />
+                                                                <TextBlock Grid.Column="1" Text="{Binding Kind}" TextWrapping="Wrap" />
+                                                                <TextBlock Grid.Column="2" Text="{Binding Target}" TextWrapping="Wrap" IsTextSelectionEnabled="True" />
+                                                                <TextBlock Grid.Column="3" Text="{Binding Stage}" TextWrapping="Wrap" />
+                                                                <TextBlock Grid.Column="4" Text="{Binding Reason}" TextWrapping="Wrap" />
+                                                            </Grid>
+                                                        </DataTemplate>
+                                                    </ItemsControl.ItemTemplate>
+                                                </ItemsControl>
                                             </StackPanel>
-                                        </Border>
+                                            <TextBlock x:Name="ReportCopiedText" Text="" Style="{StaticResource CaptionSecondaryTextBlockStyle}" Visibility="Collapsed" AutomationProperties.LiveSetting="Polite" />
+                                        </StackPanel>
+                                    </Border>
 
-                                        <Border Style="{StaticResource CardStyle}">
-                                            <StackPanel Spacing="8">
-                                                <TextBlock Text="Prototype limits" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
-                                                <TextBlock Text="This is a WinUI 2 user interface prototype. It has no tunnel, no routes, no engine, no network listener, and no credentials. It is not production ready." Style="{StaticResource SecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                                    <Border Style="{StaticResource CardStyle}">
+                                        <StackPanel Spacing="12">
+                                            <TextBlock Text="App details" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
+                                            <StackPanel Spacing="4">
+                                                <TextBlock Text="App version" Style="{StaticResource CaptionSecondaryTextBlockStyle}" />
+                                                <TextBlock x:Name="AppVersionText" Text="" IsTextSelectionEnabled="True" />
                                             </StackPanel>
-                                        </Border>
-                                    </StackPanel>
-                                </PivotItem>
-                            </Pivot>
-                        </StackPanel>
-                    </ScrollViewer>
-                </Grid>
+                                            <StackPanel Spacing="4">
+                                                <TextBlock Text="Windows" Style="{StaticResource CaptionSecondaryTextBlockStyle}" />
+                                                <TextBlock x:Name="WindowsVersionText" Text="" IsTextSelectionEnabled="True" />
+                                            </StackPanel>
+                                            <StackPanel Spacing="4">
+                                                <TextBlock Text="Engine" Style="{StaticResource CaptionSecondaryTextBlockStyle}" />
+                                                <TextBlock Text="{x:Bind ViewModel.State.EngineRoleText, Mode=OneWay}" TextWrapping="Wrap" />
+                                            </StackPanel>
+                                            <StackPanel Spacing="4">
+                                                <TextBlock Text="Status" Style="{StaticResource CaptionSecondaryTextBlockStyle}" />
+                                                <TextBlock Text="{x:Bind ViewModel.State.StatusText, Mode=OneWay}" TextWrapping="Wrap" />
+                                            </StackPanel>
+                                            <StackPanel Orientation="Horizontal" Spacing="12" Margin="0,4,0,0">
+                                                <Button Content="Copy diagnostics" Click="CopyDiagnostics_Click" />
+                                                <TextBlock x:Name="DiagnosticsCopiedText" Text="" Style="{StaticResource CaptionSecondaryTextBlockStyle}" VerticalAlignment="Center" Visibility="Collapsed" AutomationProperties.LiveSetting="Polite" />
+                                            </StackPanel>
+                                            <TextBlock Text="The diagnostics hold counters and timings. They hold no address, token, or key." Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                                        </StackPanel>
+                                    </Border>
+
+                                    <Border Style="{StaticResource CardStyle}" AutomationProperties.Name="Destination privacy">
+                                        <StackPanel Spacing="12">
+                                            <TextBlock Text="Destination privacy" Style="{StaticResource CardTitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
+                                            <TextBlock Text="{x:Bind Privacy.Intro, Mode=OneTime}" Style="{StaticResource SecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                                            <TextBlock Text="{x:Bind Privacy.StorageNote, Mode=OneTime}" Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
+
+                                            <StackPanel Spacing="4">
+                                                <TextBlock Text="Current mode" Style="{StaticResource CaptionSecondaryTextBlockStyle}" />
+                                                <TextBlock Text="{x:Bind Privacy.ModeText, Mode=OneTime}" Style="{StaticResource SubtitleTextBlockStyle}" TextWrapping="Wrap" />
+                                                <TextBlock Text="{x:Bind Privacy.ModeStateText, Mode=OneTime}" Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                                            </StackPanel>
+
+                                            <ItemsControl ItemsSource="{x:Bind Privacy.Modes, Mode=OneTime}" AutomationProperties.Name="Destination privacy modes" IsTabStop="False">
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <StackPanel Spacing="4" Margin="0,4,0,8">
+                                                            <TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextWrapping="Wrap" />
+                                                            <TextBlock Text="{Binding StateText}" Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                                                            <TextBlock Text="{Binding Detail}" Style="{StaticResource SecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                                                        </StackPanel>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+
+                                            <StackPanel Spacing="4">
+                                                <TextBlock Text="What no mode here changes" Style="{StaticResource CaptionSecondaryTextBlockStyle}" FontWeight="SemiBold" />
+                                                <TextBlock Text="{x:Bind Privacy.LimitsText, Mode=OneTime}" Style="{StaticResource SecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                                            </StackPanel>
+
+                                            <ItemsControl ItemsSource="{x:Bind Privacy.Facts, Mode=OneTime}" AutomationProperties.Name="Destination privacy capabilities" IsTabStop="False">
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <StackPanel Spacing="4" Margin="0,4,0,4">
+                                                            <TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextWrapping="Wrap" />
+                                                            <TextBlock Text="{Binding ValueText}" Style="{StaticResource SecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                                                            <TextBlock Text="{Binding Detail}" Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                                                        </StackPanel>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+
+                                            <TextBlock Text="{x:Bind Privacy.FlagsLine, Mode=OneTime}" Style="{StaticResource CaptionSecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                                            <TextBlock Text="{x:Bind Privacy.OutOfScopeNote, Mode=OneTime}" Style="{StaticResource SecondaryTextBlockStyle}" TextWrapping="Wrap" />
+                                        </StackPanel>
+                                    </Border>
+                                </StackPanel>
+                            </PivotItem>
+                        </Pivot>
+                    </StackPanel>
+                </ScrollViewer>
             </Grid>
         </muxc:NavigationView>
     </Grid>

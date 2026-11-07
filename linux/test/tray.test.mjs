@@ -12,6 +12,29 @@ const {
 
 test('the tray state follows the engine status', () => {
   assert.equal(trayState(null, null).label, 'Starting');
+  const unavailable = trayState(null, null, true);
+  assert.equal(unavailable.label, 'Not available');
+  assert.equal(unavailable.startEnabled, false);
+  assert.equal(unavailable.stopEnabled, false);
+  const unknown = trayState({ running: true, paired: true, state: 'unknown' }, { state: 'idle' });
+  assert.equal(unknown.label, 'Not available');
+  assert.equal(unknown.startEnabled, false);
+  assert.equal(unknown.stopEnabled, true);
+  assert.equal(unknown.stopIsAttempt, true);
+  const recoveryMenu = createTrayMenuTemplate({ status: { running: true, state: 'unknown' } });
+  assert.equal(recoveryMenu[3].label, 'Try to turn off');
+  assert.equal(recoveryMenu[3].enabled, true);
+  let attempts = 0;
+  const cleanupMenu = createTrayMenuTemplate({
+    status: { running: true, cleanup_blocked: true },
+    onStop() { attempts += 1; }
+  });
+  assert.equal(cleanupMenu[2].enabled, false);
+  assert.equal(cleanupMenu[3].label, 'Try to turn off');
+  assert.equal(cleanupMenu[3].enabled, true);
+  cleanupMenu[3].click();
+  assert.equal(attempts, 1);
+  assert.equal(trayState({ running: true, state: 'unknown' }, null, true).stopEnabled, false);
   assert.equal(trayState({ running: false, paired: false }, { state: 'idle' }).label, 'Not paired');
   assert.equal(trayState({ running: false, paired: true }, { state: 'idle' }).label, 'Ready');
   assert.equal(trayState({ running: false, paired: true, phone: { state: 'not_trusted' } }, { state: 'idle' }).label, 'Not trusted');
@@ -22,6 +45,33 @@ test('the tray state follows the engine status', () => {
   const demo = trayState({ demo: true, running: false, paired: false }, { state: 'idle' });
   assert.equal(demo.label, 'Not paired (demo)');
   assert.equal(demo.demo, true);
+});
+
+test('the tray requires an explicit running state before offering actions', () => {
+  for (const running of [undefined, null, 'false']) {
+    for (const mode of ['phone', 'direct']) {
+      const view = trayState({ running, paired: true }, { state: 'idle' }, false, mode);
+      assert.equal(view.label, 'Not available');
+      assert.equal(view.startEnabled, false);
+      assert.equal(view.stopEnabled, false);
+    }
+  }
+  const unknownPairing = trayState({ running: false }, { state: 'idle' }, false, 'phone');
+  assert.equal(unknownPairing.label, 'Not available');
+  assert.equal(unknownPairing.startEnabled, false);
+});
+
+test('direct mode is ready without pairing, but unsafe status cannot start', () => {
+  const status = { running: false, paired: false };
+  const idle = { state: 'idle' };
+  const direct = trayState(status, idle, false, 'direct');
+  assert.equal(direct.label, 'Ready');
+  assert.equal(direct.startEnabled, true);
+  assert.equal(trayState(status, idle, false, 'phone').startEnabled, false);
+  assert.equal(trayState(status, { state: 'confirm' }, false, 'direct').startEnabled, false);
+  assert.equal(trayState(status, idle, true, 'direct').startEnabled, false);
+  assert.equal(trayState({ ...status, cleanup_blocked: true }, idle, false, 'direct').startEnabled, false);
+  assert.equal(trayState({ ...status, state: 'unknown' }, idle, false, 'direct').startEnabled, false);
 });
 
 test('Start, Stop, Open, and Quit are the only tray actions', () => {
@@ -60,12 +110,19 @@ test('Start, Stop, Open, and Quit are the only tray actions', () => {
   const demo = createTrayMenuTemplate({ status: { demo: true, running: false, paired: true }, pair: { state: 'idle' } });
   assert.ok(demo.some((item) => item.label === 'Start simulated tunnel'));
   assert.ok(demo.some((item) => item.label === 'Stop simulated tunnel'));
+
+  const unavailable = createTrayMenuTemplate({ unavailable: true });
+  assert.equal(unavailable[0].label, 'HotspotShade. Not available');
+  assert.equal(unavailable.find((item) => item.label === 'Start tunnel').enabled, false);
+  assert.equal(unavailable.find((item) => item.label === 'Stop tunnel').enabled, false);
 });
 
 test('the tray uses the local icon and updates the tooltip and menu', () => {
   const events = [];
+  let trayInstance;
   class FakeTray {
     constructor(image) {
+      trayInstance = this;
       this.image = image;
       this.tooltip = '';
       this.menu = null;
@@ -103,20 +160,31 @@ test('the tray uses the local icon and updates the tooltip and menu', () => {
     }
   };
   let opened = 0;
+  let started = 0;
+  let tunnelMode = 'direct';
   const tray = createTray({
     Tray: FakeTray,
     Menu,
     nativeImage,
     iconPath: '/tmp/icon.png',
     onOpen() { opened += 1; },
-    onStart() {},
+    getTunnelMode() { return tunnelMode; },
+    onStart() { started += 1; },
     onStop() {},
     onQuit() {}
   });
   assert.equal(tray.available, true);
   assert.equal(tray.state().label, 'Starting');
+  tray.update({ status: { running: false, paired: false }, pair: { state: 'idle' } });
+  assert.equal(tray.state().startEnabled, true);
+  // A stale menu must not start phone mode after the setting changes.
+  tunnelMode = 'phone';
+  trayInstance.menu.template.find((item) => item.label === 'Start tunnel').click();
+  assert.equal(started, 0);
   tray.update({ status: { running: true, paired: true }, pair: { state: 'idle' } });
   assert.equal(tray.state().label, 'Tunnel on');
+  tray.update({ status: null, pair: null, unavailable: true });
+  assert.equal(tray.state().label, 'Not available');
   tray.destroy();
   assert.deepEqual(events, ['destroy']);
   assert.equal(opened, 0);

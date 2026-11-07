@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <RootNamespace>HotspotShade.WinUI2.Broker</RootNamespace>
+    <AssemblyName>HotspotShade.WinUI2.Broker</AssemblyName>
+    <LangVersion>7.3</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Deterministic>true</Deterministic>
+    <Platforms>AnyCPU;x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <UseWPF>false</UseWPF>
+    <UseWindowsForms>false</UseWindowsForms>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- The reviewed loopback client and listener-owner check from the
+         console launcher. One copy of the code serves both programs. -->
+    <Compile Include="..\HotspotShade.WinUI2.TestLauncher\LauncherHttp.cs" Link="Shared\LauncherHttp.cs" />
+    <Compile Include="..\HotspotShade.WinUI2.TestLauncher\ListenerTable.cs" Link="Shared\ListenerTable.cs" />
+    <Compile Include="..\HotspotShade.WinUI2.TestLauncher\LauncherRules.cs" Link="Shared\LauncherRules.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\HotspotShade.WinUI2.Core\HotspotShade.WinUI2.Core.csproj" />
+  </ItemGroup>
+</Project>

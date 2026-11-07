@@ -75,6 +75,34 @@ class SourceSocksCapacityTest {
     }
 
     @Test
+    fun workerLimitAddsOnePumpPerRelayAndTheEvictionOverlap() {
+        assertEquals(546, SourceSocksCapacity.workerLimit())
+        assertEquals(
+            SourceSocksCapacity.MAXIMUM_SESSIONS +
+                SourceSocksCapacity.MAXIMUM_RELAYS +
+                SourceSocksCapacity.WORKER_EVICTION_OVERLAP,
+            SourceSocksCapacity.workerLimit(),
+        )
+        val limits = SourceSocksCapacity.limitsForFileLimit(1_024)
+        assertEquals(209, SourceSocksCapacity.workerLimit(limits.total, limits.relay))
+        // A single relay still needs its session worker and one pump worker.
+        assertEquals(4, SourceSocksCapacity.workerLimit(sessions = 1, relays = 1))
+    }
+
+    @Test
+    fun resolverConcurrencyStaysBounded() {
+        assertEquals(8, SourceSocksCapacity.MAXIMUM_RESOLVER_THREADS)
+        assertEquals(8, SourceSocksCapacity.MAXIMUM_RESOLVER_QUEUE)
+        assertEquals(8, SourceSocksCapacity.resolverThreads(288))
+        assertEquals(2, SourceSocksCapacity.resolverThreads(2))
+        assertEquals(0, SourceSocksCapacity.resolverThreads(0))
+        assertEquals(8, SourceSocksCapacity.resolverQueue(288))
+        assertEquals(2, SourceSocksCapacity.resolverQueue(2))
+        assertEquals(0, SourceSocksCapacity.resolverQueue(0))
+        assertEquals(2, SourceSocksCapacity.WORKER_EVICTION_OVERLAP)
+    }
+
+    @Test
     fun fileLimitLimitMatchesTheCapacityWarning() {
         val limits = SourceSocksCapacity.limitsForFileLimit(1_024)
         assertEquals(110, limits.total)

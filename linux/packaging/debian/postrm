@@ -1,0 +1,92 @@
+#!/bin/sh
+# HotspotShade postrm. On purge it removes the root-only state directory
+# /var/lib/hotspotshade: the engine identity key, the trust list, and the
+# helper's lock and state records. Plain remove keeps it, so a reinstall keeps
+# its pairing.
+#
+# It never touches user settings or the autostart entry. Those live in each
+# user's home directory.
+#
+# Purge normally follows a prerm that proved no helper or engine was running.
+# The check is repeated because prerm can be skipped (for example with
+# dpkg --force-remove-reinstreq). If the helper still holds its lock, or an
+# engine record from this boot remains, the directory is kept and this script
+# says why. A postrm that fails would leave the package half-purged, so it
+# warns and exits 0 instead.
+#
+# The assignments below are plain on purpose, with no environment override: the
+# packaging test rewrites these exact lines to point at a temporary directory.
+set -e
+
+STATE_DIR=/var/lib/hotspotshade
+BOOT_ID_FILE=/proc/sys/kernel/random/boot_id
+
+LOCK_FILE="$STATE_DIR/helper.lock"
+STATE_FILE="$STATE_DIR/engine.state"
+
+if [ "${1:-}" != "purge" ]; then
+  exit 0
+fi
+
+if [ -L "$STATE_DIR" ]; then
+  echo "hotspotshade: $STATE_DIR is a symbolic link; it was not removed." >&2
+  exit 0
+fi
+if [ ! -e "$STATE_DIR" ]; then
+  exit 0
+fi
+
+keep_reason=""
+if [ -L "$LOCK_FILE" ]; then
+  keep_reason="the helper lock path is a symbolic link"
+elif [ -e "$LOCK_FILE" ] && [ ! -f "$LOCK_FILE" ]; then
+  keep_reason="the helper lock path is not a regular file"
+elif [ -e "$LOCK_FILE" ]; then
+  if ! command -v flock > /dev/null 2>&1; then
+    keep_reason="the flock command is missing, so the helper lock cannot be checked"
+  else
+    status=0
+    flock -n -s -E 99 "$LOCK_FILE" true > /dev/null 2>&1 || status=$?
+    case "$status" in
+      0) ;;
+      99) keep_reason="the privileged helper is still running" ;;
+      *) keep_reason="the helper lock could not be checked (flock exit $status)" ;;
+    esac
+  fi
+fi
+if [ -z "$keep_reason" ]; then
+  if [ -L "$STATE_FILE" ]; then
+    keep_reason="the engine state path is a symbolic link"
+  elif [ -e "$STATE_FILE" ]; then
+    header=""
+    recorded_boot=""
+    if [ -f "$STATE_FILE" ]; then
+      state_text=$(head -c 4096 "$STATE_FILE" 2> /dev/null || true)
+      header=$(printf '%s\n' "$state_text" | sed -n '1p')
+      recorded_boot=$(printf '%s\n' "$state_text" | sed -n '2s/^BOOT //p')
+    fi
+    current_boot=$(head -c 64 "$BOOT_ID_FILE" 2> /dev/null | tr -d '\n' || true)
+    if [ "$header" = "HS_ENGINE 2" ] && [ "${#recorded_boot}" -eq 36 ] && [ "${#current_boot}" -eq 36 ] \
+      && [ "$recorded_boot" != "$current_boot" ]; then
+      :
+    else
+      keep_reason="an engine state record from this boot remains, so an engine may still own routes"
+    fi
+  fi
+fi
+
+if [ -n "$keep_reason" ]; then
+  {
+    echo "hotspotshade: $STATE_DIR was kept: $keep_reason."
+    echo "Check for a running engine and for HotspotShade routes (pgrep -af hotspotshade;"
+    echo "ip rule show; ip route show table all). When nothing remains, delete the"
+    echo "directory yourself:  sudo rm -rf $STATE_DIR"
+  } >&2
+  exit 0
+fi
+
+# A failed removal must not leave the package half-purged.
+if ! rm -rf "$STATE_DIR"; then
+  echo "hotspotshade: $STATE_DIR could not be fully removed; delete it yourself:  sudo rm -rf $STATE_DIR" >&2
+fi
+exit 0

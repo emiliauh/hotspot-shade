@@ -1,0 +1,133 @@
+#!/bin/sh
+# HotspotShade prerm. Refuses to remove or upgrade the package while the root
+# helper or its engine may still be running.
+#
+# The engine owns the tunnel routes. Removing the package under it would delete
+# the helper and the engine files while their routes stay in the routing table
+# until the app quits. This script never signals, kills, or stops a root tunnel:
+# stopping it is the person's decision, through the app or an administrator.
+#
+# Two facts block the change:
+#   1. The helper holds a root-only flock on helper.lock for its whole life.
+#   2. engine.state holds a write-ahead record of the helper or engine. A record
+#      from this boot with no live helper is uncertain: the helper cannot prove
+#      that the engine is gone, and it refuses to start over it for the same
+#      reason. A record from an earlier boot cannot name a live process, so it
+#      does not block.
+#
+# User settings and the autostart entry are not touched.
+#
+# The three assignments below are the only paths. They are plain assignments
+# on purpose, with no environment override: the packaging test rewrites these
+# exact lines to point at a temporary directory.
+set -e
+
+STATE_DIR=/var/lib/hotspotshade
+BOOT_ID_FILE=/proc/sys/kernel/random/boot_id
+ENGINE_PATH=/opt/hotspotshade/resources/engine/hotspotshade
+
+LOCK_FILE="$STATE_DIR/helper.lock"
+STATE_FILE="$STATE_DIR/engine.state"
+
+action=${1:-}
+case "$action" in
+  # failed-upgrade is included on purpose. If the old prerm refused an upgrade,
+  # dpkg runs the new prerm with failed-upgrade, and a success there would let
+  # the upgrade continue.
+  remove | upgrade | deconfigure | failed-upgrade) ;;
+  *) exit 0 ;;
+esac
+
+case "$action" in
+  upgrade | failed-upgrade) verb=upgrade ;;
+  *) verb=remove ;;
+esac
+
+# Prints OK when the package may change, or one reason when it must not. The
+# caller treats anything but exactly OK as a refusal, so a check that dies half
+# way (set -e is still active inside the command substitution) or prints
+# nothing can never allow the change.
+check_package() {
+  if [ -L "$STATE_DIR" ]; then
+    echo "the helper state directory is a symbolic link, so it cannot be checked safely"
+    return 0
+  fi
+  if [ -L "$LOCK_FILE" ]; then
+    echo "the helper lock path is a symbolic link, so it cannot be checked safely"
+    return 0
+  fi
+  if [ -e "$LOCK_FILE" ]; then
+    # The helper requires a regular file. Opening a FIFO would hang dpkg.
+    if [ ! -f "$LOCK_FILE" ]; then
+      echo "the helper lock path is not a regular file, so it cannot be checked safely"
+      return 0
+    fi
+    if ! command -v flock > /dev/null 2>&1; then
+      echo "the flock command is missing, so the helper lock cannot be checked"
+      return 0
+    fi
+    # Shared and non-blocking: it fails only while the helper holds its
+    # exclusive lock. The code 99 separates "held" from any other flock error.
+    status=0
+    flock -n -s -E 99 "$LOCK_FILE" true > /dev/null 2>&1 || status=$?
+    case "$status" in
+      0) ;;
+      99)
+        echo "the privileged helper is running (it holds $LOCK_FILE)"
+        return 0
+        ;;
+      *)
+        echo "the helper lock could not be checked (flock exit $status)"
+        return 0
+        ;;
+    esac
+  fi
+  if [ -L "$STATE_FILE" ]; then
+    echo "the engine state path is a symbolic link, so it cannot be checked safely"
+    return 0
+  fi
+  if [ -e "$STATE_FILE" ]; then
+    header=""
+    recorded_boot=""
+    if [ -f "$STATE_FILE" ]; then
+      state_text=$(head -c 4096 "$STATE_FILE" 2> /dev/null || true)
+      header=$(printf '%s\n' "$state_text" | sed -n '1p')
+      recorded_boot=$(printf '%s\n' "$state_text" | sed -n '2s/^BOOT //p')
+    fi
+    current_boot=$(head -c 64 "$BOOT_ID_FILE" 2> /dev/null | tr -d '\n' || true)
+    if [ "$header" = "HS_ENGINE 2" ] && [ "${#recorded_boot}" -eq 36 ] && [ "${#current_boot}" -eq 36 ] \
+      && [ "$recorded_boot" != "$current_boot" ]; then
+      echo OK
+      return 0
+    fi
+    echo "an engine state record is present ($STATE_FILE) and cannot be shown to be from an earlier boot"
+    return 0
+  fi
+  echo OK
+  return 0
+}
+
+result=$(check_package) || result="the safety check itself failed, so it cannot be trusted"
+if [ "$result" = "OK" ]; then
+  exit 0
+fi
+reason=${result:-the safety check gave no answer}
+
+{
+  echo "hotspotshade: refusing to $verb the package: $reason."
+  echo
+  echo "The helper and the engine may still own tunnel routes. This script never"
+  echo "stops a root tunnel. To recover:"
+  echo "  1. Quit HotspotShade. It stops the tunnel and removes its routes. Wait up"
+  echo "     to a minute for the helper to exit."
+  echo "  2. Check that no engine remains:"
+  echo "       pgrep -af $ENGINE_PATH"
+  echo "  3. Check that no HotspotShade routes remain:"
+  echo "       ip rule show; ip route show table all; ip -6 route show table all"
+  echo "  4. If the helper exited and nothing remains, the leftover record is stale."
+  echo "     Remove it, then run the same apt or dpkg command again:"
+  echo "       sudo rm $STATE_FILE"
+  echo "If an engine is stuck, ask an administrator to send it SIGTERM. Do not use"
+  echo "SIGKILL: it skips the route cleanup. A reboot also clears the routes."
+} >&2
+exit 1

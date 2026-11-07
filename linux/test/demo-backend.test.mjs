@@ -29,7 +29,7 @@ function pairedBackend() {
 
 function runningBackend() {
   const value = pairedBackend();
-  value.backend.start({ ping: true });
+  value.backend.start({ mode: 'phone', ping: true });
   value.clock.now += 901;
   value.backend.status();
   return value;
@@ -78,9 +78,43 @@ test('a canceled pairing returns to idle', () => {
   assert.equal(backend.status().paired, false);
 });
 
+test('direct mode starts without a source device and reports the tun mode', () => {
+  const { backend, clock } = backendAt();
+  const started = backend.start({ mode: 'direct', ping: true });
+  assert.equal(started.running, false);
+  clock.now += 900;
+  const status = backend.status();
+  assert.equal(status.running, true);
+  assert.equal(status.mode, 'tun');
+  assert.equal(status.paired, false);
+  assert.equal(status.icmp_enabled, false);
+  assert.equal(status.phone.connections, null);
+  assert.equal(status.phone.state, 'unpaired');
+
+  const stopping = backend.stop();
+  assert.equal(stopping.running, true);
+  clock.now += 600;
+  const stopped = backend.status();
+  assert.equal(stopped.running, false);
+  assert.equal(stopped.mode, null);
+  assert.equal(stopped.paired, false);
+});
+
+test('a direct start is refused while the tunnel is already on', () => {
+  const { backend, clock } = backendAt();
+  backend.start({ mode: 'direct', ping: false });
+  clock.now += 900;
+  backend.status();
+  assert.throws(() => backend.start({ mode: 'direct', ping: false }), (error) => {
+    assert.equal(error.code, 'already_running');
+    return true;
+  });
+  assert.equal(backend.status().mode, 'tun');
+});
+
 test('the demo start and stop use a bounded operation window', () => {
   const { backend, clock } = pairedBackend();
-  const started = backend.start({ ping: true });
+  const started = backend.start({ mode: 'phone', ping: true });
   assert.equal(started.running, false);
   clock.now += 899;
   assert.equal(backend.status().running, false);
@@ -104,7 +138,7 @@ test('the demo start and stop use a bounded operation window', () => {
 
 test('the start refuses an unpaired source device', () => {
   const { backend } = backendAt();
-  assert.throws(() => backend.start({ ping: true }), (error) => {
+  assert.throws(() => backend.start({ mode: 'phone', ping: true }), (error) => {
     assert.equal(error instanceof BackendError, true);
     assert.equal(error.code, 'not_ready');
     return true;

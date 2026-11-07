@@ -259,6 +259,68 @@
       return (probe.capabilities) || (probe.platform && probe.platform.capabilities) || p.capabilities || {};
     }
 
+    // The destination-privacy schema. The engine defines these names in
+    // rust/src/diagnostics.rs. The page never invents a state: it echoes a
+    // token from the backend or reports that the backend did not report one.
+    var PRIVACY_MODES = ['off', 'shape', 'hide', 'cover'];
+    var PRIVACY_STATES = ['supported', 'unsupported', 'unavailable', 'unverified'];
+
+    function privacyState(value, allowed) {
+      if (typeof value !== 'string') return '';
+      var token = value.toLowerCase();
+      return allowed.indexOf(token) >= 0 ? token : '';
+    }
+
+    function destinationPrivacy() {
+      var p = platformInfo();
+      if (!p || !p.destination_privacy || typeof p.destination_privacy !== 'object' ||
+          Array.isArray(p.destination_privacy)) {
+        return null;
+      }
+      return p.destination_privacy;
+    }
+
+    // One honest row for the health panel. It states the mode in effect and
+    // the capability tokens the backend reported. It makes no claim beyond
+    // those tokens. A backend that reports no row gets no row here.
+    function destinationPrivacyRow(privacy) {
+      if (!privacy) return null;
+      var mode = privacyState(privacy.mode, PRIVACY_MODES);
+      if (!mode) {
+        return {
+          name: 'Destination privacy',
+          detail: 'The backend reported no mode from the schema.',
+          state: 'fail',
+          badge: 'Unknown'
+        };
+      }
+      var sni = privacyState(privacy.sni_override, PRIVACY_STATES) || 'not reported';
+      var ech = privacyState(privacy.ech, PRIVACY_STATES) || 'not reported';
+      var modes = privacy.modes && typeof privacy.modes === 'object' &&
+        !Array.isArray(privacy.modes) ? privacy.modes : {};
+      if (mode !== 'off' && privacyState(modes[mode], PRIVACY_STATES) !== 'supported') {
+        return {
+          name: 'Destination privacy',
+          detail: 'The backend reported a mode without a supported capability. SNI override ' +
+            sni + ', ECH ' + ech + '.',
+          state: 'fail',
+          badge: 'Unknown'
+        };
+      }
+      var meaning = {
+        off: 'Off. This app does not add destination-name privacy.',
+        shape: 'Shape reported. Re-framing does not conceal names.',
+        hide: 'Hide reported. Check the ECH capability.',
+        cover: 'Cover reported. Check endpoint configuration.'
+      }[mode];
+      return {
+        name: 'Destination privacy',
+        detail: meaning + ' SNI override ' + sni + ', ECH ' + ech + '.',
+        state: 'warn',
+        badge: mode.charAt(0).toUpperCase() + mode.slice(1)
+      };
+    }
+
     function resolveMode(mode) {
       if (mode !== 'auto') return mode;
       var p = platformInfo();
@@ -369,7 +431,8 @@
 
       var running = !!status.running;
       var mode = status.mode || null;
-      var error = state.actionError || (status.error ? String(status.error) : '');
+      var error = state.actionError || (status.error ? String(status.error) : '') ||
+        (status.state === 'unknown' ? 'The service state is unavailable. Inspect the tunnel before restarting.' : '');
       var platform = status.platform || {};
       var iface = platform.default_iface || detectedIface() || '';
       var selected = running && mode ? mode : resolveMode(state.config.mode);
@@ -525,10 +588,10 @@
       ]);
 
       if (running) {
-        dom.metricTcpLabel.textContent = mode === 'socks5' ? 'Open sockets' : 'TCP flows';
+        dom.metricTcpLabel.textContent = mode === 'socks5' ? 'Sockets created' : 'TCP flows started';
         dom.metricTcp.textContent = hasStat(['tcp_flows', 'tcp', 'flows', 'active_flows', 'tcp_active', 'outer_sockets']) ? formatInt(tcp) : 'n/a';
         dom.metricTcpSub.textContent = mode === 'socks5'
-          ? 'SOCKS5 egress sockets'
+          ? 'SOCKS5 egress sockets created'
           : (hasStat(['udp_flows', 'udp', 'udp_active']) ? formatInt(udp) + ' UDP flow' + (Math.round(udp) === 1 ? '' : 's') : 'UDP flow count unavailable.');
 
         if (packetsKnown) {
@@ -551,7 +614,7 @@
         dom.metricTtl.textContent = ttlKnown ? formatInt(ttlBad) : 'n/a';
         dom.metricTtlSub.textContent = !ttlKnown ? 'Audit data unavailable.' : (ttlBad > 0 ? 'Dropped and counted.' : 'None detected.');
       } else {
-        dom.metricTcpLabel.textContent = 'TCP flows';
+        dom.metricTcpLabel.textContent = 'TCP flows started';
         dom.metricTcp.textContent = '0';
         dom.metricTcpSub.textContent = 'No activity';
         dom.metricPackets.textContent = '0';
@@ -791,6 +854,8 @@
       var queues = data.queues && typeof data.queues === 'object' ? data.queues : {};
       var udp = data.udp && typeof data.udp === 'object' ? data.udp : {};
       var tcp = data.tcp && typeof data.tcp === 'object' ? data.tcp : {};
+      var privacy = data.destination_privacy && typeof data.destination_privacy === 'object' ? data.destination_privacy : {};
+      var privacyCounters = privacy.counters && typeof privacy.counters === 'object' ? privacy.counters : {};
       var established = data.established && typeof data.established === 'object' ? data.established : {};
       var failures = data.failures && typeof data.failures === 'object' ? data.failures : {};
       var input = Array.isArray(queues.input) ? queues.input : [];
@@ -818,9 +883,20 @@
       lines.push(queueText('Output queue', queues.output));
       lines.push('UDP flows: ' + plainInt(pickNumber(udp, 'flows')) +
         ', age drops: ' + plainInt(pickNumber(udp, 'age_drops')));
+      lines.push('Target TCP flows active: ' +
+        (typeof tcp.flows_active === 'number' && isFinite(tcp.flows_active) && tcp.flows_active >= 0
+          ? plainInt(tcp.flows_active) : 'not reported'));
       lines.push('TCP flows peak: ' + plainInt(pickNumber(tcp, 'flows_peak')) +
         ', retransmits: ' + plainInt(pickNumber(tcp, 'retransmits')) +
         ', zero window: ' + plainInt(pickNumber(tcp, 'zero_window_ms')) + ' ms');
+      lines.push('Destination privacy: mode ' + (privacyState(privacy.mode, PRIVACY_MODES) || 'not reported') +
+        '. Shaped flows ' + plainInt(pickNumber(privacyCounters, 'shaped_flows')) +
+        ', ECH attempts ' + plainInt(pickNumber(privacyCounters, 'ech_attempts')) +
+        ' (ok ' + plainInt(pickNumber(privacyCounters, 'ech_ok')) +
+        ', rejected ' + plainInt(pickNumber(privacyCounters, 'ech_rejected')) +
+        ', fallback ' + plainInt(pickNumber(privacyCounters, 'ech_fallback')) + ')' +
+        ', DoH lookups ' + plainInt(pickNumber(privacyCounters, 'doh_lookups')) +
+        ' (failed ' + plainInt(pickNumber(privacyCounters, 'doh_failed')) + ')');
       var observed = estBuckets.filter(function (bucket) { return bucket && bucket.observed; }).length;
       if (!estBuckets.length) {
         lines.push('Established: no observation.');
@@ -883,7 +959,7 @@
       var admin = platform.admin === true || probe.admin === true;
       var iface = platform.default_iface || probe.default_iface || '';
       var probeFailed = state.probeLoaded && probe.available === false;
-      var key = JSON.stringify([probe.error || '', probe.available, cap, admin, iface, osName, platform.arch || '']);
+      var key = JSON.stringify([probe.error || '', probe.available, cap, admin, iface, osName, platform.arch || '', destinationPrivacy()]);
       if (!force && key === state.healthKey) return;
       state.healthKey = key;
 
@@ -930,6 +1006,9 @@
       rows.push(iface
         ? { name: 'Default interface', detail: iface, state: 'ok', badge: 'Detected' }
         : { name: 'Default interface', detail: 'No default IPv4 interface.', state: 'fail', badge: 'Missing' });
+
+      var privacyRow = destinationPrivacyRow(destinationPrivacy());
+      if (privacyRow) rows.push(privacyRow);
 
       var failures = rows.filter(function (r) { return r.state === 'fail'; }).length;
       var warnings = rows.filter(function (r) { return r.state === 'warn'; }).length;
@@ -1331,15 +1410,15 @@
       var forgetText = forget.state === 'pending'
         ? 'Forgetting...'
         : forget.state === 'confirmed'
-          ? 'Forgotten. The source device removed this target device.'
+          ? 'Could not confirm that the source device removed this pairing. This target device forgot the pairing, but the source device may still trust it.'
           : forget.state === 'not_delivered'
-            ? 'The source device did not answer. This target device forgot the pairing, but the source device may still trust it.'
+            ? 'Could not confirm that the source device removed this pairing. This target device forgot the pairing, but the source device may still trust it.'
             : '';
       var pill;
       if (view.state === 'connecting') pill = ['Connecting', 'pill-muted'];
       else if (view.state === 'confirm') pill = ['Waiting for the source device', 'pill-warn'];
       else if (forget.state === 'pending') pill = ['Forgetting', 'pill-warn'];
-      else if (forget.state === 'confirmed') pill = ['Forgotten', 'pill-muted'];
+      else if (forget.state === 'confirmed') pill = ['Forget not confirmed', 'pill-warn'];
       else if (forget.state === 'not_delivered') pill = ['Forget not confirmed', 'pill-warn'];
       else if (view.state === 'failed' && !paired) pill = ['Not paired', 'pill-danger'];
       else if (phone.state === 'not_trusted' || phone.state === 'unpaired') pill = ['Not paired', 'pill-warn'];

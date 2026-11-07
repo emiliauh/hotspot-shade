@@ -5,19 +5,35 @@
 //! request. Credentials travel only in framed messages over that connection.
 //! The caller owns authorization, signal handling, and service implementation.
 #![cfg(unix)]
-use serde_json::{json, Value};
-use std::fs::{self, File};
+#[cfg(any(target_os = "macos", test))]
+use serde_json::json;
+use serde_json::Value;
+#[cfg(any(target_os = "macos", test))]
+use std::fs;
+#[cfg(test)]
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+#[cfg(test)]
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
+#[cfg(any(target_os = "macos", test))]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(test)]
+use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
+#[cfg(any(target_os = "macos", test))]
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+#[cfg(any(target_os = "macos", test))]
+use std::sync::{atomic::Ordering, Arc};
+#[cfg(any(target_os = "macos", test))]
 use std::thread;
-use std::time::{Duration, Instant};
+#[cfg(any(target_os = "macos", test))]
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 pub const MAX_MESSAGE: usize = 262_144;
 
@@ -98,12 +114,635 @@ pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub use macos_helper::{
+    macos_peer_identity, macos_requirement, macos_signing_flags_ok, root_helper_metadata_ok,
+    verify_macos_peer, verify_macos_root_helper_install, verify_macos_static_code, MacCallerPolicy,
+    MacPeerIdentity,
+};
+
+/// macOS peer identity and code signing checks for a root helper.
+///
+/// A Unix socket peer UID alone is not a trust boundary. Every process of the
+/// same user can connect. The protected path uses the peer audit token,
+/// `SecCodeCopyGuestWithAttributes`, and a Developer ID requirement. An
+/// ad-hoc, user-owned, or differently signed call starts no service.
+#[cfg(target_os = "macos")]
+mod macos_helper {
+    use super::*;
+    use std::ffi::{c_char, c_int, c_void, CStr, CString};
+    use std::os::unix::ffi::OsStrExt;
+    use std::ptr;
+
+    type CFAllocatorRef = *const c_void;
+    type CFDataRef = *const c_void;
+    type CFDictionaryRef = *const c_void;
+    type CFIndex = isize;
+    type CFStringRef = *const c_void;
+    type CFTypeRef = *const c_void;
+    type CFURLRef = *const c_void;
+    type SecCodeRef = *const c_void;
+    type SecRequirementRef = *const c_void;
+    type SecStaticCodeRef = *const c_void;
+
+    // The dictionary uses the standard CF callbacks. With null callbacks the
+    // dictionary does not retain the audit token data, and the Security call
+    // would read freed memory after this function returns.
+    #[repr(C)]
+    struct CFDictionaryKeyCallBacks {
+        version: CFIndex,
+        retain: Option<unsafe extern "C" fn(CFAllocatorRef, *const c_void) -> *const c_void>,
+        release: Option<unsafe extern "C" fn(CFAllocatorRef, *const c_void)>,
+        copy_description: Option<unsafe extern "C" fn(*const c_void) -> CFStringRef>,
+        equal: Option<unsafe extern "C" fn(*const c_void, *const c_void) -> u8>,
+        hash: Option<unsafe extern "C" fn(*const c_void) -> usize>,
+    }
+    #[repr(C)]
+    struct CFDictionaryValueCallBacks {
+        version: CFIndex,
+        retain: Option<unsafe extern "C" fn(CFAllocatorRef, *const c_void) -> *const c_void>,
+        release: Option<unsafe extern "C" fn(CFAllocatorRef, *const c_void)>,
+        copy_description: Option<unsafe extern "C" fn(*const c_void) -> CFStringRef>,
+    }
+
+    const LOCAL_PEERPID: c_int = 0x002;
+    const LOCAL_PEERTOKEN: c_int = 0x006;
+    const SOL_LOCAL: c_int = 0;
+    const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    const SEC_CS_SIGNING_INFORMATION: u32 = 1 << 1;
+    // Static code signing flags. A Developer ID build uses the hardened
+    // runtime. A development build usually lacks it and often carries
+    // get-task-allow.
+    const CS_ADHOC: u32 = 0x0000_0002;
+    const CS_RUNTIME: u32 = 0x0001_0000;
+    const DEVELOPER_ID_INTERMEDIATE: &str = "1.2.840.113635.100.6.2.6";
+    const DEVELOPER_ID_APPLICATION: &str = "1.2.840.113635.100.6.1.13";
+
+    // ACL constants from <sys/acl.h>. The Rust libc crate has no ACL
+    // bindings, so declare the small surface used by the install check.
+    const ACL_TYPE_EXTENDED: u32 = 0x0000_0100;
+    const ACL_FIRST_ENTRY: c_int = 0;
+    const ACL_NEXT_ENTRY: c_int = -1;
+    const ACL_EXTENDED_ALLOW: u32 = 1;
+    const ACL_WRITE_DATA: u32 = 1 << 2;
+    const ACL_DELETE: u32 = 1 << 4;
+    const ACL_APPEND_DATA: u32 = 1 << 5;
+    const ACL_DELETE_CHILD: u32 = 1 << 6;
+    const ACL_WRITE_ATTRIBUTES: u32 = 1 << 8;
+    const ACL_WRITE_EXTATTRIBUTES: u32 = 1 << 10;
+    const ACL_WRITE_SECURITY: u32 = 1 << 12;
+    const ACL_CHANGE_OWNER: u32 = 1 << 13;
+    const K_CF_NUMBER_SINT64_TYPE: c_int = 4;
+
+    #[link(name = "System")]
+    extern "C" {
+        fn acl_get_file(path: *const c_char, acl_type: u32) -> *mut c_void;
+        fn acl_free(object: *mut c_void) -> c_int;
+        fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
+        fn acl_get_tag_type(entry: *mut c_void, tag: *mut u32) -> c_int;
+        fn acl_get_permset(entry: *mut c_void, permset: *mut *mut c_void) -> c_int;
+        fn acl_get_perm_np(permset: *mut c_void, perm: u32) -> c_int;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFDataCreate(allocator: CFAllocatorRef, bytes: *const u8, length: CFIndex) -> CFDataRef;
+        fn CFDictionaryCreate(
+            allocator: CFAllocatorRef,
+            keys: *const CFTypeRef,
+            values: *const CFTypeRef,
+            num_values: CFIndex,
+            key_callbacks: *const c_void,
+            value_callbacks: *const c_void,
+        ) -> CFDictionaryRef;
+        fn CFStringCreateWithCString(
+            allocator: CFAllocatorRef,
+            c_str: *const c_char,
+            encoding: u32,
+        ) -> CFStringRef;
+        fn CFStringGetCString(
+            string: CFStringRef,
+            buffer: *mut c_char,
+            buffer_size: CFIndex,
+            encoding: u32,
+        ) -> u8;
+        fn CFDictionaryGetValue(dict: CFDictionaryRef, key: *const c_void) -> *const c_void;
+        fn CFURLCreateFromFileSystemRepresentation(
+            allocator: CFAllocatorRef,
+            buffer: *const u8,
+            buffer_length: CFIndex,
+            is_directory: u8,
+        ) -> CFURLRef;
+        static kCFTypeDictionaryKeyCallBacks: CFDictionaryKeyCallBacks;
+        static kCFTypeDictionaryValueCallBacks: CFDictionaryValueCallBacks;
+        fn CFRelease(value: CFTypeRef);
+    }
+
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        static kSecGuestAttributeAudit: CFStringRef;
+        static kSecCodeInfoIdentifier: CFStringRef;
+        static kSecCodeInfoTeamIdentifier: CFStringRef;
+        static kSecCodeInfoFlags: CFStringRef;
+        fn SecRequirementCreateWithString(
+            text: CFStringRef,
+            flags: u32,
+            requirement: *mut SecRequirementRef,
+        ) -> i32;
+        fn SecCodeCopyGuestWithAttributes(
+            host: SecCodeRef,
+            attributes: CFDictionaryRef,
+            flags: u32,
+            guest: *mut SecCodeRef,
+        ) -> i32;
+        fn SecCodeCheckValidity(
+            code: SecCodeRef,
+            flags: u32,
+            requirement: SecRequirementRef,
+        ) -> i32;
+        fn SecStaticCodeCreateWithPath(
+            path: CFURLRef,
+            flags: u32,
+            code: *mut SecStaticCodeRef,
+        ) -> i32;
+        fn SecStaticCodeCheckValidity(
+            code: SecStaticCodeRef,
+            flags: u32,
+            requirement: SecRequirementRef,
+        ) -> i32;
+        fn SecCodeCopySigningInformation(
+            code: SecStaticCodeRef,
+            flags: u32,
+            information: *mut CFDictionaryRef,
+        ) -> i32;
+        fn CFNumberGetValue(number: CFTypeRef, the_type: c_int, value: *mut c_void) -> u8;
+    }
+
+    struct CfRelease(*const c_void);
+    impl Drop for CfRelease {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CFRelease(self.0) };
+            }
+        }
+    }
+
+    struct AclFree(*mut c_void);
+    impl Drop for AclFree {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    acl_free(self.0);
+                }
+            }
+        }
+    }
+
+    fn denied(message: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::PermissionDenied, message)
+    }
+
+    fn valid_identifier(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 255
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    }
+
+    fn valid_team(value: &str) -> bool {
+        value.len() == 10 && value.bytes().all(|b| b.is_ascii_alphanumeric())
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct MacPeerIdentity {
+        pub uid: u32,
+        pub pid: i32,
+        pub audit_token: [u8; 32],
+    }
+
+    /// Read the peer UID, PID, and audit token from the kernel. The token is
+    /// never read from a message or a file.
+    pub fn macos_peer_identity(stream: &UnixStream) -> io::Result<MacPeerIdentity> {
+        let uid = peer_uid(stream)?;
+        let fd = stream.as_raw_fd();
+        let mut pid: libc::pid_t = 0;
+        let mut pid_len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                SOL_LOCAL,
+                LOCAL_PEERPID,
+                &mut pid as *mut _ as *mut c_void,
+                &mut pid_len,
+            )
+        };
+        if rc != 0 || pid_len as usize != std::mem::size_of::<libc::pid_t>() || pid <= 0 {
+            return Err(denied("peer pid unavailable"));
+        }
+        let mut token = [0u8; 32];
+        let mut token_len = token.len() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                SOL_LOCAL,
+                LOCAL_PEERTOKEN,
+                token.as_mut_ptr() as *mut c_void,
+                &mut token_len,
+            )
+        };
+        if rc != 0 || token_len as usize != token.len() {
+            return Err(denied("peer audit token unavailable"));
+        }
+        Ok(MacPeerIdentity {
+            uid,
+            pid: pid as i32,
+            audit_token: token,
+        })
+    }
+
+    /// The policy for one protected helper. It requires an exact caller UID
+    /// and an exact Developer ID team and signing identifier. Root is a valid
+    /// caller when the GUI itself runs as root. There is no UID-only fallback.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct MacCallerPolicy {
+        expected_uid: u32,
+        team_identifier: String,
+        identifier: String,
+    }
+
+    impl MacCallerPolicy {
+        pub fn new(
+            expected_uid: u32,
+            team_identifier: impl Into<String>,
+            identifier: impl Into<String>,
+        ) -> io::Result<Self> {
+            let team_identifier = team_identifier.into();
+            let identifier = identifier.into();
+            if !valid_team(&team_identifier) || !valid_identifier(&identifier) {
+                return Err(denied("invalid helper caller policy"));
+            }
+            Ok(Self {
+                expected_uid,
+                team_identifier,
+                identifier,
+            })
+        }
+
+        pub fn expected_uid(&self) -> u32 {
+            self.expected_uid
+        }
+
+        pub fn requirement(&self) -> String {
+            macos_requirement(&self.identifier, &self.team_identifier)
+                .unwrap_or_else(|_| String::new())
+        }
+    }
+
+    /// Build one exact requirement. The caller values are allowlisted so a
+    /// quote or a requirement operator cannot be injected. `anchor apple
+    /// generic` alone also accepts an Apple Development or Apple Distribution
+    /// certificate, so the requirement names both Developer ID markers and
+    /// rejects the debugger entitlement.
+    pub fn macos_requirement(identifier: &str, team_identifier: &str) -> io::Result<String> {
+        if !valid_identifier(identifier) || !valid_team(team_identifier) {
+            return Err(denied("invalid signing requirement"));
+        }
+        Ok(format!(
+            "anchor apple generic and identifier \"{identifier}\" and certificate leaf[subject.OU] = \"{team_identifier}\" and certificate 1[field.{DEVELOPER_ID_INTERMEDIATE}] exists and certificate leaf[field.{DEVELOPER_ID_APPLICATION}] exists and !entitlement[\"com.apple.security.get-task-allow\"]"
+        ))
+    }
+
+    /// A Developer ID build carries the hardened runtime flag and is not
+    /// ad-hoc. A development build usually lacks one or both.
+    pub fn macos_signing_flags_ok(flags: u32) -> bool {
+        flags & CS_ADHOC == 0 && flags & CS_RUNTIME != 0
+    }
+
+    fn cfstring(value: &str) -> io::Result<CfRelease> {
+        let value = CString::new(value).map_err(|_| denied("invalid signing requirement"))?;
+        let string = unsafe {
+            CFStringCreateWithCString(ptr::null(), value.as_ptr(), CF_STRING_ENCODING_UTF8)
+        };
+        if string.is_null() {
+            Err(denied("signing requirement unavailable"))
+        } else {
+            Ok(CfRelease(string))
+        }
+    }
+
+    fn requirement(value: &str) -> io::Result<CfRelease> {
+        let text = cfstring(value)?;
+        let mut created: SecRequirementRef = ptr::null();
+        let status = unsafe { SecRequirementCreateWithString(text.0, 0, &mut created) };
+        if status != 0 || created.is_null() {
+            Err(denied("signing requirement rejected"))
+        } else {
+            Ok(CfRelease(created))
+        }
+    }
+
+    fn audit_dictionary(token: &[u8; 32]) -> io::Result<CfRelease> {
+        let data = unsafe { CFDataCreate(ptr::null(), token.as_ptr(), token.len() as CFIndex) };
+        if data.is_null() {
+            return Err(denied("peer audit token rejected"));
+        }
+        let data = CfRelease(data);
+        let keys = [unsafe { kSecGuestAttributeAudit }];
+        let values = [data.0];
+        let key_callbacks = ptr::addr_of!(kCFTypeDictionaryKeyCallBacks);
+        let value_callbacks = ptr::addr_of!(kCFTypeDictionaryValueCallBacks);
+        let dict = unsafe {
+            CFDictionaryCreate(
+                ptr::null(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                key_callbacks.cast(),
+                value_callbacks.cast(),
+            )
+        };
+        if dict.is_null() {
+            Err(denied("peer attributes rejected"))
+        } else {
+            Ok(CfRelease(dict))
+        }
+    }
+
+    fn string_from_dictionary(dict: CFDictionaryRef, key: CFStringRef) -> Option<String> {
+        let value = unsafe { CFDictionaryGetValue(dict, key) };
+        if value.is_null() {
+            return None;
+        }
+        let mut buffer = [0 as c_char; 256];
+        let ok = unsafe {
+            CFStringGetCString(
+                value,
+                buffer.as_mut_ptr(),
+                buffer.len() as CFIndex,
+                CF_STRING_ENCODING_UTF8,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        unsafe { CStr::from_ptr(buffer.as_ptr()) }
+            .to_str()
+            .ok()
+            .map(str::to_owned)
+    }
+
+    fn signing_identity(code: SecStaticCodeRef) -> io::Result<(String, String, u32)> {
+        let mut information: CFDictionaryRef = ptr::null();
+        let status = unsafe {
+            SecCodeCopySigningInformation(code, SEC_CS_SIGNING_INFORMATION, &mut information)
+        };
+        if status != 0 || information.is_null() {
+            return Err(denied("signing information unavailable"));
+        }
+        let information = CfRelease(information);
+        let identifier = string_from_dictionary(information.0, unsafe { kSecCodeInfoIdentifier })
+            .ok_or_else(|| denied("signing identifier unavailable"))?;
+        let team = string_from_dictionary(information.0, unsafe { kSecCodeInfoTeamIdentifier })
+            .ok_or_else(|| denied("signing team unavailable"))?;
+        if identifier.is_empty() || team.is_empty() {
+            return Err(denied("signing identity incomplete"));
+        }
+        let flags_value = unsafe { CFDictionaryGetValue(information.0, kSecCodeInfoFlags) };
+        let mut flags: i64 = 0;
+        if flags_value.is_null()
+            || unsafe {
+                CFNumberGetValue(
+                    flags_value,
+                    K_CF_NUMBER_SINT64_TYPE,
+                    (&mut flags as *mut i64).cast(),
+                )
+            } == 0
+        {
+            return Err(denied("signing flags unavailable"));
+        }
+        Ok((identifier, team, flags as u32))
+    }
+
+    fn verify_static_code(
+        path: &Path,
+        requirement_text: &str,
+    ) -> io::Result<(String, String, u32)> {
+        let path_bytes = path.as_os_str().as_bytes();
+        let url = unsafe {
+            CFURLCreateFromFileSystemRepresentation(
+                ptr::null(),
+                path_bytes.as_ptr(),
+                path_bytes.len() as CFIndex,
+                0,
+            )
+        };
+        if url.is_null() {
+            return Err(denied("helper path rejected"));
+        }
+        let url = CfRelease(url);
+        let mut code: SecStaticCodeRef = ptr::null();
+        let status = unsafe { SecStaticCodeCreateWithPath(url.0, 0, &mut code) };
+        if status != 0 || code.is_null() {
+            return Err(denied("helper code unavailable"));
+        }
+        let code = CfRelease(code);
+        let requirement = requirement(requirement_text)?;
+        let status = unsafe { SecStaticCodeCheckValidity(code.0, 0, requirement.0) };
+        if status != 0 {
+            return Err(denied("helper signature rejected"));
+        }
+        signing_identity(code.0)
+    }
+
+    /// Verify a root helper with the peer audit token and an exact Developer ID
+    /// requirement. A failed lookup, an ad-hoc signature, another team, or
+    /// another identifier is a permission error.
+    pub fn verify_macos_peer(
+        stream: &UnixStream,
+        policy: &MacCallerPolicy,
+    ) -> io::Result<MacPeerIdentity> {
+        let peer = macos_peer_identity(stream)?;
+        if peer.uid != policy.expected_uid {
+            return Err(denied("unexpected helper peer"));
+        }
+        let requirement_text = policy.requirement();
+        if requirement_text.is_empty() {
+            return Err(denied("invalid helper caller policy"));
+        }
+        let requirement = requirement(&requirement_text)?;
+        let attributes = audit_dictionary(&peer.audit_token)?;
+        let mut code: SecCodeRef = ptr::null();
+        let status =
+            unsafe { SecCodeCopyGuestWithAttributes(ptr::null(), attributes.0, 0, &mut code) };
+        if status != 0 || code.is_null() {
+            return Err(denied("peer code unavailable"));
+        }
+        let code = CfRelease(code);
+        let status = unsafe { SecCodeCheckValidity(code.0, 0, requirement.0) };
+        if status != 0 {
+            return Err(denied("peer signature rejected"));
+        }
+        let (identifier, team, flags) = signing_identity(code.0)?;
+        if identifier != policy.identifier
+            || team != policy.team_identifier
+            || !macos_signing_flags_ok(flags)
+        {
+            return Err(denied("peer identity mismatch"));
+        }
+        Ok(peer)
+    }
+
+    /// Verify one static code object against the exact Developer ID. The path
+    /// is not checked here; the caller must use a protected install path.
+    pub fn verify_macos_static_code(
+        path: &Path,
+        team_identifier: &str,
+        identifier: &str,
+    ) -> io::Result<()> {
+        let requirement = macos_requirement(identifier, team_identifier)?;
+        let (actual_identifier, actual_team, flags) = verify_static_code(path, &requirement)?;
+        if actual_identifier != identifier
+            || actual_team != team_identifier
+            || !macos_signing_flags_ok(flags)
+        {
+            return Err(denied("signature identity mismatch"));
+        }
+        Ok(())
+    }
+
+    /// The helper checks its own install path before it opens a listener.
+    /// Root ownership, root group, the exact protected root, no group or other
+    /// write bit, and the same Developer ID are all required.
+    pub fn verify_macos_root_helper_install(
+        path: &Path,
+        team_identifier: &str,
+        identifier: &str,
+    ) -> io::Result<()> {
+        if !valid_team(team_identifier) || !valid_identifier(identifier) {
+            return Err(denied("invalid helper install policy"));
+        }
+        let canonical = fs::canonicalize(path)?;
+        if canonical != path
+            || canonical.parent() != Some(Path::new("/Library/PrivilegedHelperTools"))
+        {
+            return Err(denied("helper is not in the protected install root"));
+        }
+        let metadata = fs::symlink_metadata(&canonical)?;
+        if !root_helper_metadata_allowed(
+            metadata.uid(),
+            metadata.gid(),
+            metadata.permissions().mode(),
+            metadata.file_type().is_file(),
+            metadata.file_type().is_symlink(),
+        ) {
+            return Err(denied("helper install metadata is not protected"));
+        }
+        for directory in ["/Library/PrivilegedHelperTools", "/Library", "/"] {
+            let metadata = fs::symlink_metadata(directory)?;
+            if !metadata.file_type().is_dir()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != 0
+                || metadata.gid() != 0
+                || metadata.permissions().mode() & 0o022 != 0
+            {
+                return Err(denied("helper parent is not protected"));
+            }
+            if has_write_acl(Path::new(directory))? {
+                return Err(denied("helper parent has a write ACL"));
+            }
+        }
+        if has_write_acl(&canonical)? {
+            return Err(denied("helper has a write ACL"));
+        }
+        let requirement = macos_requirement(identifier, team_identifier)?;
+        let (actual_identifier, actual_team, flags) = verify_static_code(&canonical, &requirement)?;
+        if actual_identifier != identifier
+            || actual_team != team_identifier
+            || !macos_signing_flags_ok(flags)
+        {
+            return Err(denied("helper signature identity mismatch"));
+        }
+        Ok(())
+    }
+
+    // Reject any allow ACL that can write. The qualifier is not resolved to a
+    // user here; an installed helper has no extended ACL in the normal package.
+    fn has_write_acl(path: &Path) -> io::Result<bool> {
+        let path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| denied("helper ACL path rejected"))?;
+        let acl = unsafe { acl_get_file(path.as_ptr(), ACL_TYPE_EXTENDED) };
+        if acl.is_null() {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(false);
+            }
+            return Err(denied("helper ACL unavailable"));
+        }
+        let acl = AclFree(acl);
+        let mut entry: *mut c_void = ptr::null_mut();
+        let mut entry_id = ACL_FIRST_ENTRY;
+        while unsafe { acl_get_entry(acl.0, entry_id, &mut entry) } == 0 {
+            entry_id = ACL_NEXT_ENTRY;
+            let mut tag = 0u32;
+            if unsafe { acl_get_tag_type(entry, &mut tag) } == 0 && tag == ACL_EXTENDED_ALLOW {
+                let mut permissions: *mut c_void = ptr::null_mut();
+                if unsafe { acl_get_permset(entry, &mut permissions) } == 0 {
+                    for permission in [
+                        ACL_WRITE_DATA,
+                        ACL_DELETE,
+                        ACL_APPEND_DATA,
+                        ACL_DELETE_CHILD,
+                        ACL_WRITE_ATTRIBUTES,
+                        ACL_WRITE_EXTATTRIBUTES,
+                        ACL_WRITE_SECURITY,
+                        ACL_CHANGE_OWNER,
+                    ] {
+                        if unsafe { acl_get_perm_np(permissions, permission) } == 1 {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Pure metadata rule. It is public so a test can exercise every rejected
+    /// combination without root and without changing a real helper.
+    pub fn root_helper_metadata_ok(
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        is_file: bool,
+        is_symlink: bool,
+    ) -> bool {
+        uid == 0 && gid == 0 && is_file && !is_symlink && mode & 0o100 != 0 && mode & 0o022 == 0
+    }
+
+    fn root_helper_metadata_allowed(
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        is_file: bool,
+        is_symlink: bool,
+    ) -> bool {
+        root_helper_metadata_ok(uid, gid, mode, is_file, is_symlink)
+    }
+}
+
 /// A private listener owned by the unprivileged GUI process.
+///
+/// The production macOS app uses the XPC helper instead. This type stays for
+/// the hermetic Unix helper tests only, so the UID-only socket cannot become a
+/// production boundary again by accident.
+#[cfg(test)]
 pub struct PrivateListener {
     listener: UnixListener,
     directory: PathBuf,
     path: PathBuf,
 }
+#[cfg(test)]
 impl PrivateListener {
     /// Create a 0700 directory under /tmp. Failure never removes an existing path.
     pub fn create() -> io::Result<Self> {
@@ -188,6 +827,7 @@ impl PrivateListener {
         }
     }
 }
+#[cfg(test)]
 impl Drop for PrivateListener {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
@@ -195,7 +835,55 @@ impl Drop for PrivateListener {
     }
 }
 
+#[cfg(all(test, target_os = "macos"))]
+impl PrivateListener {
+    /// Accept only a peer that satisfies the code signing policy. A wrong UID
+    /// or a failed signature is dropped without a reply, and the listener
+    /// keeps waiting until the timeout. This is the protected macOS path; the
+    /// older `accept` checks the UID only.
+    pub fn accept_verified(
+        &self,
+        policy: &MacCallerPolicy,
+        timeout: Duration,
+    ) -> io::Result<UnixStream> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "helper connection timed out",
+                ));
+            }
+            match self.listener.accept() {
+                Ok((stream, _)) => match macos_helper::verify_macos_peer(&stream, policy) {
+                    Ok(_) => {
+                        stream.set_nonblocking(false)?;
+                        return Ok(stream);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                        // An untrusted local process receives no request and no
+                        // error detail. Close it and wait for the real caller.
+                    }
+                    Err(error) => return Err(error),
+                },
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "helper connection timed out",
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
 /// Validate the socket and its 0700 parent without following their final links.
+#[cfg(test)]
 pub fn verify_path(path: &Path, owner: u32) -> io::Result<()> {
     let parent = path
         .parent()
@@ -217,6 +905,7 @@ pub fn verify_path(path: &Path, owner: u32) -> io::Result<()> {
 }
 
 /// Connect as root only after checking the private path and expected peer.
+#[cfg(test)]
 pub fn connect_as_root(path: &Path, owner: u32) -> io::Result<UnixStream> {
     if unsafe { libc::geteuid() } != 0 || owner == 0 {
         return Err(io::Error::new(
@@ -255,7 +944,9 @@ pub trait PrivilegedService {
     }
     fn stop(&mut self) -> Result<Value, String>;
 }
+#[cfg(any(target_os = "macos", test))]
 struct StopOnDrop<'a, T: PrivilegedService>(&'a mut T);
+#[cfg(any(target_os = "macos", test))]
 impl<T: PrivilegedService> Drop for StopOnDrop<'_, T> {
     fn drop(&mut self) {
         let _ = self.0.stop();
@@ -264,6 +955,7 @@ impl<T: PrivilegedService> Drop for StopOnDrop<'_, T> {
 
 // Do not consume the next IPC message. Detect a closed peer while start is
 // running so authentication can be cancelled before route setup.
+#[cfg(any(target_os = "macos", test))]
 fn watch_disconnect(stream: UnixStream, cancel: Arc<AtomicBool>, finished: Arc<AtomicBool>) {
     let mut p = libc::pollfd {
         fd: stream.as_raw_fd(),
@@ -315,10 +1007,12 @@ fn watch_disconnect(stream: UnixStream, cancel: Arc<AtomicBool>, finished: Arc<A
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 struct DisconnectWatch {
     finished: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
+#[cfg(any(target_os = "macos", test))]
 impl Drop for DisconnectWatch {
     fn drop(&mut self) {
         self.finished.store(true, Ordering::Release);
@@ -331,7 +1025,8 @@ impl Drop for DisconnectWatch {
 /// Serve one verified client. Stop the service on stop, EOF, error, or unwind.
 /// The caller must call `shutdown` on a cloned stream when SIGINT or SIGTERM
 /// arrives. This unblocks receive and runs the cleanup guard.
-pub fn serve_connection<T: PrivilegedService>(
+#[cfg(any(target_os = "macos", test))]
+fn serve_connection<T: PrivilegedService>(
     mut stream: UnixStream,
     expected_uid: u32,
     service: &mut T,
@@ -442,6 +1137,19 @@ pub fn serve_connection<T: PrivilegedService>(
             _ => return Err(invalid("unknown helper action")),
         }
     }
+}
+
+/// Serve one macOS client only after the audit token and Developer ID check.
+/// Stop the service on stop, EOF, error, or unwind. The caller must close a
+/// cloned stream on SIGINT or SIGTERM, exactly as with `serve_connection`.
+#[cfg(target_os = "macos")]
+pub fn serve_connection_verified<T: PrivilegedService>(
+    stream: UnixStream,
+    policy: &MacCallerPolicy,
+    service: &mut T,
+) -> io::Result<()> {
+    macos_helper::verify_macos_peer(&stream, policy)?;
+    serve_connection(stream, policy.expected_uid(), service)
 }
 
 #[cfg(test)]
@@ -767,6 +1475,117 @@ mod tests {
         assert_eq!(receive(&mut stream).unwrap()["ok"], true);
         t.join().unwrap();
     }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_signing_requirement_rejects_injected_values() {
+        assert_eq!(
+            macos_requirement("dev.hotspotshade.mac", "ABCDEFGHIJ").unwrap(),
+            "anchor apple generic and identifier \"dev.hotspotshade.mac\" and certificate leaf[subject.OU] = \"ABCDEFGHIJ\" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and !entitlement[\"com.apple.security.get-task-allow\"]"
+        );
+        assert!(macos_requirement("dev.hotspotshade.mac\" or true", "ABCDEFGHIJ").is_err());
+        assert!(macos_requirement("dev.hotspotshade.mac", "ABCDEFGHI\"").is_err());
+        assert!(macos_requirement("", "ABCDEFGHIJ").is_err());
+        assert!(MacCallerPolicy::new(501, "SHORT", "dev.hotspotshade.mac").is_err());
+        // A root GUI is a valid caller. The old policy refused it even though
+        // the GUI accepts root with a per-launch token.
+        assert!(MacCallerPolicy::new(0, "ABCDEFGHIJ", "dev.hotspotshade.mac").is_ok());
+        assert!(MacCallerPolicy::new(501, "ABCDEFGHIJ", "dev.hotspotshade.mac").is_ok());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_signing_flags_require_developer_id_and_hardened_runtime() {
+        // Hardened runtime, not ad-hoc.
+        assert!(macos_signing_flags_ok(0x0001_0000));
+        // A development or distribution signature without the runtime.
+        assert!(!macos_signing_flags_ok(0));
+        // An ad-hoc signature with the runtime bit.
+        assert!(!macos_signing_flags_ok(0x0001_0002));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_peer_identity_comes_from_the_kernel() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let peer = macos_peer_identity(&b).unwrap();
+        assert_eq!(peer.pid, std::process::id() as i32);
+        assert_eq!(peer.uid, unsafe { libc::geteuid() } as u32);
+        assert_ne!(peer.audit_token, [0u8; 32]);
+        drop(a);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_ad_hoc_caller_is_rejected() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (a, b) = UnixStream::pair().unwrap();
+        let uid = unsafe { libc::geteuid() } as u32;
+        let policy = MacCallerPolicy::new(uid, "AAAAAAAAAA", "dev.hotspotshade.mac").unwrap();
+        // The cargo test binary is ad-hoc or unsigned. A team requirement must
+        // fail before the helper reads a request.
+        assert!(verify_macos_peer(&b, &policy).is_err());
+        drop(a);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_verified_connection_rejects_before_the_service_starts() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (a, b) = UnixStream::pair().unwrap();
+        let uid = unsafe { libc::geteuid() } as u32;
+        let policy = MacCallerPolicy::new(uid, "AAAAAAAAAA", "dev.hotspotshade.mac").unwrap();
+        let n = Arc::new(AtomicUsize::new(0));
+        let result = serve_connection_verified(b, &policy, &mut Fake(Arc::clone(&n)));
+        drop(a);
+        assert!(result.is_err());
+        assert_eq!(n.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_static_ad_hoc_code_is_rejected() {
+        let executable = std::env::current_exe().unwrap();
+        assert!(
+            verify_macos_static_code(&executable, "AAAAAAAAAA", "dev.hotspotshade.mac").is_err()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_root_helper_metadata_rule() {
+        assert!(root_helper_metadata_ok(0, 0, 0o755, true, false));
+        assert!(root_helper_metadata_ok(0, 0, 0o555, true, false));
+        assert!(!root_helper_metadata_ok(501, 0, 0o755, true, false));
+        assert!(!root_helper_metadata_ok(0, 20, 0o755, true, false));
+        assert!(!root_helper_metadata_ok(0, 0, 0o775, true, false));
+        assert!(!root_helper_metadata_ok(0, 0, 0o757, true, false));
+        assert!(!root_helper_metadata_ok(0, 0, 0o755, false, false));
+        assert!(!root_helper_metadata_ok(0, 0, 0o755, true, true));
+        assert!(!root_helper_metadata_ok(0, 0, 0o644, true, false));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_root_helper_install_rejects_a_user_path() {
+        let path = std::env::temp_dir().join(format!(
+            "hs-helper-install-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, b"not a helper").unwrap();
+        let result =
+            verify_macos_root_helper_install(&path, "AAAAAAAAAA", "dev.hotspotshade.mac.helper");
+        let _ = fs::remove_file(&path);
+        assert!(result.is_err());
+    }
+
     #[test]
     fn only_allowlisted_start_codes_cross_the_ipc_boundary() {
         struct Failing(&'static str);

@@ -98,6 +98,31 @@ test('an unpaired demo offers Pair and stays off', () => {
   assert.equal(view.demo, true);
 });
 
+test('recovery offers a stop attempt only with a fresh running indication', () => {
+  for (const recovery of [{ state: 'unknown' }, { cleanup_blocked: true }]) {
+    const fresh = derive({ status: status({ ...recovery, running: true }) });
+    assert.equal(fresh.primary.id, 'checkNow');
+    assert.equal(fresh.secondary.id, 'turnOff');
+    assert.equal(fresh.secondary.label, 'Try to turn off');
+    for (const running of [false, undefined]) {
+      const view = derive({ status: status({ ...recovery, running }) });
+      assert.equal(view.secondary, null);
+    }
+    const stale = derive({ status: status({ ...recovery, running: true }), freshness: 'stale' });
+    assert.equal(stale.secondary, null);
+  }
+});
+
+test('a failed recovery stop remains visible', () => {
+  const view = derive({
+    status: status({ running: true, state: 'unknown' }),
+    error: 'The tunnel may still need cleanup.',
+    retryAction: 'stop'
+  });
+  assert.ok(view.attention.includes('The tunnel may still need cleanup.'));
+  assert.equal(view.secondary.id, 'turnOff');
+});
+
 test('a paired source device offers Turn on and Forget', () => {
   const view = derive({
     status: status({
@@ -220,6 +245,94 @@ test('an unavailable status does not claim a tunnel state', () => {
   assert.ok(view.attention.includes('The engine did not answer. This status may be out of date.'));
 });
 
+test('an unknown service state does not claim the tunnel is on', () => {
+  const message = 'The service state is unavailable after an interrupted operation.';
+  const view = derive({
+    status: status({ running: true, paired: true, state: 'unknown', error: message,
+      phone: { state: 'not_responding', port_changed: true } }),
+    tokenRejected: 'old pairing error',
+    forgetBlocked: true
+  });
+  assert.equal(view.title, 'Status unavailable');
+  assert.equal(view.subtitle, message);
+  assert.equal(view.unavailable, true);
+  assert.equal(view.primary.id, 'checkNow');
+  assert.equal(view.secondary.id, 'turnOff');
+  assert.equal(view.secondary.label, 'Try to turn off');
+  assert.equal(view.modeLocked, true);
+  assert.equal(view.connection.value, 'The status is unavailable.');
+  assert.ok(!view.attention.includes('The source device stopped answering.'));
+  assert.ok(!view.attention.includes('Turn off the tunnel to forget this source device.'));
+});
+
+test('an unpaired status without source details stays consistent', () => {
+  const view = derive({ status: { running: false, paired: false } });
+  assert.notEqual(view.title, 'Status unavailable');
+  assert.equal(view.unavailable, false);
+  assert.equal(view.source.value, 'Not paired');
+});
+
+test('a paired status without source details offers a fresh check', () => {
+  const view = derive({ status: { running: false, paired: true } });
+  assert.equal(view.title, 'Status unavailable');
+  assert.equal(view.primary.id, 'checkNow');
+  assert.equal(view.source.value, 'Paired');
+  assert.notEqual(view.primary.id, 'turnOn');
+});
+
+test('missing pairing evidence is not reported as unpaired', () => {
+  for (const paired of [undefined, null, 'false']) {
+    const view = derive({ status: { running: false, paired } });
+    assert.equal(view.pairingKnown, false);
+    assert.equal(view.title, 'Status unavailable');
+    assert.equal(view.primary.id, 'checkNow');
+    assert.equal(view.source.value, 'The status is unavailable.');
+    assert.notEqual(view.primary.id, 'pair');
+  }
+});
+
+test('an incomplete running status cannot enable a start or claim stopped', () => {
+  for (const running of [undefined, null, 'false']) {
+    for (const startMode of ['phone', 'direct']) {
+      const view = derive({ status: { running, paired: true }, startMode });
+      assert.equal(view.unavailable, true);
+      assert.equal(view.primary.id, 'checkNow');
+      assert.equal(view.connection.value, 'The status is unavailable.');
+      assert.equal(view.modeLocked, true);
+    }
+  }
+});
+
+test('start and stop confirmation require explicit state without recovery uncertainty', () => {
+  for (const running of [false, true]) {
+    assert.equal(model.tunnelStateConfirmed({ running }, running), true);
+    assert.equal(model.tunnelStateConfirmed({ running: !running }, running), false);
+    assert.equal(model.tunnelStateConfirmed({ running, state: 'unknown' }, running), false);
+    assert.equal(model.tunnelStateConfirmed({ running, cleanup_blocked: true }, running), false);
+    assert.equal(model.tunnelStateConfirmed({}, running), false);
+    assert.equal(model.tunnelStateConfirmed({ running: String(running) }, running), false);
+  }
+});
+
+test('a cleanup-blocked stopped status does not offer restart or Forget', () => {
+  const view = derive({
+    status: status({ running: false, paired: true, cleanup_blocked: true }),
+    forgetBlocked: true
+  });
+  assert.equal(view.unavailable, true);
+  assert.match(view.subtitle, /cleanup did not finish/i);
+  assert.equal(view.primary.id, 'checkNow');
+  assert.equal(view.secondary, null);
+  assert.equal(view.modeLocked, true);
+});
+
+test('direct mode does not depend on missing pairing evidence', () => {
+  const view = derive({ status: { running: false }, startMode: 'direct' });
+  assert.equal(view.pairingKnown, false);
+  assert.equal(view.primary.id, 'turnOn');
+  assert.equal(view.source.value, 'Not used');
+});
+
 test('Forget is blocked while the tunnel runs', () => {
   const view = derive({
     forgetBlocked: true,
@@ -243,6 +356,18 @@ test('an action error shows Needs attention and a retry action', () => {
   assert.equal(view.kind, 'attention');
 });
 
+test('an action error keeps the stop action available for a running tunnel', () => {
+  for (const mode of ['tun', 'phone']) {
+    const view = derive({
+      status: status({ running: true, paired: true, mode }),
+      error: 'The previous start did not finish.'
+    });
+    assert.equal(view.title, 'Needs attention');
+    assert.equal(view.primary.id, 'turnOff');
+    assert.equal(view.subtitle, 'The previous start did not finish.');
+  }
+});
+
 test('a pairing state replaces the dashboard card actions', () => {
   const view = derive({ pair: { state: 'confirm', code: '482931' } });
   assert.equal(view.title, 'Pairing');
@@ -256,8 +381,15 @@ test('a forget message wins over the usual unpaired hint', () => {
     status: status({ forget: { state: 'confirmed', attempts: 1 } })
   });
   assert.equal(view.title, 'Not paired');
-  assert.equal(view.subtitle, 'Forgotten. The source device removed this target device.');
+  assert.equal(view.subtitle, 'Could not confirm that the source device removed this pairing. This target device forgot the pairing, but the source device may still trust it.');
   assert.equal(view.primary.id, 'pair');
+});
+
+test('an unconfirmed forget does not claim the source failed to answer', () => {
+  const view = derive({
+    status: status({ forget: { state: 'not_delivered', attempts: 3 } })
+  });
+  assert.equal(view.subtitle, 'Could not confirm that the source device removed this pairing. This target device forgot the pairing, but the source device may still trust it.');
 });
 
 test('the pairing view carries the code and the plain phase text', () => {
@@ -401,4 +533,76 @@ test('the menu command allowlist is explicit', () => {
   assert.equal(model.menuCommandAllowed('quit'), false);
   assert.equal(model.menuCommandAllowed('open-url'), false);
   assert.equal(model.menuCommandAllowed(''), false);
+});
+
+test('the mode choice defaults to source device proxy and locks while running', () => {
+  const idle = model.modeChoice({});
+  assert.equal(idle.selected, 'phone');
+  assert.equal(idle.running, false);
+  assert.equal(idle.locked, false);
+  assert.deepEqual(idle.rows.map((row) => row.id), ['phone', 'direct']);
+  assert.equal(idle.rows[0].pressed, true);
+  assert.equal(idle.rows[1].pressed, false);
+  assert.match(idle.rows[0].detail, /source device/i);
+  assert.match(idle.rows[1].detail, /No app on the source device/i);
+  assert.match(idle.rows[1].detail, /IPv6 is blocked by default/i);
+
+  const direct = model.modeChoice({ selected: 'direct' });
+  assert.equal(direct.selected, 'direct');
+  assert.equal(direct.rows[0].pressed, false);
+  assert.equal(direct.rows[1].pressed, true);
+
+  const running = model.modeChoice({ selected: 'phone', runningMode: 'direct' });
+  assert.equal(running.selected, 'direct');
+  assert.equal(running.running, true);
+  assert.equal(running.locked, true);
+  assert.ok(running.rows.every((row) => row.disabled));
+
+  for (const value of [null, undefined, 'tun', 1, [], {}]) {
+    assert.equal(model.modeChoice({ selected: value }).selected, 'phone');
+  }
+});
+
+test('a running direct tunnel does not use a source device and states the IPv6 policy', () => {
+  const view = derive({
+    startMode: 'direct',
+    status: status({ running: true, mode: 'tun', paired: false })
+  });
+  assert.equal(view.title, 'On');
+  assert.equal(view.kind, 'on');
+  assert.equal(view.primary.id, 'turnOff');
+  assert.equal(view.activeMode, 'direct');
+  assert.equal(view.runningMode, 'direct');
+  assert.equal(view.source.value, 'Not used');
+  assert.ok(view.source.details.includes('Direct mode does not use a source device app.'));
+  assert.equal(view.connection.value, 'Tunnel on');
+  assert.ok(view.connection.details.includes('IPv6 is blocked in direct mode.'));
+  assert.ok(view.connection.details.includes('The engine reports direct mode. Live route behavior is not verified by this app.'));
+  assert.equal(view.attention.includes('The source device stopped answering. New connections fail.'), false);
+});
+
+test('direct mode is ready to start without pairing and leaves source mode intact', () => {
+  const direct = derive({ startMode: 'direct' });
+  assert.equal(direct.title, 'Direct mode');
+  assert.equal(direct.kind, 'off');
+  assert.equal(direct.primary.id, 'turnOn');
+  assert.equal(direct.source.value, 'Not used');
+  assert.equal(direct.connection.value, 'Tunnel off');
+  assert.ok(direct.connection.details.includes('IPv6 is blocked in direct mode.'));
+
+  const phone = derive({ startMode: 'phone' });
+  assert.equal(phone.title, 'Not paired');
+  assert.equal(phone.primary.id, 'pair');
+  assert.equal(phone.source.value, 'Not paired');
+});
+
+test('known start refusals become plain fixed text', () => {
+  assert.match(model.startFailureText('admin_required', 'Start HotspotShade as Administrator to use the tunnel.'), /root engine/);
+  assert.equal(model.startFailureText('route_setup', 'x'), 'The tunnel could not configure its routes. Cleanup may need attention. Check the current status before trying again.');
+  assert.equal(model.startFailureText('tunnel_setup', 'x'), 'The tunnel could not set up its virtual interface. Check the current status and any cleanup warning before trying again.');
+  assert.equal(model.startFailureText('start_cancelled', 'x'), 'The start was cancelled. Check the current status and any cleanup warning before trying again.');
+  assert.match(model.startFailureText('service_start', 'x'), /hotspot link/);
+  assert.match(model.startFailureText('unsupported_mode', 'x'), /does not support the selected tunnel mode/);
+  assert.equal(model.startFailureText('engine_error', 'The service could not start.'), 'The service could not start.');
+  assert.equal(model.startFailureText('', ''), 'The tunnel did not start.');
 });

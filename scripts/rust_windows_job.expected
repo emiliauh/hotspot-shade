@@ -1,0 +1,21 @@
+    name: Rust (Windows) type check and test
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: github.ref_type != 'tag'
+        with:
+          workspaces: rust
+      - name: Type check (all targets)
+        shell: bash
+        working-directory: rust
+        run: cargo check --all-targets --locked
+      - name: Test
+        shell: bash
+        working-directory: rust
+        run: cargo test --locked
+      - name: Clippy (Windows code)
+        shell: bash
+        working-directory: rust
+        run: cargo clippy --all-targets --locked -- -D warnings

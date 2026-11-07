@@ -14,6 +14,12 @@ if [ ! -x node_modules/.bin/electron ]; then
   exit 2
 fi
 
+if command -v cargo >/dev/null 2>&1; then
+  cargo test --locked --manifest-path helper/Cargo.toml
+else
+  echo "cargo is not installed; skipping the helper tests." >&2
+fi
+
 node --test test/*.test.mjs
 if [ -n "${DISPLAY:-}" ]; then
   ./node_modules/.bin/electron test/smoke-main.js

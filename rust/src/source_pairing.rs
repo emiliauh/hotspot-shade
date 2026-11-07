@@ -45,9 +45,17 @@
 //!   most MAX_UNKNOWN_CHALLENGES challenges in the same window. The state
 //!   machine charges both budgets before it creates the ephemeral secret. It
 //!   charges no budget when the source device has no pairing credentials. It
-//!   answers NotActive in that case. A trusted key skips both budgets: that
-//!   path is intentionally unbudgeted. The budgets are an availability limit,
-//!   not an authentication limit.
+//!   answers NotActive in that case.
+//! - A HELLO that claims a trusted key uses a separate known-claim budget:
+//!   MAX_KNOWN_PEER_CHALLENGES for one source address and
+//!   MAX_KNOWN_CHALLENGES across all source addresses in the same window. A
+//!   public key is public, so the claim is unproven until the REVEAL proof.
+//!   The state machine charges this budget before it creates the ephemeral
+//!   secret too. A valid proof refunds exactly the charge that its own session
+//!   paid, so a real target device is not limited by its own presence checks
+//!   and a staggered unproven session keeps its charge and expiry. A bad proof
+//!   does not refund. The budgets are an availability limit, not an
+//!   authentication limit.
 //! - An approval must name the connection, the prompt ID, and the displayed
 //!   code. A stale connection, a stale prompt, a wrong code, or an expired
 //!   deadline does not approve a prompt.
@@ -114,6 +122,15 @@ const MAX_UNKNOWN_CHALLENGES: usize = 8;
 /// CHALLENGE_WINDOW_SECONDS. One source address cannot use the whole global
 /// budget.
 const MAX_PEER_CHALLENGES: usize = 4;
+/// The largest number of challenges for a claimed trusted key from one source
+/// address in CHALLENGE_WINDOW_SECONDS. A trusted public key is public, so the
+/// claim is unproven until the REVEAL proof. A valid proof refunds exactly the
+/// charge that its own session paid, so a real target device is not limited by
+/// its own presence checks and a staggered unproven claim keeps its charge.
+const MAX_KNOWN_PEER_CHALLENGES: usize = 8;
+/// The largest number of challenges for a claimed trusted key across all
+/// source addresses in CHALLENGE_WINDOW_SECONDS.
+const MAX_KNOWN_CHALLENGES: usize = 16;
 const CHALLENGE_WINDOW_SECONDS: u64 = 60;
 static NEXT_PROMPT_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -507,6 +524,20 @@ enum Stage {
     Authenticated(SessionKeys),
 }
 
+/// Identifies one challenge charge. A session keeps the identifier of the
+/// charge that paid for its HELLO, so a verified proof refunds exactly that
+/// charge and never a later unproven one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChallengeId(u64);
+
+/// One charge in a challenge budget. The charge keeps its own time, so a
+/// refund for another session cannot move its expiry.
+#[derive(Clone, Copy, Debug)]
+struct ChallengeCharge {
+    id: ChallengeId,
+    at: Duration,
+}
+
 struct Session {
     connection: ConnectionId,
     l_s: [u8; 32],
@@ -517,6 +548,9 @@ struct Session {
     first_deactivate: Option<Duration>,
     peer: String,
     nonces: Vec<[u8; 12]>,
+    /// The challenge charge that this session paid. A verified known proof
+    /// refunds this exact charge. An unknown proof never refunds.
+    charge: ChallengeId,
     stage: Stage,
 }
 
@@ -548,9 +582,18 @@ pub struct PairingResponder {
     clock: Box<dyn Clock>,
     sessions: BTreeMap<ConnectionId, Session>,
     unknown_budget: BTreeMap<String, Vec<Duration>>,
-    /// The times of the unknown challenges, for each source address. The sum of
-    /// the lists is at most MAX_UNKNOWN_CHALLENGES, so the map stays small.
-    unknown_challenges: BTreeMap<String, Vec<Duration>>,
+    /// The charges of the unknown challenges, for each source address. The sum
+    /// of the lists is at most MAX_UNKNOWN_CHALLENGES, so the map stays small.
+    unknown_challenges: BTreeMap<String, Vec<ChallengeCharge>>,
+    /// The charges of the challenges for a claimed trusted key, for each source
+    /// address. The sum of the lists is at most MAX_KNOWN_CHALLENGES, so the
+    /// map stays small too. Each charge has a unique identifier, so a refund
+    /// removes the proven session's charge and no other.
+    known_challenges: BTreeMap<String, Vec<ChallengeCharge>>,
+    /// The next challenge identifier. It is unique for the life of the
+    /// responder. Wrapping after 2^64 charges cannot collide with a live
+    /// charge in practice.
+    next_challenge_id: u64,
     invalid_budget: BTreeMap<String, InvalidBudget>,
     failures: BTreeMap<String, Vec<Duration>>,
     lockouts: BTreeMap<String, Duration>,
@@ -569,6 +612,8 @@ impl PairingResponder {
             sessions: BTreeMap::new(),
             unknown_budget: BTreeMap::new(),
             unknown_challenges: BTreeMap::new(),
+            known_challenges: BTreeMap::new(),
+            next_challenge_id: 0,
             invalid_budget: BTreeMap::new(),
             failures: BTreeMap::new(),
             lockouts: BTreeMap::new(),
@@ -696,24 +741,26 @@ impl PairingResponder {
         if !known && self.invalid_backoff_active(&peer, now) {
             return Ok(self.reply(connection, PairingStatus::Rejected, false));
         }
-        // A trusted key skips both challenge budgets. That path is
-        // intentionally unbudgeted. The budgets are an availability limit for
-        // unknown peers, not an authentication limit.
+        // A claimed trusted key is unproven until the REVEAL proof, so it pays
+        // the known-claim budget. An attacker can read or guess a public key,
+        // so the claim alone must not buy unbounded key generation or session
+        // slots. The budgets are an availability limit, not an authentication
+        // limit.
         if !known {
             // A source device with pairing off answers NotActive. It must not
             // charge the challenge budget, or the peer is locked out later.
             if self.context.credentials().is_none() {
                 return Ok(self.reply(connection, PairingStatus::NotActive, true));
             }
-            self.prune_challenges(now);
-            // Charge both challenge budgets before the ephemeral secret
-            // exists. An active attacker must not get a fresh handshake for
-            // each connection attempt.
-            if self.challenge_budget_used(&peer) {
-                return Ok(self.reply(connection, PairingStatus::Busy, false));
-            }
-            self.charge_challenge(&peer, now);
         }
+        self.prune_challenges(now);
+        // Charge the per-address and global challenge budgets before the
+        // ephemeral secret exists. An active attacker must not get a fresh
+        // handshake for each connection attempt.
+        if self.challenge_budget_used(&peer, known) {
+            return Ok(self.reply(connection, PairingStatus::Busy, false));
+        }
+        let charge = self.charge_challenge(&peer, now, known);
 
         let mut secret = self.identity.ephemeral_secret()?;
         let ephemeral = StaticSecret::from(secret);
@@ -734,6 +781,7 @@ impl PairingResponder {
                 first_deactivate: None,
                 peer,
                 nonces: Vec::new(),
+                charge,
                 stage: Stage::AwaitingReveal { ephemeral, commit },
             },
         );
@@ -932,6 +980,11 @@ impl PairingResponder {
         }
 
         if session.known {
+            // The proof shows that the peer holds the claimed key, so the
+            // challenge was not wasted work. Refund exactly this session's
+            // charge, not the latest charge for the address, so a staggered
+            // unproven session keeps its own charge and its own expiry.
+            self.refund_known_challenge(&session.peer, session.charge);
             // The trust list can change while the handshake runs. Recheck it
             // before the source device sends credentials or accepts a command.
             if !self.trust.contains(&session.l_s) {
@@ -1214,25 +1267,76 @@ impl PairingResponder {
 
     fn prune_challenges(&mut self, now: Duration) {
         let window = Duration::from_secs(CHALLENGE_WINDOW_SECONDS);
+        let keep = |charge: &ChallengeCharge| now.saturating_sub(charge.at) < window;
         self.unknown_challenges.retain(|_, challenges| {
-            challenges.retain(|at| now.saturating_sub(*at) < window);
+            challenges.retain(keep);
+            !challenges.is_empty()
+        });
+        self.known_challenges.retain(|_, challenges| {
+            challenges.retain(keep);
             !challenges.is_empty()
         });
     }
 
     /// True when the source address or the whole responder has no challenge
-    /// budget left for the current window. Call `prune_challenges` first.
-    fn challenge_budget_used(&self, peer: &str) -> bool {
-        let peer_count = self.unknown_challenges.get(peer).map_or(0, Vec::len);
-        let total: usize = self.unknown_challenges.values().map(Vec::len).sum();
-        peer_count >= MAX_PEER_CHALLENGES || total >= MAX_UNKNOWN_CHALLENGES
+    /// budget left for the current window. A claimed trusted key uses its own
+    /// budget. Call `prune_challenges` first.
+    fn challenge_budget_used(&self, peer: &str, known: bool) -> bool {
+        let (peer_count, total, peer_limit, global_limit) = if known {
+            let peer_count = self.known_challenges.get(peer).map_or(0, Vec::len);
+            let total: usize = self.known_challenges.values().map(Vec::len).sum();
+            (
+                peer_count,
+                total,
+                MAX_KNOWN_PEER_CHALLENGES,
+                MAX_KNOWN_CHALLENGES,
+            )
+        } else {
+            let peer_count = self.unknown_challenges.get(peer).map_or(0, Vec::len);
+            let total: usize = self.unknown_challenges.values().map(Vec::len).sum();
+            (
+                peer_count,
+                total,
+                MAX_PEER_CHALLENGES,
+                MAX_UNKNOWN_CHALLENGES,
+            )
+        };
+        peer_count >= peer_limit || total >= global_limit
     }
 
-    fn charge_challenge(&mut self, peer: &str, now: Duration) {
-        self.unknown_challenges
-            .entry(peer.to_owned())
+    /// Charge one challenge and return its identifier. The caller stores the
+    /// identifier in the session that the charge paid for. The budget check
+    /// runs first, so the map never holds more than its global limit.
+    fn charge_challenge(&mut self, peer: &str, now: Duration, known: bool) -> ChallengeId {
+        let id = ChallengeId(self.next_challenge_id);
+        self.next_challenge_id = self.next_challenge_id.wrapping_add(1);
+        let map = if known {
+            &mut self.known_challenges
+        } else {
+            &mut self.unknown_challenges
+        };
+        map.entry(peer.to_owned())
             .or_default()
-            .push(now);
+            .push(ChallengeCharge { id, at: now });
+        id
+    }
+
+    /// Return one known-challenge charge after a verified proof. The caller
+    /// passes the identifier that the proven session recorded, so the refund
+    /// cannot return a later unproven charge for the same address. A charge
+    /// that already expired is a no-op. A target device that holds the claimed
+    /// key is not limited by its own presence checks.
+    fn refund_known_challenge(&mut self, peer: &str, charge: ChallengeId) {
+        let Some(times) = self.known_challenges.get_mut(peer) else {
+            return;
+        };
+        let Some(index) = times.iter().position(|entry| entry.id == charge) else {
+            return;
+        };
+        times.remove(index);
+        if times.is_empty() {
+            self.known_challenges.remove(peer);
+        }
     }
 
     fn prune_invalid(&mut self, now: Duration) {
@@ -1668,6 +1772,12 @@ mod tests {
             }
         }
 
+        fn with_static_key(l_s_priv: [u8; 32]) -> Self {
+            let mut target = Self::new();
+            target.l_s_priv = l_s_priv;
+            target
+        }
+
         fn l_s(&self) -> [u8; 32] {
             public(&self.l_s_priv)
         }
@@ -1998,6 +2108,224 @@ mod tests {
             assert_eq!(result_status(&output), Some(PairingStatus::Busy));
             assert_eq!(responder.active_sessions(), 0);
         }
+    }
+
+    #[test]
+    fn known_key_claims_have_a_bounded_challenge_budget() {
+        let trust = TrustHandle::default();
+        let clock = TestClock::new(0);
+        let identity = TestIdentity::new();
+        let provider = valid_provider();
+        let mut responder = make_responder(&trust, &clock, &identity, &provider);
+        let mut target = Target::new();
+        trust.add_ok(&target.l_s());
+
+        // A trusted public key is public. A HELLO that claims it without a
+        // proof spends the known-claim budget before the ephemeral secret
+        // exists. This is the availability gap that the unknown budget alone
+        // left open.
+        for connection in 0..MAX_KNOWN_PEER_CHALLENGES as u64 {
+            let output = responder
+                .receive(connection, &target.hello(Some(1)), "peer-a", true)
+                .unwrap();
+            assert!(!output.close);
+            assert!(target.accept_challenge(&output).0);
+            responder.connection_closed(connection);
+        }
+        assert_eq!(identity.ephemeral_calls(), MAX_KNOWN_PEER_CHALLENGES);
+
+        let calls = identity.ephemeral_calls();
+        let output = responder
+            .receive(20, &target.hello(Some(1)), "peer-a", true)
+            .unwrap();
+        assert_eq!(result_status(&output), Some(PairingStatus::Busy));
+        assert_eq!(identity.ephemeral_calls(), calls);
+        assert_eq!(responder.active_sessions(), 0);
+
+        // Another source address has its own known-claim budget until the
+        // separate global known-claim limit.
+        let output = responder
+            .receive(21, &target.hello(Some(1)), "peer-b", true)
+            .unwrap();
+        assert!(target.accept_challenge(&output).0);
+        responder.connection_closed(21);
+        for index in 0..(MAX_KNOWN_CHALLENGES - MAX_KNOWN_PEER_CHALLENGES - 1) {
+            let connection = 30 + index as u64;
+            let output = responder
+                .receive(
+                    connection,
+                    &target.hello(Some(1)),
+                    &format!("peer-c{index}"),
+                    true,
+                )
+                .unwrap();
+            assert!(target.accept_challenge(&output).0);
+            responder.connection_closed(connection);
+        }
+        let calls = identity.ephemeral_calls();
+        assert_eq!(calls, MAX_KNOWN_CHALLENGES);
+        let output = responder
+            .receive(40, &target.hello(Some(1)), "peer-d", true)
+            .unwrap();
+        assert_eq!(result_status(&output), Some(PairingStatus::Busy));
+        assert_eq!(identity.ephemeral_calls(), calls);
+
+        // The known-claim and unknown budgets are separate. A real unknown
+        // target can still start while the known-claim budget is spent.
+        let mut stranger = Target::with_static_key([0x77; 32]);
+        let output = responder
+            .receive(41, &stranger.hello(None), "peer-e", true)
+            .unwrap();
+        assert!(!stranger.accept_challenge(&output).0);
+        assert_eq!(identity.ephemeral_calls(), calls + 1);
+        responder.connection_closed(41);
+
+        // The window clears the known-claim budget.
+        clock.advance(CHALLENGE_WINDOW_SECONDS);
+        let output = responder
+            .receive(42, &target.hello(Some(1)), "peer-a", true)
+            .unwrap();
+        assert!(target.accept_challenge(&output).0);
+    }
+
+    #[test]
+    fn sustained_known_status_probes_refund_their_challenge_charge() {
+        let trust = TrustHandle::default();
+        let clock = TestClock::new(0);
+        let identity = TestIdentity::new();
+        let provider = valid_provider();
+        let mut responder = make_responder(&trust, &clock, &identity, &provider);
+        let target = Target::new();
+        trust.add_ok(&target.l_s());
+
+        // A presence check runs about every 2 seconds. The known-claim budget
+        // is smaller than that rate, so every verified proof must refund its
+        // own charge. A real target device must not lock itself out.
+        for round in 0..30u64 {
+            clock.set(round * 2);
+            let mut probe = Target::new();
+            let output = responder
+                .receive(round, &probe.hello(Some(1)), "172.20.10.2", true)
+                .unwrap();
+            assert!(!output.close, "probe {round} gets a challenge");
+            let (known, _) = probe.accept_challenge(&output);
+            assert!(known, "probe {round} sees a known challenge");
+            let reveal = probe.reveal();
+            let output = responder
+                .receive(round, &reveal, "172.20.10.2", true)
+                .unwrap();
+            assert!(output.frames.is_empty());
+            assert!(!output.close);
+            responder.connection_closed(round);
+        }
+        assert_eq!(identity.ephemeral_calls(), 30);
+        assert!(responder.known_challenges.is_empty());
+        assert_eq!(responder.active_sessions(), 0);
+    }
+
+    #[test]
+    fn a_verified_proof_refunds_only_its_own_session_charge() {
+        let trust = TrustHandle::default();
+        let clock = TestClock::new(0);
+        let identity = TestIdentity::new();
+        let provider = valid_provider();
+        let mut responder = make_responder(&trust, &clock, &identity, &provider);
+        let older = Target::new();
+        trust.add_ok(&older.l_s());
+        let mut older = older;
+
+        // At t=0 the first session is charged.
+        let output = responder
+            .receive(1, &older.hello(Some(1)), "172.20.10.2", true)
+            .unwrap();
+        assert!(older.accept_challenge(&output).0);
+
+        // At t=4 a second session from the same address is charged. Both are
+        // live and each paid its own challenge.
+        clock.set(4);
+        let mut newer = Target::new();
+        let output = responder
+            .receive(2, &newer.hello(Some(1)), "172.20.10.2", true)
+            .unwrap();
+        assert!(newer.accept_challenge(&output).0);
+
+        // Only the older session proves, before its 5 second deadline. Its
+        // refund must remove the t=0 charge, not the latest t=4 charge.
+        let output = responder
+            .receive(1, &older.reveal(), "172.20.10.2", true)
+            .unwrap();
+        assert!(output.frames.is_empty());
+        assert!(!output.close);
+        responder.connection_closed(1);
+        responder.connection_closed(2);
+
+        let remaining: Vec<ChallengeCharge> = responder
+            .known_challenges
+            .values()
+            .flat_map(|charges| charges.iter().copied())
+            .collect();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].at, Duration::from_secs(4));
+        assert_eq!(responder.active_sessions(), 0);
+
+        // At t=61 the older charge would have expired. The unproven newer
+        // charge keeps its own t=4 window, so seven new claims fit and the
+        // eighth is refused. Popping the latest charge would have left no
+        // charge here and allowed eight.
+        clock.set(61);
+        for connection in 10..17u64 {
+            let probe = Target::new();
+            let output = responder
+                .receive(connection, &probe.hello(Some(1)), "172.20.10.2", true)
+                .unwrap();
+            assert!(!output.close, "claim {connection} after the refund");
+            responder.connection_closed(connection);
+        }
+        let charged: usize = responder.known_challenges.values().map(Vec::len).sum();
+        assert_eq!(charged, MAX_KNOWN_PEER_CHALLENGES);
+        let probe = Target::new();
+        let output = responder
+            .receive(20, &probe.hello(Some(1)), "172.20.10.2", true)
+            .unwrap();
+        assert_eq!(result_status(&output), Some(PairingStatus::Busy));
+        assert_eq!(identity.ephemeral_calls(), 9);
+        assert_eq!(responder.active_sessions(), 0);
+    }
+
+    #[test]
+    fn a_bad_proof_does_not_refund_a_known_claim() {
+        let trust = TrustHandle::default();
+        let clock = TestClock::new(0);
+        let identity = TestIdentity::new();
+        let provider = valid_provider();
+        let mut responder = make_responder(&trust, &clock, &identity, &provider);
+        let target = Target::new();
+        trust.add_ok(&target.l_s());
+
+        for round in 0..MAX_KNOWN_PEER_CHALLENGES as u64 {
+            let mut probe = Target::new();
+            let output = responder
+                .receive(round, &probe.hello(None), "peer-x", true)
+                .unwrap();
+            let (known, _) = probe.accept_challenge(&output);
+            assert!(known);
+            let mut reveal = probe.reveal();
+            // The proof is the last 32 bytes. A claim without the private key
+            // cannot produce a valid one.
+            *reveal.last_mut().unwrap() ^= 1;
+            let output = responder.receive(round, &reveal, "peer-x", true).unwrap();
+            assert_eq!(result_status(&output), Some(PairingStatus::Rejected));
+            responder.connection_closed(round);
+        }
+        assert_eq!(identity.ephemeral_calls(), MAX_KNOWN_PEER_CHALLENGES);
+
+        let calls = identity.ephemeral_calls();
+        let output = responder
+            .receive(40, &target.hello(None), "peer-x", true)
+            .unwrap();
+        assert_eq!(result_status(&output), Some(PairingStatus::Busy));
+        assert_eq!(identity.ephemeral_calls(), calls);
+        assert_eq!(responder.active_sessions(), 0);
     }
 
     #[test]

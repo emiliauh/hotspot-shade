@@ -1,4 +1,8 @@
 //! Connect the local GUI to the Rust service and administrator helper.
+#[cfg(test)]
+use crate::privileged;
+#[cfg(target_os = "macos")]
+use crate::tunnel_grant::TunnelGrant;
 use crate::{
     autostop, environment,
     gui::{phone_message, GuiBackend, PROBE_FRESH},
@@ -7,22 +11,23 @@ use crate::{
     phone::PhoneProxy,
     service::Service,
 };
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use crate::{
-    dns, privileged,
+    dns,
     service::{Ipv6Policy, TunOptions},
 };
 use serde_json::{json, Value};
 use std::io;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::os::fd::RawFd;
 use std::os::unix::net::UnixStream;
-#[cfg(target_os = "macos")]
-use std::path::Path;
-#[cfg(any(target_os = "macos", test))]
-use std::process::{Child, Command, Stdio};
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
+use std::process::Child;
+#[cfg(test)]
+use std::process::{Command, Stdio};
+#[cfg(test)]
 use std::sync::atomic::AtomicU8;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -31,20 +36,20 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// One privileged helper process. Only macOS starts a helper.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 struct Helper {
     stream: UnixStream,
     launcher: Child,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 fn io_stage(error: &io::Error) -> &'static str {
     match error.kind() {
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => "helper_timeout",
         _ => "helper_disconnected",
     }
 }
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 fn stderr_class(text: &str) -> u8 {
     if text.contains("panicked at") || text.contains("fatal runtime error") {
         3
@@ -57,7 +62,7 @@ fn stderr_class(text: &str) -> u8 {
     }
 }
 /// Drain child stderr and retain only an allowlisted classification.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 fn watch_stderr(
     mut input: impl Read + Send + 'static,
     result: Arc<AtomicU8>,
@@ -129,6 +134,32 @@ fn probe_target(host: Ipv4Addr, iface: Option<&str>) -> ProbeTarget {
         host,
         iface: iface.and_then(|name| normalization::interface_index(name).ok()),
     }
+}
+
+/// The physical default route at the moment a token-bearing connection starts.
+/// The source device is always the current hotspot gateway. A saved gateway
+/// from an earlier network is not evidence that the phone is still there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HotspotRoute {
+    host: Ipv4Addr,
+    iface: String,
+    index: u32,
+}
+
+/// Tests replace this with a route that does not depend on the host network.
+type RouteLookup = Arc<dyn Fn() -> Option<HotspotRoute> + Send + Sync>;
+
+/// Read the default route without the 30 second cache. The cached discovery
+/// feeds status and presence, but a start or a token check must see the network
+/// as it is now.
+fn discover_hotspot_route() -> Option<HotspotRoute> {
+    let route = environment::default_route().ok()?;
+    let index = normalization::interface_index(&route.interface).ok()?;
+    Some(HotspotRoute {
+        host: route.gateway?,
+        iface: route.interface,
+        index,
+    })
 }
 
 /// Cache a real answer for 30 seconds. The presence probe runs every 2 seconds
@@ -218,7 +249,7 @@ fn network_pair(
     cancel: Arc<AtomicBool>,
     on_code: &mut dyn FnMut(&str),
 ) -> Result<PhoneCredentials, PairError> {
-    let identity = Identity::load_or_create(&Identity::default_path()?)?;
+    let identity = pairing::local_identity()?;
     let (host, index) = discover_gateway().ok_or(PairError::NoPhone)?;
     pairing::pair(
         host,
@@ -242,8 +273,8 @@ fn store_pair_result(
         Ok(credentials) => {
             inner.credentials = Some(credentials.clone());
             inner.view = inner.resting_view();
-            // A new pairing supersedes a pending forget. A later FORGET must
-            // not revoke the new trust on the source device.
+            // A new pairing supersedes a local pending forget. Protocol v1
+            // cannot order a request already sent against source-side trust.
             if let Ok(mut state) = forget.lock() {
                 state.clear();
                 state.generation = state.generation.wrapping_add(1);
@@ -260,12 +291,22 @@ fn store_pair_result(
     }
 }
 
+fn pair_spawn_failed(shared: &Mutex<PairInner>, generation: u64) {
+    if let Ok(mut inner) = shared.lock() {
+        if inner.generation == generation {
+            inner.cancel = None;
+            inner.view = inner.resting_view();
+        }
+    }
+}
+
 fn run_pairing(
     shared: Arc<Mutex<PairInner>>,
     generation: u64,
     cancel: Arc<AtomicBool>,
     forget: Arc<Mutex<Forget>>,
     attempt: PairAttempt,
+    drain: Duration,
 ) {
     let update = |change: &mut dyn FnMut(&mut PairInner)| {
         if let Ok(mut inner) = shared.lock() {
@@ -274,6 +315,27 @@ fn run_pairing(
             }
         }
     };
+    // Wait for the local network attempt to finish before pairing. This
+    // reduces overlap, but a timeout does not prove that the source device
+    // processed the request: protocol v1 has no remote ordering barrier.
+    if !wait_for_forget_idle(&forget, drain, &cancel) {
+        update(&mut |inner| {
+            inner.cancel = None;
+            inner.view = PairView {
+                phase: PairPhase::Failed,
+                error: Some(FORGET_DRAIN_ERROR),
+                ..PairView::default()
+            };
+        });
+        return;
+    }
+    // The old FORGET has finished. Clear a pending retry only while this
+    // pairing still owns the state and was not cancelled. The pairing lock
+    // keeps a new forget request from starting between the check and the
+    // clear.
+    if !clear_forget_for_pairing(&shared, &forget, generation, &cancel) {
+        return;
+    }
     let result = attempt(Arc::clone(&cancel), &mut |code| {
         update(&mut |inner| {
             inner.view = PairView {
@@ -299,6 +361,9 @@ struct Presence {
     /// True when the last unpaired CHALLENGE said that the source device still
     /// trusts this target key. False for a CHALLENGE with known = 0. None when
     /// the last probe did not answer with a CHALLENGE.
+    ///
+    /// This is a plaintext claim, not proof. The auto-stop policy treats the
+    /// answer as unverified even when this value is true.
     trusted_by_source: Option<bool>,
 }
 
@@ -307,7 +372,7 @@ struct ZeroToken(String);
 impl ZeroToken {
     /// Move the token out. The caller must zero it or give it to a type with
     /// its own Drop. The wrapper stays empty and zeroes nothing.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn into_inner(mut self) -> String {
         std::mem::take(&mut self.0)
     }
@@ -324,6 +389,16 @@ impl Drop for ZeroToken {
 
 /// The maximum number of best-effort FORGET requests after one forget.
 const MAX_FORGET_TRIES: u8 = 3;
+
+/// The longest time a new pairing waits for an old FORGET network attempt to
+/// finish. A FORGET connect and its exchange each have a 2 second bound. The
+/// extra second covers route discovery and thread scheduling. If the attempt
+/// does not finish in this time, the pairing fails closed instead of starting
+/// while the old request may still reach the source device.
+const FORGET_DRAIN_LIMIT: Duration = Duration::from_secs(5);
+
+/// The fixed pairing text when an old FORGET is still in flight.
+const FORGET_DRAIN_ERROR: &str = "The previous forget is still running. Try again.";
 
 /// A best-effort FORGET that the source device has not confirmed yet.
 #[derive(Default)]
@@ -374,8 +449,7 @@ fn network_forget() -> bool {
     let Some((host, iface)) = discover_gateway() else {
         return false;
     };
-    let Ok(identity) = Identity::default_path().and_then(|path| Identity::load_or_create(&path))
-    else {
+    let Ok(identity) = pairing::local_identity() else {
         return false;
     };
     pairing::forget(
@@ -388,42 +462,126 @@ fn network_forget() -> bool {
     .is_ok()
 }
 
-/// Run one FORGET attempt in the background. A failed attempt stays pending,
-/// so the presence probe can retry when the source device is reachable.
-fn spawn_forget(forget: Arc<Mutex<Forget>>, network: ForgetNetwork) {
+/// Mark one FORGET attempt finished. Only the generation that started the
+/// attempt may change the attempt count or the outcome. The in-flight flag
+/// always clears, so a newer forget can start after an older attempt.
+fn finish_forget_attempt(forget: &Mutex<Forget>, generation: u64, confirmed: bool) {
+    if let Ok(mut state) = forget.lock() {
+        state.in_flight = false;
+        if state.generation == generation {
+            state.attempts = state.attempts.saturating_add(1);
+            if confirmed {
+                state.pending = false;
+                state.outcome = ForgetOutcome::Confirmed;
+            } else if state.attempts >= MAX_FORGET_TRIES {
+                state.pending = false;
+                state.outcome = ForgetOutcome::NotDelivered;
+            }
+        }
+    }
+}
+
+/// A FORGET worker could not start. No request reached the source device.
+/// End the pending state instead of leaving it set forever. A later Forget
+/// action starts a new attempt.
+fn forget_spawn_failed(forget: &Mutex<Forget>, generation: u64) {
+    if let Ok(mut state) = forget.lock() {
+        state.in_flight = false;
+        if state.generation == generation {
+            state.pending = false;
+            state.outcome = ForgetOutcome::NotDelivered;
+        }
+    }
+}
+
+type ForgetJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// Start one FORGET attempt with an injected spawner. The test seam proves
+/// that a failed spawn ends the pending state.
+fn spawn_forget_with<F>(forget: Arc<Mutex<Forget>>, network: ForgetNetwork, spawn: F) -> bool
+where
+    F: FnOnce(ForgetJob) -> io::Result<()>,
+{
     let generation = match forget.lock() {
         Ok(mut state) if state.pending && !state.in_flight => {
             state.in_flight = true;
             state.generation
         }
-        _ => return,
+        _ => return false,
     };
     let worker = Arc::clone(&forget);
-    let spawned = std::thread::Builder::new()
-        .name("hotspotshade-forget".into())
-        .spawn(move || {
-            let confirmed = network();
-            if let Ok(mut state) = worker.lock() {
-                // Clear the in-flight flag for the next generation too. Only
-                // this generation may change the attempt count.
-                state.in_flight = false;
-                if state.generation == generation {
-                    state.attempts = state.attempts.saturating_add(1);
-                    if confirmed {
-                        state.pending = false;
-                        state.outcome = ForgetOutcome::Confirmed;
-                    } else if state.attempts >= MAX_FORGET_TRIES {
-                        state.pending = false;
-                        state.outcome = ForgetOutcome::NotDelivered;
-                    }
-                }
-            }
-        });
-    if spawned.is_err() {
-        if let Ok(mut state) = forget.lock() {
-            state.in_flight = false;
+    let job: ForgetJob = Box::new(move || {
+        let confirmed = network();
+        finish_forget_attempt(&worker, generation, confirmed);
+    });
+    match spawn(job) {
+        Ok(()) => true,
+        Err(_) => {
+            forget_spawn_failed(&forget, generation);
+            false
         }
     }
+}
+
+/// Run one FORGET attempt in the background. A failed attempt stays pending,
+/// so the presence probe can retry when the source device is reachable.
+fn spawn_forget(forget: Arc<Mutex<Forget>>, network: ForgetNetwork) {
+    spawn_forget_with(forget, network, |job| {
+        std::thread::Builder::new()
+            .name("hotspotshade-forget".into())
+            .spawn(job)
+            .map(|_| ())
+    });
+}
+
+/// Wait until no FORGET attempt is in flight. Return false on timeout, a
+/// poisoned lock, or a cancel request.
+///
+/// The wait never cancels the network attempt. A cancel flag cannot retract
+/// bytes that were already sent, so a new pairing must wait for the attempt
+/// to return instead.
+fn wait_for_forget_idle(forget: &Mutex<Forget>, limit: Duration, cancel: &AtomicBool) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return false;
+        }
+        let in_flight = match forget.lock() {
+            Ok(state) => state.in_flight,
+            Err(_) => return false,
+        };
+        if !in_flight {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(10)));
+    }
+}
+
+/// Clear a pending FORGET after its attempt has finished. The pairing lock is
+/// held across the check and the clear, so a forget request cannot start
+/// between them. Return false when this pairing is stale or was cancelled.
+fn clear_forget_for_pairing(
+    shared: &Mutex<PairInner>,
+    forget: &Mutex<Forget>,
+    generation: u64,
+    cancel: &AtomicBool,
+) -> bool {
+    let Ok(inner) = shared.lock() else {
+        return false;
+    };
+    if inner.generation != generation || cancel.load(Ordering::Acquire) {
+        return false;
+    }
+    let Ok(mut state) = forget.lock() else {
+        return false;
+    };
+    state.clear();
+    state.generation = state.generation.wrapping_add(1);
+    true
 }
 
 /// One presence probe. The state is always fixed text. `info` is present only
@@ -747,8 +905,7 @@ fn presence_probe(paired: bool, stop: &AtomicBool, target: Option<ProbeTarget>) 
         },
     };
     let address = SocketAddr::V4(SocketAddrV4::new(host, pairing::PAIRING_PORT));
-    let Ok(identity) = Identity::default_path().and_then(|path| Identity::load_or_create(&path))
-    else {
+    let Ok(identity) = pairing::local_identity() else {
         return ProbeResult {
             state: "not_responding",
             info: None,
@@ -771,6 +928,39 @@ fn presence_probe(paired: bool, stop: &AtomicBool, target: Option<ProbeTarget>) 
 fn connect_error_state(error: &io::Error) -> &'static str {
     match error.kind() {
         io::ErrorKind::ConnectionRefused => "not_running",
+        _ => "not_responding",
+    }
+}
+
+/// The presence state for a status exchange that ended with an error.
+///
+/// The answers `Busy`, `NotActive`, and `LockedOut` are plaintext RESULT
+/// frames that the listener sends before it authenticates anyone, so they say
+/// that something answered, not that the app is ready or trusted:
+///
+/// - `Busy`: the listener is saturated or holds a prompt. `checking`.
+/// - `NotActive` and `LockedOut`: the listener answers an unknown key this
+///   way. It does not hold this target key, the same claim as `Rejected`.
+///   A paired target reports `not_trusted`; an unpaired one reports
+///   `unpaired`.
+///
+/// `checking`, `unpaired`, and `not_trusted` are unverified answers. The
+/// auto-stop policy treats them as neither presence nor silence, and bounds a
+/// continuous run with [`crate::autostop::UNVERIFIED_GRACE`]. A timeout, a
+/// protocol or decrypt failure, a transport error, a missing identity,
+/// `Denied`, `TimedOut`, and an unexpected `Ok` stay `not_responding`: none
+/// of them is a valid answer to a status request.
+fn status_failure_state(error: &PairError, paired: bool) -> &'static str {
+    match error {
+        PairError::Phone(pairing::PhoneStatus::Rejected) if paired => "not_trusted",
+        PairError::Phone(pairing::PhoneStatus::Busy) => "checking",
+        PairError::Phone(pairing::PhoneStatus::NotActive | pairing::PhoneStatus::LockedOut) => {
+            if paired {
+                "not_trusted"
+            } else {
+                "unpaired"
+            }
+        }
         _ => "not_responding",
     }
 }
@@ -827,8 +1017,8 @@ fn probe_address(
                 cancelled: false,
             },
             Err(PairError::Cancelled) => ProbeResult::cancelled(),
-            Err(_) => ProbeResult {
-                state: "not_responding",
+            Err(error) => ProbeResult {
+                state: status_failure_state(&error, false),
                 info: None,
                 gateway: Some(host),
                 trusted_by_source: None,
@@ -851,16 +1041,9 @@ fn probe_address(
             trusted_by_source: None,
             cancelled: false,
         },
-        Err(PairError::Phone(pairing::PhoneStatus::Rejected)) => ProbeResult {
-            state: "not_trusted",
-            info: None,
-            gateway: Some(host),
-            trusted_by_source: None,
-            cancelled: false,
-        },
         Err(PairError::Cancelled) => ProbeResult::cancelled(),
-        Err(_) => ProbeResult {
-            state: "not_responding",
+        Err(error) => ProbeResult {
+            state: status_failure_state(&error, true),
             info: None,
             gateway: Some(host),
             trusted_by_source: None,
@@ -896,10 +1079,15 @@ fn record_probe_for_run(
     if let (Some(gateway), Some(info)) = (result.gateway, result.info.as_ref()) {
         apply_probe(pairing, gateway, info);
     }
+    // Store the answer unchanged. A plaintext `checking`, `unpaired`, or
+    // `not_trusted` answer stays visible, but the auto-stop policy treats it
+    // as unverified and bounds a continuous run. Do not turn it into presence
+    // or into source device silence here.
+    let now = Instant::now();
     presence.state = Some(result.state);
     presence.connections = result.info.as_ref().map(|info| info.connections);
     presence.checked_at = Some(now_unix());
-    presence.checked = Some(Instant::now());
+    presence.checked = Some(now);
     presence.trusted_by_source = result.trusted_by_source;
     true
 }
@@ -958,18 +1146,21 @@ enum Phase {
         socket: Arc<Mutex<Option<UnixStream>>>,
     },
     Local,
-    /// A privileged helper owns the tunnel. Only macOS starts a helper.
-    #[cfg(any(target_os = "macos", test))]
+    /// A privileged helper owns the tunnel. The legacy Unix helper path is
+    /// retained only for the hermetic tests; production uses XPC.
+    #[cfg(test)]
     Remote(Arc<Mutex<Helper>>),
-    /// A helper process did not exit after a failed start. Only macOS starts a
-    /// helper.
-    #[cfg(target_os = "macos")]
-    Stuck(Arc<Mutex<Child>>),
     Stopping,
 }
 
 /// The phase, port, source host, and pinned interface of one successful start.
 type StartOutcome = (Phase, Option<u16>, Option<Ipv4Addr>, Option<String>);
+
+#[cfg(test)]
+thread_local! {
+    /// One test can request a panic in the next tunnel start branch.
+    static PANIC_NEXT_TUN_START: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Recover a start that panicked before it published its phase.
 ///
@@ -1002,9 +1193,10 @@ impl Drop for StartRecovery<'_> {
         }
         // A local service may already run. A helper start is stopped by its
         // own cleanup guard when the socket closes. A poisoned service lock
-        // must not hide the phase recovery.
+        // must not hide the phase recovery. The stop result stays in the
+        // service's cleanup flag, so the next stop or process exit reports it.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.backend.service.stop();
+            let _ = self.backend.service.stop_checked();
         }));
         self.backend.cancel_run();
         if let Ok(mut phase) = self.backend.phase.lock() {
@@ -1042,7 +1234,7 @@ impl Drop for StopRecovery<'_> {
             return;
         };
         let local = matches!(original, Phase::Local);
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(test)]
         let helper = match &original {
             Phase::Remote(helper) => Some(Arc::clone(helper)),
             _ => None,
@@ -1052,10 +1244,10 @@ impl Drop for StopRecovery<'_> {
         }
         if local {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.backend.service.stop();
+                let _ = self.backend.service.stop_checked();
             }));
         }
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(test)]
         if let Some(helper) = helper {
             if let Ok(helper) = helper.lock() {
                 let _ = helper.stream.shutdown(std::net::Shutdown::Both);
@@ -1083,10 +1275,15 @@ pub struct RustGuiBackend {
     /// The source host and physical interface of a running phone tunnel. The
     /// presence probe uses them for the whole run.
     probe_target: Arc<Mutex<Option<ProbeTarget>>>,
+    /// The current default route for a token-bearing start or check. It is a
+    /// fresh lookup, not the cached status value. Tests replace it.
+    route_lookup: RouteLookup,
     /// A FORGET that the source device has not confirmed yet.
     forget: Arc<Mutex<Forget>>,
     /// The network FORGET. Tests replace it with a local closure.
     forget_network: ForgetNetwork,
+    /// The longest wait for an old FORGET before a new pairing fails closed.
+    forget_drain: Duration,
     /// One pairing attempt. Tests replace it with a local closure.
     pair_attempt: PairAttempt,
     /// One presence probe. Tests replace it with a local closure.
@@ -1112,17 +1309,76 @@ pub struct RustGuiBackend {
     /// True while the engine believes that a tunnel runs. A stop that the
     /// engine did not start is reported as an error stop.
     was_running: AtomicBool,
+    /// Set once when the HTTP server begins shutdown. A request that passed
+    /// its own stop check before shutdown must not start a tunnel after the
+    /// final stop.
+    closing: AtomicBool,
     changed: Condvar,
     experimental_icmp: bool,
     experimental_icmp_persistent: bool,
+    /// The one-time administrator grant that the protected helper writes for
+    /// this engine. A start that changes routes consumes it. A manually
+    /// started root GUI has no grant file and keeps the old root authority.
+    #[cfg(target_os = "macos")]
+    tunnel_grant: Option<TunnelGrant>,
+    /// True when a route-changing start needs a grant even if no grant file is
+    /// present. The helper-owned engine always sets it, including when it
+    /// imports pairing credentials. An absent grant is then a refusal, not a
+    /// fallback to root authority.
+    #[cfg(target_os = "macos")]
+    tunnel_grant_required: bool,
+    /// True for a Linux root engine. The pkexec authorization covers a
+    /// route-changing tunnel only, so any other start mode, such as a local
+    /// SOCKS5 listener, is refused with `mode_not_allowed` instead of running
+    /// as root. The unit tests build it on every Unix host.
+    #[cfg(any(target_os = "linux", test))]
+    tunnel_modes_only: bool,
+    /// The private write descriptor for one pairing handoff to an elevated
+    /// engine. Only the user-owned engine sets it. The root engine never
+    /// exports a handoff.
+    handoff_fd: Mutex<Option<RawFd>>,
+    /// The identity bytes for the handoff. The user engine sets these once at
+    /// launch after it reads its key file, so a handoff never reopens the user
+    /// key on the request thread. A missing value falls back to the key file.
+    /// The bytes are cleared when the backend drops.
+    handoff_identity: Mutex<Option<zeroize::Zeroizing<[u8; 32]>>>,
 }
 impl RustGuiBackend {
+    /// Start the local SOCKS5 service. A unit test uses the loopback seam;
+    /// a production build can reach only the guarded service entry.
+    fn start_socks_service(
+        &self,
+        address: SocketAddr,
+        iface: Option<&str>,
+        dns: Option<Vec<SocketAddr>>,
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            self.service.start_socks_loopback(address, iface, dns)
+        }
+        #[cfg(not(test))]
+        {
+            self.service.start_socks(address, iface, dns)
+        }
+    }
     /// The default source device tunnel turns the echo relay on.
     pub fn new(service: Arc<Service>) -> Self {
         Self::with_icmp_options(service, true, true)
     }
     pub fn with_experimental_icmp(service: Arc<Service>, experimental_icmp: bool) -> Self {
         Self::with_icmp_options(service, experimental_icmp, experimental_icmp)
+    }
+
+    /// Use the one-time grant that the protected helper writes. The helper
+    /// starts the engine without an administrator prompt, so the engine itself
+    /// refuses a route-changing start until the grant proves that a person
+    /// authorized that start.
+    #[cfg(target_os = "macos")]
+    pub fn with_tunnel_grant(service: Arc<Service>, grant: TunnelGrant) -> Self {
+        let mut backend = Self::with_icmp_options(service, true, true);
+        backend.tunnel_grant = Some(grant);
+        backend.tunnel_grant_required = true;
+        backend
     }
     /// Set the default echo relay values for a start request that does not
     /// name them. A request value wins.
@@ -1140,8 +1396,10 @@ impl RustGuiBackend {
             tunnel_phone_port: Mutex::new(None),
             tunnel_iface: Mutex::new(None),
             probe_target: Arc::new(Mutex::new(None)),
+            route_lookup: Arc::new(discover_hotspot_route),
             forget: Arc::new(Mutex::new(Forget::default())),
             forget_network: Arc::new(network_forget),
+            forget_drain: FORGET_DRAIN_LIMIT,
             pair_attempt: Arc::new(network_pair),
             probe_attempt: Arc::new(presence_probe),
             observer: Arc::new(Mutex::new(ObserverControl::default())),
@@ -1152,15 +1410,172 @@ impl RustGuiBackend {
             run_id: Arc::new(AtomicU64::new(0)),
             last_stop: Mutex::new(None),
             was_running: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             changed: Condvar::new(),
             experimental_icmp,
             experimental_icmp_persistent,
+            #[cfg(target_os = "macos")]
+            tunnel_grant: None,
+            #[cfg(target_os = "macos")]
+            tunnel_grant_required: false,
+            #[cfg(any(target_os = "linux", test))]
+            tunnel_modes_only: false,
+            handoff_fd: Mutex::new(None),
+            handoff_identity: Mutex::new(None),
         }
+    }
+
+    /// Build the root engine from the one pairing handoff that the helper
+    /// passed on an inherited descriptor. The imported identity replaces the
+    /// root HOME key so the source device sees the same target public key.
+    /// The credentials stay in process memory and are never sent in a status
+    /// answer.
+    ///
+    /// Imported credentials never relax the administrator boundary. The helper
+    /// always passes the grant path that it writes after it verifies the
+    /// authorization, so an imported engine still needs a fresh grant before
+    /// it changes a route. A missing grant path is a refusal, not a fallback
+    /// to root authority.
+    #[cfg(target_os = "macos")]
+    pub fn with_imported_credentials(
+        service: Arc<Service>,
+        identity: Identity,
+        credentials: PhoneCredentials,
+        grant: Option<TunnelGrant>,
+    ) -> Result<Self, PairError> {
+        // The imported key is process-wide and must be set before any probe,
+        // pairing, or forget path runs. A second import with a different key is
+        // refused, which keeps the first handoff authoritative.
+        pairing::set_imported_identity(identity.secret_bytes())?;
+        let mut backend = Self::with_icmp_options(service, true, true);
+        let mut inner = PairInner {
+            credentials: Some(credentials),
+            ..PairInner::default()
+        };
+        inner.view = inner.resting_view();
+        backend.pairing = Arc::new(Mutex::new(inner));
+        backend.tunnel_grant = grant;
+        backend.tunnel_grant_required = true;
+        Ok(backend)
+    }
+
+    /// Build the Linux root engine from the one pairing handoff that the
+    /// pkexec helper passed on an inherited descriptor. The imported identity
+    /// replaces the root HOME key, so the source device sees the same target
+    /// public key as the user engine. The credentials stay in process memory
+    /// and are never sent in a status answer.
+    ///
+    /// polkit authorized the helper launch before this engine existed, so the
+    /// Linux root engine has no separate grant file. The unit tests build it
+    /// on every Unix host so the import path is checked on macOS too.
+    #[cfg(any(target_os = "linux", test))]
+    pub fn with_imported_pairing(
+        service: Arc<Service>,
+        identity: Identity,
+        credentials: PhoneCredentials,
+    ) -> Result<Self, PairError> {
+        // Process-wide, set before any probe, pairing, or forget path runs. A
+        // second import with a different key is refused.
+        pairing::set_imported_identity(identity.secret_bytes())?;
+        let mut backend = Self::with_icmp_options(service, true, true);
+        let mut inner = PairInner {
+            credentials: Some(credentials),
+            ..PairInner::default()
+        };
+        inner.view = inner.resting_view();
+        backend.pairing = Arc::new(Mutex::new(inner));
+        backend.tunnel_modes_only = true;
+        Ok(backend)
+    }
+
+    /// Accept only the tunnel start modes, `phone` and `tun`. The Linux entry
+    /// point calls this for every root engine, including a direct mode engine
+    /// that the helper starts with no pairing handoff.
+    #[cfg(any(target_os = "linux", test))]
+    pub fn restrict_to_tunnel_modes(&mut self) {
+        self.tunnel_modes_only = true;
+    }
+
+    /// Give the user engine the private write end of the pairing handoff pipe.
+    /// The app holds the read end. The engine writes the identity and the
+    /// credentials on each start request. The descriptor stays open for later
+    /// attempts and is closed when the engine exits.
+    pub fn set_handoff_fd(&self, descriptor: RawFd) {
+        if let Ok(mut slot) = self.handoff_fd.lock() {
+            *slot = Some(descriptor);
+        }
+    }
+
+    /// Give the user engine the identity that its handoff must carry. The
+    /// caller reads this once from the user key file before the engine serves
+    /// a request. The bytes stay in this process memory.
+    pub fn set_handoff_identity(&self, secret: [u8; 32]) {
+        if let Ok(mut slot) = self.handoff_identity.lock() {
+            *slot = Some(zeroize::Zeroizing::new(secret));
+        }
+    }
+
+    /// Test seam: store a pairing as if the pairing flow had completed, so a
+    /// route test in another module can drive the real handoff.
+    #[cfg(test)]
+    pub(crate) fn set_pairing_for_test(&self, credentials: PhoneCredentials) {
+        self.pairing.lock().unwrap().credentials = Some(credentials);
+    }
+
+    /// Write the current pairing to the private handoff descriptor. This is
+    /// the only path that moves the token out of the user engine. The response
+    /// reports success and never repeats the token, key, host, or port.
+    pub fn pair_handoff(&self) -> Result<Value, String> {
+        // A running tunnel already owns the routes. A handoff at that point
+        // would start a second engine over a live one.
+        let status = self.service.status();
+        if status["running"] == true {
+            return Err("tunnel_running".into());
+        }
+        let credentials = {
+            let inner = self.pairing.lock().map_err(|_| "pairing_unavailable")?;
+            inner
+                .credentials
+                .clone()
+                .ok_or_else(|| "not_paired".to_string())?
+        };
+        let identity = match self
+            .handoff_identity
+            .lock()
+            .map_err(|_| "handoff_unavailable".to_string())?
+            .as_ref()
+        {
+            Some(secret) => Identity::from_bytes(**secret),
+            None => pairing::local_identity().map_err(|error| error.message().to_string())?,
+        };
+        let descriptor = *self
+            .handoff_fd
+            .lock()
+            .map_err(|_| "handoff_unavailable")?
+            .as_ref()
+            .ok_or_else(|| "handoff_unavailable".to_string())?;
+        // The descriptor stays open for a later start attempt. The app only
+        // calls this immediately before it asks the helper for an elevated
+        // engine. A failed authorization leaves the same pairing queued, and a
+        // later attempt reads the same credentials.
+        let result = crate::credential_handoff::write_handoff(descriptor, &identity, &credentials);
+        result.map_err(|error| error.message().to_string())?;
+        Ok(json!({"ok": true}))
     }
 
     fn begin(&self) -> Result<HelperSession, String> {
         let mut phase = self.phase.lock().map_err(|_| "service state unavailable")?;
-        if !matches!(*phase, Phase::Idle) || self.service.status()["running"] == true {
+        // Check the shutdown flag under the phase lock. Shutdown sets the flag
+        // before its first stop. A start that reaches this point after the
+        // final stop sees the flag and starts nothing.
+        if self.closing.load(Ordering::Acquire) {
+            return Err("service is stopping".into());
+        }
+        let status = self.service.status();
+        if status["state"] == "unknown" {
+            return Err(crate::service::SERVICE_STATE_UNAVAILABLE_MESSAGE.into());
+        }
+        if !matches!(*phase, Phase::Idle) || status["running"] == true {
             return Err("service is running".into());
         }
         // A new run starts with no stale presence. An in-flight probe from the
@@ -1222,14 +1637,14 @@ impl RustGuiBackend {
         self.changed.notify_all();
         Ok(())
     }
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(test)]
     fn finish(&self, phase_value: Phase) {
         if let Ok(mut phase) = self.phase.lock() {
             *phase = phase_value;
             self.changed.notify_all();
         }
     }
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(test)]
     fn active_helper(&self) -> Option<Arc<Mutex<Helper>>> {
         self.phase.lock().ok().and_then(|p| match &*p {
             Phase::Remote(h) => Some(Arc::clone(h)),
@@ -1241,7 +1656,7 @@ impl RustGuiBackend {
     /// A socket error alone is not proof. The privileged engine keeps the
     /// tunnel, and the launcher waits for it. A reaped child is a definite
     /// death. A locked or unavailable state is not.
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(test)]
     fn helper_exited(helper: &Arc<Mutex<Helper>>) -> bool {
         helper
             .lock()
@@ -1253,7 +1668,7 @@ impl RustGuiBackend {
     /// A status answer can finish after a stop or a new start replaced the
     /// helper. The run id and the helper identity must both match before any
     /// side effect touches a helper.
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(test)]
     fn helper_is_current(&self, observed_run: u64, helper: &Arc<Mutex<Helper>>) -> bool {
         if self.run_id.load(Ordering::Acquire) != observed_run
             || !self.was_running.load(Ordering::Acquire)
@@ -1270,7 +1685,7 @@ impl RustGuiBackend {
     }
     /// Send the final stop and close only to the helper that still owns the
     /// observed run. Return false when a newer run owns the phase.
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(test)]
     fn finalize_helper_for_run(&self, observed_run: u64, helper: &Arc<Mutex<Helper>>) -> bool {
         if !self.helper_is_current(observed_run, helper) {
             return false;
@@ -1293,7 +1708,7 @@ impl RustGuiBackend {
     /// The helper must get its final stop and close before this call. The
     /// phase lock covers the tunnel data clear, the error stop record, and the
     /// run id. A start that follows cannot be corrupted by late cleanup.
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(test)]
     fn retire_dead_helper(&self, helper: &Arc<Mutex<Helper>>) -> bool {
         let retired = match self.phase.lock() {
             Ok(mut phase) => match &*phase {
@@ -1321,14 +1736,28 @@ impl RustGuiBackend {
     }
     /// Publish Idle after a stop. The phase lock keeps a new start out until
     /// the old tunnel data is gone and the stop is recorded.
-    fn finish_stop(&self, reason: &'static str) -> Result<(), String> {
+    ///
+    /// The returned value is the cleanup failure when the service cannot prove
+    /// that routes and devices are gone. The phase is still published as Idle,
+    /// because the tunnel is not running, but the caller must return that
+    /// failure. The engine exit path turns it into a nonzero exit so the Swift
+    /// helper does not clear its durable launch intent on an unclean stop.
+    fn finish_stop(&self, reason: &'static str) -> Result<Option<String>, String> {
+        let cleanup_error = self
+            .service
+            .cleanup_uncertain()
+            .then_some(crate::service::CLEANUP_UNCERTAIN_MESSAGE);
         let mut phase = self.phase.lock().map_err(|_| "service state unavailable")?;
         self.clear_tunnel_run();
-        self.record_stop(reason);
+        if cleanup_error.is_some() {
+            self.record_stop("error");
+        } else {
+            self.record_stop(reason);
+        }
         self.bump_run();
         *phase = Phase::Idle;
         self.changed.notify_all();
-        Ok(())
+        Ok(cleanup_error.map(str::to_owned))
     }
     /// Restore the phase of a stop that panicked before it published Idle.
     ///
@@ -1362,11 +1791,11 @@ impl RustGuiBackend {
         {
             return false;
         }
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(test)]
         if !matches!(*phase, Phase::Local | Phase::Remote(_)) {
             return false;
         }
-        #[cfg(not(any(target_os = "macos", test)))]
+        #[cfg(not(test))]
         if !matches!(*phase, Phase::Local) {
             return false;
         }
@@ -1707,7 +2136,34 @@ impl RustGuiBackend {
             .map(|c| (c.host, c.port, c.token.clone()))
             .ok_or_else(|| "pair_first".into())
     }
+    /// Require `host` to be the gateway of the current physical default route.
+    ///
+    /// A saved credential can name the gateway of a network that is gone. A
+    /// manual request can name any address. The proxy token crosses the
+    /// hotspot link in cleartext, so it may go only to the source device on the
+    /// hotspot that is connected now. The route is read fresh and the caller
+    /// pins the connection to that interface. A public gateway is refused: a
+    /// hotspot gateway is always a private address, so a public address cannot
+    /// be the source device.
+    ///
+    /// The stored credential holds only the gateway address. Two different
+    /// networks that use the same private gateway address cannot be told
+    /// apart here. Storing a network identity with the credential is open
+    /// work; this check removes the old-network and arbitrary-host paths, not
+    /// that same-address case.
+    fn require_hotspot_gateway(&self, host: Ipv4Addr) -> Result<HotspotRoute, String> {
+        let route = (self.route_lookup)().ok_or("no_hotspot")?;
+        if !route.host.is_private() || route.host != host {
+            return Err("source_device_moved".into());
+        }
+        Ok(route)
+    }
     fn with_pairing(&self, mut status: Value) -> Value {
+        // A poisoned service cannot establish whether a tunnel is running.
+        // Cached presence, interface, and stop data cannot fill that gap.
+        if status.get("state").and_then(Value::as_str) == Some("unknown") {
+            return status;
+        }
         // Read each lock alone. The pairing lock is not held with another lock.
         let observer_failed = self.observer_failed();
         let tunnel_port = self
@@ -1842,18 +2298,25 @@ impl RustGuiBackend {
             .and_then(Value::as_str)
             .is_some_and(|t| !t.is_empty());
         let (host, port, token) = self.phone_target(options)?;
+        /* Wrap the token before the check. Every early return then zeroes this
+         * copy instead of dropping a plain String. */
         let token = ZeroToken(token);
+        let route = self.require_hotspot_gateway(host)?;
         let started_port = (!manual).then_some(port);
-        #[cfg(target_os = "macos")]
+        // A root engine starts the tunnel in its own process. The macOS app
+        // opens a helper to gain root; the Linux app starts the packaged
+        // engine through pkexec, so that engine is already root.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if unsafe { libc::geteuid() } == 0 {
             let proxy = PhoneProxy {
                 address: SocketAddr::V4(SocketAddrV4::new(host, port)),
                 username: "hotspotshade".into(),
                 token: token.into_inner(),
-                iface: None,
+                iface: Some(route.index),
                 timeout: Duration::from_secs(5),
             };
             let options = TunOptions {
+                iface: Some(route.iface.clone()),
                 ipv6: Ipv6Policy::Forward,
                 icmp_phone: icmp_enabled,
                 icmp_persistent,
@@ -1877,11 +2340,12 @@ impl RustGuiBackend {
             };
             return Ok((Phase::Local, started_port, host, pinned));
         }
-        #[cfg(not(target_os = "macos"))]
+        // A non-root Linux engine cannot open the TUN device or change the
+        // routing table. Report the privilege requirement instead of trying a
+        // helper that does not exist on this platform.
+        #[cfg(target_os = "linux")]
         {
             let _ = (
-                host,
-                port,
                 token,
                 cancel,
                 slot,
@@ -1889,173 +2353,27 @@ impl RustGuiBackend {
                 icmp_enabled,
                 icmp_persistent,
             );
-            Err("administrator helper is available on macOS only".into())
+            Err("admin_required".into())
         }
         #[cfg(target_os = "macos")]
         {
-            if cancel.load(Ordering::Acquire) {
-                return Err("start_cancelled".into());
-            }
-            let listener = privileged::PrivateListener::create().map_err(|_| "private_listener")?;
-            let uid = unsafe { libc::getuid() } as u32;
-            if uid == 0 {
-                return Err("expected an unprivileged user".into());
-            }
-            let script = admin_script(listener.path(), uid).map_err(|_| "launcher_start")?;
-            if cancel.load(Ordering::Acquire) {
-                return Err("start_cancelled".into());
-            }
-            let mut child = Command::new("/usr/bin/osascript")
-                .arg("-e")
-                .arg(script)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|_| "launcher_start")?;
-            let diagnostics = Arc::new(AtomicU8::new(0));
-            let stderr = child
-                .stderr
-                .take()
-                .map(|stream| watch_stderr(stream, Arc::clone(&diagnostics)));
-            let mut connected = false;
-            let mut pinned_iface: Option<String> = None;
-            let result = (|| -> Result<UnixStream, String> {
-                let deadline = Instant::now() + Duration::from_secs(90);
-                loop {
-                    if cancel.load(Ordering::Acquire) {
-                        return Err("start_cancelled".into());
-                    }
-                    if Instant::now() >= deadline {
-                        return Err("authorization_timeout".into());
-                    }
-                    if child.try_wait().map_err(|_| "launcher_start")?.is_some() {
-                        return Err("authorization_cancelled".into());
-                    }
-                    match listener.accept(0, Duration::from_millis(100)) {
-                        Ok(mut stream) => {
-                            connected = true;
-                            stream
-                                .set_read_timeout(Some(Duration::from_secs(20)))
-                                .map_err(|_| "helper_connection")?;
-                            stream
-                                .set_write_timeout(Some(Duration::from_secs(20)))
-                                .map_err(|_| "helper_connection")?;
-                            *slot.lock().map_err(|_| "helper_connection")? =
-                                Some(stream.try_clone().map_err(|_| "helper_connection")?);
-                            if cancel.load(Ordering::Acquire) {
-                                let _ = stream.shutdown(std::net::Shutdown::Both);
-                                return Err("start_cancelled".into());
-                            }
-                            let mut request = phone_start_request(
-                                host,
-                                port,
-                                &token.0,
-                                icmp_enabled,
-                                icmp_persistent,
-                            );
-                            let sent = privileged::send(&mut stream, &request);
-                            zero_request_token(&mut request);
-                            sent.map_err(|e| io_stage(&e))?;
-                            let response =
-                                privileged::receive(&mut stream).map_err(|e| io_stage(&e))?;
-                            if response.get("ok") != Some(&Value::Bool(true)) {
-                                let code = response
-                                    .get("error_code")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("service_start");
-                                return Err(match code {
-                                    "phone_auth" => "phone_auth",
-                                    "route_setup" => "route_setup",
-                                    "tunnel_setup" => "tunnel_setup",
-                                    _ => "service_start",
-                                }
-                                .into());
-                            }
-                            // Inspect the helper status, not the pre-start
-                            // default route. A helper that answers ok but is not
-                            // running the expected mode is a failed start.
-                            let status = response.get("status").cloned().unwrap_or(Value::Null);
-                            pinned_iface = match started_status_iface(&status, "phone") {
-                                Ok(pinned) => pinned,
-                                Err(error) => {
-                                    let _ = stream.shutdown(std::net::Shutdown::Both);
-                                    return Err(error);
-                                }
-                            };
-                            if cancel.load(Ordering::Acquire) {
-                                let _ = stream.shutdown(std::net::Shutdown::Both);
-                                return Err("start_cancelled".into());
-                            }
-                            return Ok(stream);
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
-                        Err(_) => return Err("helper_connection".into()),
-                    }
-                }
-            })();
-            match result {
-                Ok(stream) => {
-                    if let Ok(mut s) = slot.lock() {
-                        *s = None;
-                    }
-                    Ok((
-                        Phase::Remote(Arc::new(Mutex::new(Helper {
-                            stream,
-                            launcher: child,
-                        }))),
-                        started_port,
-                        host,
-                        pinned_iface,
-                    ))
-                }
-                Err(mut e) => {
-                    if let Ok(mut s) = slot.lock() {
-                        if let Some(stream) = s.take() {
-                            let _ = stream.shutdown(std::net::Shutdown::Both);
-                        }
-                    }
-                    let mut exited = false;
-                    if !connected {
-                        let _ = child.kill();
-                        exited = child.wait().is_ok();
-                    } else {
-                        let deadline = Instant::now() + Duration::from_secs(20);
-                        while Instant::now() < deadline {
-                            match child.try_wait() {
-                                Ok(Some(_)) => {
-                                    exited = true;
-                                    break;
-                                }
-                                Err(_) => break,
-                                Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-                            }
-                        }
-                        if !exited {
-                            self.finish(Phase::Stuck(Arc::new(Mutex::new(child))));
-                        }
-                    }
-                    if exited {
-                        if let Some(reader) = stderr {
-                            let _ = reader.join();
-                        }
-                        if e == "helper_disconnected" {
-                            e = match diagnostics.load(Ordering::Acquire) {
-                                3 => "helper_panic",
-                                2 => "helper_permission",
-                                1 => "helper_error",
-                                _ => "helper_disconnected",
-                            }
-                            .into();
-                        }
-                    }
-                    Err(e)
-                }
-            }
+            // The macOS app starts real-mode engines through the installed
+            // protected XPC helper. This process is not root, so it cannot
+            // create a utun or change routes. Do not run a copy of this
+            // user-writable binary as root. Report the missing helper.
+            let _ = (
+                token,
+                cancel,
+                slot,
+                started_port,
+                icmp_enabled,
+                icmp_persistent,
+            );
+            Err("protected_helper_required".into())
         }
     }
 }
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn worker_count() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().clamp(1, 4))
@@ -2063,15 +2381,33 @@ fn worker_count() -> usize {
 }
 /// Map a source device start failure to a fixed code. The text is not a
 /// secret. The HTTP layer maps `phone_auth` to its own fixed message.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn phone_start_error(error: io::Error) -> String {
-    if error.to_string() == "phone_auth" {
-        "phone_auth".into()
-    } else {
-        "source device start failed".into()
+    match error.to_string().as_str() {
+        "phone_auth" => "phone_auth".into(),
+        "source_device_moved" => "source_device_moved".into(),
+        _ if error.kind() == io::ErrorKind::Interrupted => "start_cancelled".into(),
+        _ if error.kind() == io::ErrorKind::PermissionDenied => "admin_required".into(),
+        _ => "source device start failed".into(),
     }
 }
-#[cfg(any(target_os = "macos", test))]
+/// Map a direct tunnel start failure to a fixed code. The page has its own
+/// text for each known code. The service is the authority on the privilege
+/// check and on the route and device stages, so this mapping must not hide a
+/// real service code behind one generic failure.
+#[cfg(any(unix, test))]
+fn direct_start_error(error: io::Error) -> String {
+    match error.kind() {
+        io::ErrorKind::Interrupted => "start_cancelled".into(),
+        io::ErrorKind::PermissionDenied => "admin_required".into(),
+        _ => match error.to_string().as_str() {
+            "route_setup" => "route_setup".into(),
+            "tunnel_setup" => "tunnel_setup".into(),
+            _ => "service_start".into(),
+        },
+    }
+}
+#[cfg(test)]
 fn phone_start_request(
     host: Ipv4Addr,
     port: u16,
@@ -2113,20 +2449,29 @@ fn mode_icmp_options(
         Ok(None)
     }
 }
-
-/// Zero the token copy inside a start request after the request is sent.
-#[cfg(target_os = "macos")]
-fn zero_request_token(request: &mut Value) {
-    if let Some(Value::String(token)) = request
-        .get_mut("phone")
-        .and_then(Value::as_array_mut)
-        .and_then(|items| items.get_mut(3))
-    {
-        unsafe {
-            for byte in token.as_bytes_mut() {
-                std::ptr::write_volatile(byte, 0);
+/// Parse the GUI SOCKS5 DNS server array with the same grammar as the CLI.
+///
+/// Each entry is one numeric IP literal with an optional port, including an
+/// IPv6 literal in brackets or bare form. The result is deduplicated and
+/// bounded by [`dns::normalize_servers`], so the GUI and `--dns-servers` accept
+/// and reject the same values in the same order.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn socks_dns_servers(v: &Value) -> Result<Option<Vec<SocketAddr>>, String> {
+    match v.get("dns_servers") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => {
+            let mut servers = Vec::with_capacity(items.len());
+            for item in items {
+                let text = item.as_str().ok_or("DNS servers must be IP addresses")?;
+                let server =
+                    dns::parse_server(text).map_err(|_| "DNS servers must be IP addresses")?;
+                servers.push(server);
             }
+            dns::normalize_servers(servers)
+                .map(Some)
+                .map_err(|_| "invalid DNS servers".into())
         }
+        _ => Err("invalid DNS servers".into()),
     }
 }
 fn phone_options(v: &Value) -> Result<(Ipv4Addr, u16, String), String> {
@@ -2160,7 +2505,7 @@ fn options(payload: &Value) -> Result<&Value, String> {
         Err("invalid options".into())
     }
 }
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn tun_options(v: &Value) -> Result<TunOptions, String> {
     if !v.is_object() {
         return Err("invalid tunnel options".into());
@@ -2223,7 +2568,7 @@ fn tun_options(v: &Value) -> Result<TunOptions, String> {
         .map_err(|_| "invalid tunnel options")?;
     Ok(options)
 }
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 fn request(helper: &Arc<Mutex<Helper>>, message: &Value) -> Result<Value, String> {
     let mut helper = helper.lock().map_err(|_| "helper unavailable")?;
     privileged::send(&mut helper.stream, message).map_err(|_| "helper disconnected")?;
@@ -2233,7 +2578,7 @@ fn request(helper: &Arc<Mutex<Helper>>, message: &Value) -> Result<Value, String
     }
     Ok(response)
 }
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 fn close_helper(helper: &Arc<Mutex<Helper>>) -> Result<(), String> {
     let mut helper = helper.lock().map_err(|_| "helper unavailable")?;
     let _ = helper.stream.shutdown(std::net::Shutdown::Both);
@@ -2250,14 +2595,14 @@ fn close_helper(helper: &Arc<Mutex<Helper>>) -> Result<(), String> {
 
 /// How long one final helper request may wait. The caller is already on an
 /// error path and must not hang the status answer.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 const HELPER_FINALIZE: Duration = Duration::from_secs(2);
 
 /// Give one failed helper a bounded stop request, then close its stream.
 ///
 /// This runs without the phase lock. The stream close makes the helper cleanup
 /// guard stop the service and remove its routes. It never starts a tunnel.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 fn finalize_helper(helper: &Arc<Mutex<Helper>>) {
     if let Ok(mut helper) = helper.lock() {
         let _ = helper.stream.set_read_timeout(Some(HELPER_FINALIZE));
@@ -2268,33 +2613,32 @@ fn finalize_helper(helper: &Arc<Mutex<Helper>>) {
         let _ = helper.stream.shutdown(std::net::Shutdown::Both);
     }
 }
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 fn shell_quote(value: &str) -> Result<String, String> {
     if value.chars().any(|c| c.is_control()) {
         return Err("invalid path".into());
     }
     Ok(format!("'{}'", value.replace('\'', "'\\''")))
 }
-#[cfg(target_os = "macos")]
-fn admin_script(path: &Path, uid: u32) -> Result<String, String> {
-    let exe = std::env::current_exe().map_err(|_| "cannot find executable")?;
-    let exe = exe.to_str().ok_or("invalid executable path")?;
-    let path = path.to_str().ok_or("invalid helper path")?;
-    let cmd = format!(
-        "/usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin {} --privileged-helper {} {}",
-        shell_quote(exe)?,
-        shell_quote(path)?,
-        uid
-    );
-    let escaped = cmd.replace('\\', "\\\\").replace('"', "\\\"");
-    Ok(format!("with timeout of 604800 seconds\ndo shell script \"{}\" with administrator privileges\nend timeout",escaped))
-}
 
 impl GuiBackend for RustGuiBackend {
+    /// `POST /api/pairing/handoff` reaches the user engine through the trait.
+    /// Without this override the route returns the trait default,
+    /// `handoff_unsupported`.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn pair_handoff(&self) -> Result<Value, String> {
+        RustGuiBackend::pair_handoff(self)
+    }
     fn api_request(&self) {
         if let Ok(mut presence) = self.presence.lock() {
             presence.last_request = Some(Instant::now());
         }
+    }
+    fn mark_closing(&self) {
+        // Set before the server's first stop. begin() and pair_start() read it
+        // under the phase lock, so a late request cannot start work after the
+        // final stop.
+        self.closing.store(true, Ordering::Release);
     }
     fn start_presence(&self, stop: Arc<AtomicBool>) {
         // The supervisor records a failed thread start. `status` starts the
@@ -2311,7 +2655,7 @@ impl GuiBackend for RustGuiBackend {
         // Remember which run this answer describes. A stop or a new start
         // changes the id, so a late error stop cannot clear newer state.
         let observed_run = self.run_id.load(Ordering::Acquire);
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(test)]
         let status = if let Some(helper) = self.active_helper() {
             match request(&helper, &json!({"action":"status"})) {
                 Ok(value) => {
@@ -2351,14 +2695,14 @@ impl GuiBackend for RustGuiBackend {
         } else {
             self.service.status()
         };
-        #[cfg(not(any(target_os = "macos", test)))]
+        #[cfg(not(test))]
         let status = self.service.status();
         // A tunnel that stops without a stop request is an error stop. A user
         // stop and an auto stop claim the transition first. A live helper that
         // reports no tunnel gets one final stop before the state is cleared.
         let running = status.get("running") == Some(&json!(true));
         if self.was_running.load(Ordering::Acquire) && !running {
-            #[cfg(any(target_os = "macos", test))]
+            #[cfg(test)]
             {
                 if let Some(helper) = self.active_helper() {
                     // Never touch a helper that a newer run owns.
@@ -2377,7 +2721,7 @@ impl GuiBackend for RustGuiBackend {
         Ok(self.with_pairing(status))
     }
     fn failures(&self) -> Result<Value, String> {
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(test)]
         {
             if let Some(helper) = self.active_helper() {
                 return request(&helper, &json!({"action":"failures"})).and_then(|v| {
@@ -2390,7 +2734,7 @@ impl GuiBackend for RustGuiBackend {
         Ok(self.service.failures())
     }
     fn diagnostics(&self) -> Result<Value, String> {
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(test)]
         {
             if let Some(helper) = self.active_helper() {
                 return request(&helper, &json!({"action":"diagnostics"})).and_then(|v| {
@@ -2403,6 +2747,13 @@ impl GuiBackend for RustGuiBackend {
         Ok(self.service.diagnostics())
     }
     fn pair_start(&self) -> Result<Value, String> {
+        // Take the phase lock first, in the same order as pair_forget. The
+        // shutdown flag is checked while the phase lock is held, so a pairing
+        // cannot start after shutdown's final stop.
+        let phase = self.phase.lock().map_err(|_| "pair_state")?;
+        if self.closing.load(Ordering::Acquire) {
+            return Err("service is stopping".into());
+        }
         let mut inner = self.pairing.lock().map_err(|_| "pair_state")?;
         if inner.cancel.is_some() {
             return Err("pair_busy".into());
@@ -2415,25 +2766,29 @@ impl GuiBackend for RustGuiBackend {
             phase: PairPhase::Connecting,
             ..PairView::default()
         };
-        // A new pairing clears a completed forget state and cancels a pending
-        // FORGET. The old FORGET must not revoke the new trust.
+        // A new pairing clears a completed forget state and a pending retry
+        // that has no request in flight. A request that is already in flight
+        // stays pending: the pairing thread waits for it before it sends its
+        // own exchange, because a generation bump cannot undo bytes that have
+        // already left this device.
         if let Ok(mut forget) = self.forget.lock() {
-            forget.clear();
-            forget.generation = forget.generation.wrapping_add(1);
+            if !forget.in_flight {
+                forget.clear();
+                forget.generation = forget.generation.wrapping_add(1);
+            }
         }
         let view = inner.view.to_json();
         drop(inner);
+        drop(phase);
         let shared = Arc::clone(&self.pairing);
         let forget = Arc::clone(&self.forget);
         let attempt = Arc::clone(&self.pair_attempt);
+        let drain = self.forget_drain;
         let spawned = std::thread::Builder::new()
             .name("hotspotshade-pair".into())
-            .spawn(move || run_pairing(shared, generation, cancel, forget, attempt));
+            .spawn(move || run_pairing(shared, generation, cancel, forget, attempt, drain));
         if spawned.is_err() {
-            if let Ok(mut inner) = self.pairing.lock() {
-                inner.cancel = None;
-                inner.view = inner.resting_view();
-            }
+            pair_spawn_failed(&self.pairing, generation);
             return Err("pair_start".into());
         }
         Ok(view)
@@ -2578,14 +2933,15 @@ impl GuiBackend for RustGuiBackend {
     }
     fn phone_check(&self, payload: Value) -> Result<Value, String> {
         let (host, port, token) = phone_options(&payload)?;
-        let route = environment::default_route().map_err(|_| "no physical interface")?;
-        let index = normalization::interface_index(&route.interface)
-            .map_err(|_| "no physical interface")?;
+        let token = ZeroToken(token);
+        /* Do not send the token to any host except the gateway of the current
+         * default route. A manual check is not a general TCP test. */
+        let route = self.require_hotspot_gateway(host)?;
         let proxy = PhoneProxy {
             address: SocketAddr::V4(SocketAddrV4::new(host, port)),
             username: "hotspotshade".into(),
-            token,
-            iface: Some(index),
+            token: token.into_inner(),
+            iface: Some(route.index),
             timeout: Duration::from_secs(5),
         };
         proxy
@@ -2598,6 +2954,33 @@ impl GuiBackend for RustGuiBackend {
             .get("mode")
             .and_then(Value::as_str)
             .ok_or("missing mode")?;
+        // The helper-owned engine starts without an administrator prompt. A
+        // start that changes routes must present the one-time grant that the
+        // helper wrote after it verified the administrator authorization. The
+        // grant is consumed before any option or route work, so one
+        // authorization covers one attempt. A manually started root GUI has no
+        // grant file; root is already the authorization for that path. An
+        // engine that imported pairing credentials is still a helper engine,
+        // so it never falls back to that root authority when its grant is
+        // missing. The helper engine runs only the grant-checked modes. Any
+        // other mode, such as a local SOCKS5 listener, would run as root
+        // without a prompt, so it is refused before the grant is touched.
+        #[cfg(target_os = "macos")]
+        if self.tunnel_grant_required && mode != "phone" && mode != "tun" {
+            return Err("mode_not_allowed".into());
+        }
+        // A Linux root engine runs only the tunnel that pkexec authorized.
+        #[cfg(any(target_os = "linux", test))]
+        if self.tunnel_modes_only && mode != "phone" && mode != "tun" {
+            return Err("mode_not_allowed".into());
+        }
+        #[cfg(target_os = "macos")]
+        if (mode == "phone" || mode == "tun") && self.tunnel_grant_required {
+            match &self.tunnel_grant {
+                Some(grant) => grant.consume().map_err(|_| "authorization_required")?,
+                None => return Err("authorization_required".into()),
+            }
+        }
         let opts = options(&payload)?;
         let icmp = mode_icmp_options(
             mode,
@@ -2614,102 +2997,130 @@ impl GuiBackend for RustGuiBackend {
             socket: Arc::clone(&slot),
             armed: true,
         };
-        let result = (|| -> Result<StartOutcome, String> {
-            match mode {
-                "phone" => self
-                    .start_phone(
-                        opts,
-                        icmp.unwrap_or((false, false)),
-                        Arc::clone(&cancel),
-                        Arc::clone(&slot),
-                    )
-                    .map(|(phase, port, host, pinned)| (phase, port, Some(host), pinned)),
-                "socks5" => {
-                    let host = opts
-                        .get("host")
-                        .and_then(Value::as_str)
-                        .unwrap_or("127.0.0.1")
-                        .parse::<Ipv4Addr>()
-                        .map_err(|_| "invalid host")?;
-                    if host != Ipv4Addr::LOCALHOST {
-                        return Err("listener must use loopback".into());
-                    }
-                    let port = opts.get("port").and_then(Value::as_u64).unwrap_or(1080);
-                    if port == 0 || port > 65535 {
-                        return Err("invalid port".into());
-                    }
-                    let iface = opts
-                        .get("iface")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty());
-                    let dns = match opts.get("dns_servers") {
-                        None | Some(Value::Null) => None,
-                        Some(Value::Array(items)) => {
-                            let mut servers = Vec::new();
-                            for item in items {
-                                let text =
-                                    item.as_str().ok_or("DNS servers must be IP addresses")?;
-                                let server = text
-                                    .parse::<SocketAddr>()
-                                    .or_else(|_| {
-                                        text.parse::<Ipv4Addr>()
-                                            .map(|ip| SocketAddr::V4(SocketAddrV4::new(ip, 53)))
-                                    })
-                                    .map_err(|_| "DNS servers must be IP addresses")?;
-                                servers.push(server);
+        let (result, panicked) =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (|| -> Result<StartOutcome, String> {
+                    match mode {
+                        "phone" => self
+                            .start_phone(
+                                opts,
+                                icmp.unwrap_or((false, false)),
+                                Arc::clone(&cancel),
+                                Arc::clone(&slot),
+                            )
+                            .map(|(phase, port, host, pinned)| (phase, port, Some(host), pinned)),
+                        "socks5" => {
+                            let host = opts
+                                .get("host")
+                                .and_then(Value::as_str)
+                                .unwrap_or("127.0.0.1")
+                                .parse::<Ipv4Addr>()
+                                .map_err(|_| "invalid host")?;
+                            if host != Ipv4Addr::LOCALHOST {
+                                return Err("listener must use loopback".into());
                             }
-                            Some(servers)
-                        }
-                        _ => return Err("invalid DNS servers".into()),
-                    };
-                    self.service
-                        .start_socks(
-                            SocketAddr::V4(SocketAddrV4::new(host, port as u16)),
-                            iface,
-                            dns,
-                        )
-                        .map_err(|_| "start failed")?;
-                    if cancel.load(Ordering::Acquire) {
-                        self.service.stop();
-                        return Err("start cancelled".into());
-                    }
-                    let pinned = match started_status_iface(&self.service.status(), "socks5") {
-                        Ok(pinned) => pinned,
-                        Err(error) => {
-                            self.service.stop();
-                            return Err(error);
-                        }
-                    };
-                    Ok((Phase::Local, None, None, pinned))
-                }
-                "tun" => {
-                    #[cfg(target_os = "macos")]
-                    {
-                        let parsed = tun_options(opts)?;
-                        self.service
-                            .start_tun_options(parsed, None, worker_count())
-                            .map_err(|_| "start failed")?;
-                        if cancel.load(Ordering::Acquire) {
-                            self.service.stop();
-                            return Err("start cancelled".into());
-                        }
-                        let pinned = match started_status_iface(&self.service.status(), "tun") {
-                            Ok(pinned) => pinned,
-                            Err(error) => {
+                            let port = opts.get("port").and_then(Value::as_u64).unwrap_or(1080);
+                            if port == 0 || port > 65535 {
+                                return Err("invalid port".into());
+                            }
+                            let iface = opts
+                                .get("iface")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty());
+                            let dns = socks_dns_servers(opts)?;
+                            self.start_socks_service(
+                                SocketAddr::V4(SocketAddrV4::new(host, port as u16)),
+                                iface,
+                                dns,
+                            )
+                            .map_err(direct_start_error)?;
+                            if cancel.load(Ordering::Acquire) {
                                 self.service.stop();
-                                return Err(error);
+                                return Err("start cancelled".into());
                             }
-                        };
-                        Ok((Phase::Local, None, None, pinned))
+                            let pinned =
+                                match started_status_iface(&self.service.status(), "socks5") {
+                                    Ok(pinned) => pinned,
+                                    Err(error) => {
+                                        self.service.stop();
+                                        return Err(error);
+                                    }
+                                };
+                            Ok((Phase::Local, None, None, pinned))
+                        }
+                        "tun" => {
+                            #[cfg(test)]
+                            if PANIC_NEXT_TUN_START.with(|flag| flag.replace(false)) {
+                                // No panic hook: this is an injected fault, not
+                                // a test failure.
+                                std::panic::resume_unwind(Box::new("injected tunnel start panic"));
+                            }
+                            #[cfg(target_os = "macos")]
+                            {
+                                let parsed = tun_options(opts)?;
+                                self.service
+                                    .start_tun_options(parsed, None, worker_count())
+                                    .map_err(direct_start_error)?;
+                                if cancel.load(Ordering::Acquire) {
+                                    self.service.stop();
+                                    return Err("start cancelled".into());
+                                }
+                                let pinned =
+                                    match started_status_iface(&self.service.status(), "tun") {
+                                        Ok(pinned) => pinned,
+                                        Err(error) => {
+                                            self.service.stop();
+                                            return Err(error);
+                                        }
+                                    };
+                                Ok((Phase::Local, None, None, pinned))
+                            }
+                            #[cfg(target_os = "linux")]
+                            {
+                                // The service checks the privilege before it creates a
+                                // TUN device or changes a route. Do not duplicate that
+                                // check here: the service is the authority, and its
+                                // PermissionDenied becomes admin_required below.
+                                let parsed = tun_options(opts)?;
+                                self.service
+                                    .start_tun_options_cancellable(
+                                        parsed,
+                                        None,
+                                        worker_count(),
+                                        &cancel,
+                                    )
+                                    .map_err(direct_start_error)?;
+                                if cancel.load(Ordering::Acquire) {
+                                    self.service.stop();
+                                    return Err("start cancelled".into());
+                                }
+                                let pinned =
+                                    match started_status_iface(&self.service.status(), "tun") {
+                                        Ok(pinned) => pinned,
+                                        Err(error) => {
+                                            self.service.stop();
+                                            return Err(error);
+                                        }
+                                    };
+                                Ok((Phase::Local, None, None, pinned))
+                            }
+                            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                            {
+                                Err("tun unavailable".into())
+                            }
+                        }
+                        _ => Err("invalid mode".into()),
                     }
-                    #[cfg(not(target_os = "macos"))]
-                    {
-                        Err("tun unavailable".into())
+                })()
+            })) {
+                Ok(result) => (result, false),
+                Err(_) => {
+                    if mode == "tun" || mode == "phone" {
+                        self.service.mark_start_panic();
                     }
+                    (Err("start failed".into()), true)
                 }
-                _ => Err("invalid mode".into()),
-            }
-        })();
+            };
         match result {
             Ok((next, port, phone_host, pinned_iface)) => {
                 // Use the interface that the successful start actually pinned
@@ -2742,7 +3153,9 @@ impl GuiBackend for RustGuiBackend {
                     }
                     self.changed.notify_all();
                 }
-                recovery.disarm();
+                if !panicked {
+                    recovery.disarm();
+                }
                 Err(e)
             }
         }
@@ -2778,6 +3191,10 @@ impl RustGuiBackend {
         loop {
             let mut phase = self.phase.lock().map_err(|_| "service state unavailable")?;
             if expected_run.is_some_and(|run| self.run_id.load(Ordering::Acquire) != run) {
+                drop(phase);
+                if self.service.cleanup_uncertain() {
+                    return Err(crate::service::CLEANUP_UNCERTAIN_MESSAGE.into());
+                }
                 return Ok(json!({"stopped":false}));
             }
             match &*phase {
@@ -2786,6 +3203,15 @@ impl RustGuiBackend {
                     self.forget_tunnel_iface();
                     self.forget_probe_target();
                     self.start_run_cancel();
+                    drop(phase);
+                    // A worker can fail after the phase is already Idle, or a
+                    // stop can have published Idle after a failed cleanup. The
+                    // service flag is the durable answer for this process. Do
+                    // not hold the phase lock across the service lock: a start
+                    // in flight holds it for the whole start.
+                    if self.service.cleanup_uncertain() {
+                        return Err(crate::service::CLEANUP_UNCERTAIN_MESSAGE.into());
+                    }
                     return Ok(json!({"stopped":false}));
                 }
                 Phase::Starting { cancel, socket } => {
@@ -2840,10 +3266,12 @@ impl RustGuiBackend {
                     if finished.is_ok() {
                         recovery.disarm();
                     }
-                    finished?;
+                    if let Some(cleanup_error) = finished? {
+                        return Err(cleanup_error);
+                    }
                     return Ok(json!({"stopped":true}));
                 }
-                #[cfg(any(target_os = "macos", test))]
+                #[cfg(test)]
                 Phase::Remote(helper) => {
                     let helper = Arc::clone(helper);
                     *phase = Phase::Stopping;
@@ -2874,46 +3302,10 @@ impl RustGuiBackend {
                     if finished.is_ok() {
                         recovery.disarm();
                     }
-                    finished?;
+                    if let Some(cleanup_error) = finished? {
+                        return Err(cleanup_error);
+                    }
                     result?;
-                    return Ok(json!({"stopped":true}));
-                }
-                #[cfg(target_os = "macos")]
-                Phase::Stuck(child) => {
-                    let child = Arc::clone(child);
-                    *phase = Phase::Stopping;
-                    let stop_run = self.bump_run();
-                    self.cancel_run();
-                    drop(phase);
-                    let mut recovery = StopRecovery {
-                        backend: self,
-                        run: stop_run,
-                        original: Some(Phase::Stuck(Arc::clone(&child))),
-                    };
-                    let result = (|| -> Result<(), String> {
-                        let mut child = child.lock().map_err(|_| "helper unavailable")?;
-                        let until = Instant::now() + Duration::from_secs(20);
-                        loop {
-                            match child.try_wait() {
-                                Ok(Some(_)) => return Ok(()),
-                                Err(_) => return Err("helper cleanup failed".into()),
-                                Ok(None) if Instant::now() >= until => {
-                                    return Err("helper is still stopping".into())
-                                }
-                                Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-                            }
-                        }
-                    })();
-                    if result.is_err() {
-                        self.finish(Phase::Stuck(child));
-                        recovery.disarm();
-                        return result.map(|_| json!({"stopped":false}));
-                    }
-                    let finished = self.finish_stop(reason);
-                    if finished.is_ok() {
-                        recovery.disarm();
-                    }
-                    finished?;
                     return Ok(json!({"stopped":true}));
                 }
             }
@@ -2930,6 +3322,212 @@ impl Drop for RustGuiBackend {
 #[cfg(test)]
 mod tests {
     use crate::gui::start_error_message;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_helper_engine_refuses_a_tunnel_start_without_a_grant() {
+        use crate::gui::GuiBackend;
+        use crate::service::Service;
+        use crate::tunnel_grant::TunnelGrant;
+        use serde_json::json;
+        use std::sync::Arc;
+        let backend = RustGuiBackend::with_tunnel_grant(
+            Arc::new(Service::new()),
+            TunnelGrant::new(std::env::temp_dir().join("hotspotshade-missing-grant")),
+        );
+        let error = backend
+            .start(json!({"mode":"phone"}))
+            .expect_err("a helper engine must refuse a start without a grant");
+        assert_eq!(error, "authorization_required");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn imported_backend(grant: Option<TunnelGrant>) -> RustGuiBackend {
+        let mut backend = RustGuiBackend::with_imported_credentials(
+            Arc::new(Service::new()),
+            Identity::from_bytes([0x47; 32]),
+            PhoneCredentials {
+                // TEST-NET-1 is never a hotspot gateway. Even if a failing
+                // route lookup were not in place, the gateway check refuses it.
+                host: Ipv4Addr::new(192, 0, 2, 1),
+                port: 18080,
+                token: "public-test-token".into(),
+            },
+            grant,
+        )
+        .expect("the test identity is the first import");
+        // No route in a hermetic test. A phone start fails at the gateway
+        // check before it opens a socket, whatever network the host uses.
+        backend.route_lookup = Arc::new(|| None);
+        backend
+    }
+
+    /// One private grant directory owned by the test user. The production
+    /// path is root-owned; the test seam lets a hermetic test exercise the
+    /// same freshness and permission checks without root.
+    #[cfg(target_os = "macos")]
+    fn grant_fixture() -> (std::path::PathBuf, std::path::PathBuf, u32) {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hotspotshade-gui-grant-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            unique
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("tunnel-grant");
+        let owner = unsafe { libc::geteuid() } as u32;
+        (directory, path, owner)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_grant(path: &std::path::Path, timestamp: u64) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, format!("{} {timestamp}\n", "a".repeat(64))).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn imported_credentials_refuse_a_second_identity() {
+        // The first import is the process-wide handoff identity. A second
+        // engine with a different key must not replace it.
+        let _first = imported_backend(None);
+        let error = RustGuiBackend::with_imported_credentials(
+            Arc::new(Service::new()),
+            Identity::from_bytes([0x48; 32]),
+            PhoneCredentials {
+                host: Ipv4Addr::new(192, 0, 2, 1),
+                port: 18080,
+                token: "public-test-token".into(),
+            },
+            None,
+        )
+        .err()
+        .expect("a different imported identity must be refused");
+        assert!(matches!(error, crate::pairing::PairError::Identity));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn imported_credentials_refuse_phone_and_tun_without_a_grant() {
+        // No grant option at all: the engine was not launched by the helper
+        // with a grant path. Imported credentials must not become authority.
+        let backend = imported_backend(None);
+        for mode in ["phone", "tun"] {
+            let error = backend
+                .start(json!({"mode":mode}))
+                .expect_err("imported credentials still need a grant");
+            assert_eq!(error, "authorization_required", "mode {mode}");
+        }
+
+        // A grant path that does not exist yet is the normal state before the
+        // person authorizes the first start. It is a refusal, not a bypass.
+        let (directory, path, owner) = grant_fixture();
+        let backend = imported_backend(Some(TunnelGrant::with_expected_owner(path, owner)));
+        for mode in ["phone", "tun"] {
+            let error = backend
+                .start(json!({"mode":mode}))
+                .expect_err("a missing grant must refuse the start");
+            assert_eq!(error, "authorization_required", "mode {mode}");
+        }
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_helper_engine_refuses_every_mode_without_a_grant_check() {
+        // A root engine started by the helper must not open a local SOCKS5
+        // listener, or any other mode, without the administrator grant. The
+        // refusal comes before the grant is read, so a fresh grant survives.
+        let (directory, path, owner) = grant_fixture();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        write_grant(&path, now);
+        let helper = RustGuiBackend::with_tunnel_grant(
+            Arc::new(Service::new()),
+            TunnelGrant::with_expected_owner(path.clone(), owner),
+        );
+        let imported =
+            imported_backend(Some(TunnelGrant::with_expected_owner(path.clone(), owner)));
+        for backend in [&helper, &imported] {
+            for payload in [
+                json!({"mode":"socks5","options":{"host":"127.0.0.1","port":1080}}),
+                json!({"mode":"socks5","options":{"host":"127.0.0.1","port":80}}),
+                json!({"mode":"other"}),
+            ] {
+                let error = backend
+                    .start(payload.clone())
+                    .expect_err("a helper engine must refuse an unchecked mode");
+                assert_eq!(error, "mode_not_allowed", "payload {payload}");
+                assert!(path.exists(), "the refusal must not consume the grant");
+                assert_eq!(backend.service.status()["running"], json!(false));
+            }
+        }
+        assert_eq!(
+            start_error_message("mode_not_allowed"),
+            Some("The protected engine starts only the tunnel.")
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn imported_credentials_refuse_phone_and_tun_with_a_stale_grant() {
+        let (directory, path, owner) = grant_fixture();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        write_grant(&path, now.saturating_sub(61));
+        let backend = imported_backend(Some(TunnelGrant::with_expected_owner(path.clone(), owner)));
+        for mode in ["phone", "tun"] {
+            let error = backend
+                .start(json!({"mode":mode}))
+                .expect_err("a stale grant must refuse the start");
+            assert_eq!(error, "authorization_required", "mode {mode}");
+        }
+        // A refused stale grant stays for a person to inspect. It cannot be
+        // retried into a valid grant.
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn imported_credentials_consume_a_fresh_grant_before_the_route_check() {
+        let (directory, path, owner) = grant_fixture();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        write_grant(&path, now);
+        let backend = imported_backend(Some(TunnelGrant::with_expected_owner(path.clone(), owner)));
+        // The grant is consumed before option validation, so this start reaches
+        // the phone gateway check and fails there. The test route lookup is
+        // empty, so it fails before any socket or route code on the host.
+        let first = backend
+            .start(json!({"mode":"phone","options":{}}))
+            .expect_err("a phone start without options still fails");
+        assert_eq!(first, "no_hotspot");
+        assert!(!path.exists(), "the fresh grant is single use");
+        // One authorization covers one attempt. The next start refuses.
+        let second = backend
+            .start(json!({"mode":"phone","options":{}}))
+            .expect_err("the consumed grant must refuse the next start");
+        assert_eq!(second, "authorization_required");
+        let _ = std::fs::remove_dir_all(directory);
+    }
 
     #[test]
     fn presence_schedule_stops_and_resumes() {
@@ -2969,9 +3567,194 @@ mod tests {
     use super::*;
     use crate::pairing::tests::{spawn_phone, Decide, MockPhone};
     use std::net::TcpListener;
+    use std::os::fd::IntoRawFd;
 
     fn backend() -> RustGuiBackend {
         RustGuiBackend::new(Arc::new(Service::new()))
+    }
+
+    /// A backend whose default route is fixed, so the test does not depend on
+    /// the network of the machine that runs it.
+    fn backend_with_route(route: Option<super::HotspotRoute>) -> RustGuiBackend {
+        let mut backend = backend();
+        backend.route_lookup = Arc::new(move || route.clone());
+        backend
+    }
+
+    #[test]
+    fn pairing_handoff_writes_the_pairing_and_the_answer_holds_no_secret() {
+        let backend = backend();
+        backend.set_handoff_identity([0x42; 32]);
+        backend.pairing.lock().unwrap().credentials = Some(PhoneCredentials {
+            host: Ipv4Addr::new(172, 20, 10, 1),
+            port: 18080,
+            token: "public-test-token".into(),
+        });
+        let (writer, reader) = UnixStream::pair().unwrap();
+        backend.set_handoff_fd(writer.into_raw_fd());
+        let answer = backend.pair_handoff().unwrap();
+        assert_eq!(answer["ok"], true);
+        assert!(!answer.to_string().contains("public-test-token"));
+        let read_fd = reader.into_raw_fd();
+        let (identity, credentials) =
+            crate::credential_handoff::read_handoff(read_fd).expect("one valid handoff");
+        assert_eq!(identity.public(), Identity::from_bytes([0x42; 32]).public());
+        assert_eq!(credentials.host, Ipv4Addr::new(172, 20, 10, 1));
+        assert_eq!(credentials.port, 18080);
+        assert_eq!(credentials.token, "public-test-token");
+        // A later attempt writes the same pairing again. The descriptor is
+        // not consumed by one authorization failure.
+        let answer = backend.pair_handoff().unwrap();
+        assert_eq!(answer["ok"], true);
+        let (_, again) = crate::credential_handoff::read_handoff(read_fd)
+            .expect("the same pairing is available for a retry");
+        assert_eq!(again.token, "public-test-token");
+        unsafe {
+            libc::close(read_fd);
+        }
+    }
+
+    #[test]
+    fn pairing_handoff_requires_a_pairing() {
+        let backend = backend();
+        backend.set_handoff_identity([0x42; 32]);
+        let (writer, _reader) = UnixStream::pair().unwrap();
+        backend.set_handoff_fd(writer.into_raw_fd());
+        assert_eq!(backend.pair_handoff().unwrap_err(), "not_paired");
+    }
+
+    /// A Linux root engine, with or without an imported pairing, starts only
+    /// the tunnel modes. A SOCKS5 listener or any other mode is refused before
+    /// options are parsed or a listener exists. The tun mode is not started
+    /// here, because a hermetic test must not try to create a device.
+    #[test]
+    fn linux_root_engines_refuse_every_mode_but_the_tunnel() {
+        let mut imported = RustGuiBackend::with_imported_pairing(
+            Arc::new(Service::new()),
+            Identity::from_bytes([0x47; 32]),
+            PhoneCredentials {
+                host: Ipv4Addr::new(192, 0, 2, 1),
+                port: 18080,
+                token: "public-test-token".into(),
+            },
+        )
+        .expect("the test identity matches the process-wide import");
+        imported.route_lookup = Arc::new(|| None);
+        let mut direct = backend_with_route(None);
+        direct.restrict_to_tunnel_modes();
+        for backend in [&imported, &direct] {
+            for payload in [
+                json!({"mode":"socks5","options":{"host":"127.0.0.1","port":1080}}),
+                json!({"mode":"socks5"}),
+                json!({"mode":"anything"}),
+            ] {
+                let error = backend.start(payload.clone()).unwrap_err();
+                assert_eq!(error, "mode_not_allowed", "payload {payload}");
+            }
+            assert_eq!(backend.service.status()["running"], false);
+        }
+        // A phone start passes the mode check and stops at the gateway check,
+        // because the hermetic route lookup finds no hotspot.
+        let error = imported
+            .start(json!({"mode":"phone","options":{}}))
+            .unwrap_err();
+        assert_ne!(error, "mode_not_allowed");
+        assert_eq!(
+            crate::gui::start_error_message("mode_not_allowed"),
+            Some("The protected engine starts only the tunnel.")
+        );
+    }
+
+    /// The Linux path: the user engine writes frames into its standard input
+    /// socket, a cancelled start leaves an older frame queued, and the root
+    /// engine reads the newest frame from the peer socket and imports it. The
+    /// identity matches the macOS import tests, because the imported identity
+    /// is process-wide.
+    #[test]
+    fn linux_handoff_imports_the_newest_pairing_into_a_root_backend() {
+        let user = backend();
+        user.set_handoff_identity([0x47; 32]);
+        let (user_end, app_end) = UnixStream::pair().unwrap();
+        user.set_handoff_fd(user_end.into_raw_fd());
+        user.pairing.lock().unwrap().credentials = Some(PhoneCredentials {
+            host: Ipv4Addr::new(192, 0, 2, 1),
+            port: 18080,
+            token: "public-old-token".into(),
+        });
+        // A start that the person cancelled at the prompt.
+        assert_eq!(user.pair_handoff().unwrap()["ok"], true);
+        user.pairing.lock().unwrap().credentials = Some(PhoneCredentials {
+            host: Ipv4Addr::new(192, 0, 2, 1),
+            port: 18081,
+            token: "public-test-token".into(),
+        });
+        let answer = user.pair_handoff().unwrap();
+        assert!(!answer.to_string().contains("public-test-token"));
+        let read_fd = app_end.into_raw_fd();
+        let (identity, credentials) = crate::credential_handoff::read_latest_handoff(read_fd)
+            .expect("the newest queued frame");
+        assert_eq!(credentials.port, 18081);
+        assert_eq!(credentials.token, "public-test-token");
+        // The channel is drained. A second root engine on the same socket
+        // with no new frame fails its launch instead of waiting.
+        assert!(crate::credential_handoff::read_latest_handoff(read_fd).is_err());
+        unsafe {
+            libc::close(read_fd);
+        }
+        assert_eq!(identity.public(), Identity::from_bytes([0x47; 32]).public());
+
+        let mut root =
+            RustGuiBackend::with_imported_pairing(Arc::new(Service::new()), identity, credentials)
+                .expect("the test identity matches the process-wide import");
+        root.route_lookup = Arc::new(|| None);
+        let view = root.pair_status().unwrap();
+        assert_eq!(view["state"], "paired");
+        assert!(!view.to_string().contains("public-test-token"));
+        assert_eq!(
+            pairing::local_identity().unwrap().public(),
+            Identity::from_bytes([0x47; 32]).public(),
+            "the root engine uses the imported key, not a root HOME key"
+        );
+        // The root engine never exports a handoff of its own.
+        assert_eq!(root.pair_handoff().unwrap_err(), "handoff_unavailable");
+        // A different identity cannot replace the imported one.
+        assert!(RustGuiBackend::with_imported_pairing(
+            Arc::new(Service::new()),
+            Identity::from_bytes([0x48; 32]),
+            PhoneCredentials {
+                host: Ipv4Addr::new(192, 0, 2, 1),
+                port: 18080,
+                token: "public-test-token".into(),
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn closing_blocks_a_late_start_and_pairing() {
+        let backend = backend();
+        // A normal request may start before shutdown.
+        let _session = backend.begin().expect("an idle backend accepts a start");
+        backend.closing.store(false, Ordering::Release);
+        // Return the phase to Idle without touching a real service.
+        *backend.phase.lock().unwrap() = Phase::Idle;
+        backend.mark_closing();
+        assert!(matches!(
+            backend.begin(),
+            Err(ref error) if error == "service is stopping"
+        ));
+        assert!(matches!(
+            backend.pair_start(),
+            Err(ref error) if error == "service is stopping"
+        ));
+    }
+
+    fn hotspot() -> super::HotspotRoute {
+        super::HotspotRoute {
+            host: "172.20.10.1".parse().unwrap(),
+            iface: "hs-test5".into(),
+            index: 5,
+        }
     }
 
     fn identity() -> Identity {
@@ -3131,6 +3914,29 @@ mod tests {
         let status =
             backend.with_pairing(json!({"running":true,"mode":"phone","icmp_enabled":false}));
         assert_eq!(status["icmp_enabled"], false);
+    }
+
+    #[test]
+    fn poisoned_service_refuses_start_and_does_not_publish_cached_presence() {
+        let service = Arc::new(Service::new());
+        let backend = RustGuiBackend::new(Arc::clone(&service));
+        backend.presence.lock().unwrap().state = Some("ready");
+        service.poison_state_for_test();
+
+        let status = backend.status().unwrap();
+        assert_eq!(status["state"], "unknown");
+        assert_eq!(
+            status["error"],
+            crate::service::SERVICE_STATE_UNAVAILABLE_MESSAGE
+        );
+        assert!(status.get("phone").is_none());
+        assert!(status.get("paired").is_none());
+        assert!(matches!(backend.begin(), Err(ref error)
+            if error == crate::service::SERVICE_STATE_UNAVAILABLE_MESSAGE));
+        assert_eq!(
+            backend.stop().unwrap_err(),
+            crate::service::CLEANUP_UNCERTAIN_MESSAGE
+        );
     }
 
     #[test]
@@ -3362,6 +4168,49 @@ mod tests {
             .contains("private-token-value"));
     }
     #[test]
+    fn gui_and_cli_dns_lists_parse_and_deduplicate_alike() {
+        let tokens = [
+            "192.0.2.53",
+            "[2001:db8::53]:5353",
+            "192.0.2.53:53",
+            "[2001:db8::53]:5353",
+            "2001:db8::53",
+        ];
+        let cli = dns::parse_server_list(&tokens.join(", ")).unwrap();
+        let gui = socks_dns_servers(&json!({"dns_servers":tokens}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(gui, cli);
+        // Both forms of an IPv6 literal are accepted, and the port defaults to
+        // 53 in each parser.
+        assert!(cli.contains(&"[2001:db8::53]:53".parse().unwrap()));
+        assert!(cli.contains(&"[2001:db8::53]:5353".parse().unwrap()));
+        // Both reject an empty list, a name, a non-unicast address, and an
+        // oversized unique list. The count bound applies after deduplication.
+        for value in [
+            json!({"dns_servers":[]}),
+            json!({"dns_servers":["dns.example"]}),
+            json!({"dns_servers":["0.0.0.0"]}),
+            json!({"dns_servers":["[fe80::1]"]}),
+        ] {
+            assert!(socks_dns_servers(&value).is_err(), "accepted {value}");
+        }
+        assert!(dns::parse_server_list("").is_err());
+        let mut many = Vec::new();
+        for index in 0..=dns::MAX_EXPLICIT_SERVERS {
+            many.push(format!("192.0.2.{index}"));
+        }
+        assert!(socks_dns_servers(&json!({"dns_servers":many})).is_err());
+        assert!(dns::parse_server_list(&many.join(",")).is_err());
+        // An explicit null keeps the discovery path, and a non-array value is
+        // rejected rather than treated as empty.
+        assert!(socks_dns_servers(&json!({})).unwrap().is_none());
+        assert!(socks_dns_servers(&json!({"dns_servers":null}))
+            .unwrap()
+            .is_none());
+        assert!(socks_dns_servers(&json!({"dns_servers":"192.0.2.53"})).is_err());
+    }
+    #[test]
     fn tunnel_options_parse_and_preserve_defaults_and_explicit_values() {
         let default = tun_options(&json!({})).unwrap();
         assert_eq!(default.ipv6, Ipv6Policy::Block);
@@ -3386,6 +4235,148 @@ mod tests {
         assert!(tun_options(&json!({"no_routes":"true"})).is_err());
         assert!(tun_options(&json!({"ipv6":"forward","no_routes":true})).is_err());
     }
+    // The packaged Linux engine is the root process that owns the tunnel. The
+    // GUI must reach the in-process start path for both modes. A development
+    // engine that runs as the desktop user must refuse before it touches a TUN
+    // device or a route. Run this test as a normal user only: as root it would
+    // create a real tunnel.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_start_reaches_the_local_path_and_requires_root() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: this test must run as a normal user");
+            return;
+        }
+        let backend = backend_with_route(Some(hotspot()));
+        backend.pairing.lock().unwrap().credentials = Some(PhoneCredentials {
+            host: "172.20.10.1".parse().unwrap(),
+            port: 1080,
+            token: "paired-secret-token".into(),
+        });
+        assert_eq!(
+            backend
+                .start(json!({"mode":"phone","options":{}}))
+                .unwrap_err(),
+            "admin_required"
+        );
+        assert_eq!(backend.status().unwrap()["running"], json!(false));
+        assert_eq!(
+            backend
+                .start(json!({"mode":"tun","options":{}}))
+                .unwrap_err(),
+            "admin_required"
+        );
+        assert_eq!(backend.status().unwrap()["running"], json!(false));
+    }
+
+    #[test]
+    fn a_saved_gateway_from_an_old_network_never_receives_the_token() {
+        let backend = backend_with_route(Some(hotspot()));
+        backend.pairing.lock().unwrap().credentials = Some(PhoneCredentials {
+            host: "192.168.1.1".parse().unwrap(),
+            port: 1080,
+            token: "paired-secret-token".into(),
+        });
+        let error = backend
+            .start(json!({"mode":"phone","options":{}}))
+            .unwrap_err();
+        assert_eq!(error, "source_device_moved");
+        assert!(!error.contains("paired-secret-token"));
+        let status = backend.status().unwrap();
+        assert_eq!(status["running"], json!(false));
+        assert!(!status.to_string().contains("paired-secret-token"));
+        // The credential stays for a return to the network that it names.
+        assert!(backend.pairing.lock().unwrap().credentials.is_some());
+    }
+
+    #[test]
+    fn a_route_change_invalidates_the_saved_gateway_until_it_returns() {
+        let route = Arc::new(Mutex::new(Some(hotspot())));
+        let mut backend = backend();
+        let source = Arc::clone(&route);
+        backend.route_lookup = Arc::new(move || source.lock().unwrap().clone());
+        let saved: Ipv4Addr = "172.20.10.1".parse().unwrap();
+        assert!(backend.require_hotspot_gateway(saved).is_ok());
+        // The same saved gateway on a different network is not the source
+        // device. The token check must fail before any connection.
+        *route.lock().unwrap() = Some(super::HotspotRoute {
+            host: "192.168.1.1".parse().unwrap(),
+            iface: "hs-test6".into(),
+            index: 6,
+        });
+        assert_eq!(
+            backend.require_hotspot_gateway(saved).unwrap_err(),
+            "source_device_moved"
+        );
+        // Returning to the hotspot makes the saved credential usable again.
+        *route.lock().unwrap() = Some(hotspot());
+        assert_eq!(backend.require_hotspot_gateway(saved).unwrap().index, 5);
+    }
+
+    #[test]
+    fn a_manual_start_requires_the_current_private_gateway() {
+        let backend = backend_with_route(Some(hotspot()));
+        for host in ["203.0.113.10", "192.168.1.1"] {
+            let error = backend
+                .start(json!({"mode":"phone","options":{
+                    "host":host,"port":1080,"token":"manual-secret-token"}}))
+                .unwrap_err();
+            assert_eq!(error, "source_device_moved", "{host}");
+            assert!(!error.contains("manual-secret-token"));
+        }
+        assert_eq!(backend.status().unwrap()["running"], json!(false));
+        // A public default gateway is not a hotspot source device, even when
+        // the manual host matches it.
+        let public = backend_with_route(Some(super::HotspotRoute {
+            host: "203.0.113.10".parse().unwrap(),
+            iface: "hs-test5".into(),
+            index: 5,
+        }));
+        assert_eq!(
+            public
+                .start(json!({"mode":"phone","options":{
+                    "host":"203.0.113.10","port":1080,"token":"manual-secret-token"}}))
+                .unwrap_err(),
+            "source_device_moved"
+        );
+    }
+
+    #[test]
+    fn a_source_device_check_refuses_a_host_that_is_not_the_gateway() {
+        let backend = backend_with_route(Some(hotspot()));
+        let error = backend
+            .phone_check(json!({
+                "host":"203.0.113.10","port":1080,"token":"manual-secret-token"
+            }))
+            .unwrap_err();
+        assert_eq!(error, "source_device_moved");
+        assert!(!error.contains("manual-secret-token"));
+    }
+
+    #[test]
+    fn a_missing_default_route_does_not_send_the_token() {
+        let backend = backend_with_route(None);
+        backend.pairing.lock().unwrap().credentials = Some(PhoneCredentials {
+            host: "172.20.10.1".parse().unwrap(),
+            port: 1080,
+            token: "paired-secret-token".into(),
+        });
+        assert_eq!(
+            backend
+                .start(json!({"mode":"phone","options":{}}))
+                .unwrap_err(),
+            "no_hotspot"
+        );
+        assert_eq!(
+            backend
+                .phone_check(json!({
+                    "host":"172.20.10.1","port":1080,"token":"manual-secret-token"
+                }))
+                .unwrap_err(),
+            "no_hotspot"
+        );
+    }
+
     #[test]
     fn pending_start_can_be_cancelled_without_a_helper() {
         let backend = Arc::new(RustGuiBackend::new(Arc::new(Service::new())));
@@ -3554,6 +4545,213 @@ mod tests {
         backend.pair_cancel().unwrap();
         assert!(cancel.load(Ordering::Acquire));
         assert!(backend.pairing.lock().unwrap().cancel.is_none());
+    }
+
+    #[test]
+    fn a_stale_pair_spawn_failure_preserves_the_new_attempt() {
+        let backend = RustGuiBackend::new(Arc::new(Service::new()));
+        let current_cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut inner = backend.pairing.lock().unwrap();
+            inner.generation = 2;
+            inner.cancel = Some(Arc::clone(&current_cancel));
+            inner.view.phase = PairPhase::Connecting;
+        }
+        pair_spawn_failed(&backend.pairing, 1);
+        let inner = backend.pairing.lock().unwrap();
+        assert!(Arc::ptr_eq(inner.cancel.as_ref().unwrap(), &current_cancel));
+        assert_eq!(inner.view.phase, PairPhase::Connecting);
+    }
+
+    #[test]
+    fn a_current_pair_spawn_failure_clears_the_failed_attempt() {
+        let backend = RustGuiBackend::new(Arc::new(Service::new()));
+        {
+            let mut inner = backend.pairing.lock().unwrap();
+            inner.generation = 2;
+            inner.cancel = Some(Arc::new(AtomicBool::new(false)));
+            inner.view.phase = PairPhase::Connecting;
+        }
+        pair_spawn_failed(&backend.pairing, 2);
+        let inner = backend.pairing.lock().unwrap();
+        assert!(inner.cancel.is_none());
+        assert_eq!(inner.view.phase, PairPhase::Idle);
+    }
+
+    #[test]
+    fn a_new_pairing_waits_for_an_in_flight_forget_before_it_sends_its_request() {
+        let mut backend = backend();
+        backend.forget_drain = Duration::from_secs(2);
+        backend.probe_attempt = Arc::new(|_paired, _stop, _target| ProbeResult {
+            state: "unpaired",
+            info: None,
+            gateway: None,
+            trusted_by_source: None,
+            cancelled: false,
+        });
+        let (forget_started_tx, forget_started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let forget_done = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&forget_done);
+        backend.forget_network = Arc::new(move || {
+            forget_started_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            done.store(true, Ordering::Release);
+            true
+        });
+        let pair_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::clone(&pair_calls);
+        let saw_forget_done = Arc::new(AtomicBool::new(false));
+        let saw = Arc::clone(&saw_forget_done);
+        let done_flag = Arc::clone(&forget_done);
+        backend.pair_attempt = Arc::new(move |_cancel, _on_code| {
+            calls.fetch_add(1, Ordering::AcqRel);
+            saw.store(done_flag.load(Ordering::Acquire), Ordering::Release);
+            Ok(PhoneCredentials {
+                host: "172.20.10.1".parse().unwrap(),
+                port: 1080,
+                token: "test-token".into(),
+            })
+        });
+        // Start a FORGET and hold its network call open.
+        backend.pair_forget().unwrap();
+        forget_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        // A new pairing may be requested while the old FORGET is in flight.
+        backend.pair_start().unwrap();
+        assert!(
+            backend.forget.lock().unwrap().pending,
+            "pair start cleared a FORGET that was already on the wire"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            pair_calls.load(Ordering::Acquire),
+            0,
+            "the pairing sent a request while the old FORGET was in flight"
+        );
+        // Release the old FORGET. The pairing starts only after it returns.
+        release_tx.send(()).unwrap();
+        let end = Instant::now() + Duration::from_secs(2);
+        while pair_calls.load(Ordering::Acquire) == 0 && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(pair_calls.load(Ordering::Acquire), 1);
+        assert!(
+            saw_forget_done.load(Ordering::Acquire),
+            "the pairing ran before the old FORGET finished"
+        );
+        let end = Instant::now() + Duration::from_secs(2);
+        loop {
+            let phase = backend.pairing.lock().unwrap().view.phase;
+            if phase == PairPhase::Paired {
+                break;
+            }
+            assert!(Instant::now() < end, "pairing did not complete: {phase:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(backend.forget.lock().unwrap().state(), "none");
+    }
+
+    #[test]
+    fn a_new_pairing_fails_closed_when_the_old_forget_does_not_finish() {
+        let mut backend = backend();
+        backend.forget_drain = Duration::from_millis(50);
+        backend.probe_attempt = Arc::new(|_paired, _stop, _target| ProbeResult {
+            state: "unpaired",
+            info: None,
+            gateway: None,
+            trusted_by_source: None,
+            cancelled: false,
+        });
+        let (forget_started_tx, forget_started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        backend.forget_network = Arc::new(move || {
+            forget_started_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            true
+        });
+        let pair_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::clone(&pair_calls);
+        backend.pair_attempt = Arc::new(move |_cancel, _on_code| {
+            calls.fetch_add(1, Ordering::AcqRel);
+            Ok(PhoneCredentials {
+                host: "172.20.10.1".parse().unwrap(),
+                port: 1080,
+                token: "test-token".into(),
+            })
+        });
+        backend.pair_forget().unwrap();
+        forget_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        backend.pair_start().unwrap();
+        let end = Instant::now() + Duration::from_secs(2);
+        loop {
+            let view = backend.pairing.lock().unwrap().view.clone();
+            if view.phase == PairPhase::Failed {
+                assert_eq!(view.error, Some(FORGET_DRAIN_ERROR));
+                break;
+            }
+            assert!(
+                Instant::now() < end,
+                "pairing stayed {:?} while the old FORGET was in flight",
+                view.phase
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The pairing must not send a request after the wait timed out, and
+        // the in-flight FORGET must stay pending so it can finish.
+        assert_eq!(pair_calls.load(Ordering::Acquire), 0);
+        assert!(backend.forget.lock().unwrap().pending);
+        release_tx.send(()).unwrap();
+        let end = Instant::now() + Duration::from_secs(2);
+        while backend.forget.lock().unwrap().state() != "confirmed" && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(backend.forget.lock().unwrap().state(), "confirmed");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(pair_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn a_forget_worker_that_cannot_start_does_not_stay_pending() {
+        let forget = Arc::new(Mutex::new(Forget::default()));
+        {
+            let mut state = forget.lock().unwrap();
+            state.pending = true;
+            state.generation = 7;
+        }
+        let network_called = Arc::new(AtomicBool::new(false));
+        let called = Arc::clone(&network_called);
+        let network: ForgetNetwork = Arc::new(move || {
+            called.store(true, Ordering::Release);
+            false
+        });
+        let started = spawn_forget_with(Arc::clone(&forget), network, |_job| {
+            Err(io::Error::other("test thread spawn failure"))
+        });
+        assert!(!started);
+        let state = forget.lock().unwrap();
+        assert!(!state.pending);
+        assert!(!state.in_flight);
+        assert_eq!(state.state(), "not_delivered");
+        assert_eq!(state.attempts, 0);
+        assert!(!network_called.load(Ordering::Acquire));
+        drop(state);
+        // A failure for an older generation must not clear a newer forget.
+        {
+            let mut state = forget.lock().unwrap();
+            state.pending = true;
+            state.outcome = ForgetOutcome::None;
+            state.generation = 8;
+        }
+        forget_spawn_failed(&forget, 7);
+        let state = forget.lock().unwrap();
+        assert!(state.pending);
+        assert_eq!(state.generation, 8);
     }
 
     fn wait_for_forget(backend: &RustGuiBackend, wanted: &str) -> Value {
@@ -3807,10 +5005,106 @@ mod tests {
             "phone_auth"
         );
         assert_eq!(
+            phone_start_error(io::Error::other("source_device_moved")),
+            "source_device_moved"
+        );
+        assert_eq!(
+            phone_start_error(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+            "admin_required"
+        );
+        assert_eq!(
+            phone_start_error(io::Error::new(io::ErrorKind::Interrupted, "stopped")),
+            "start_cancelled"
+        );
+        assert_eq!(
             phone_start_error(io::Error::other("private detail")),
             "source device start failed"
         );
         assert!(!phone_start_error(io::Error::other("secret-token")).contains("secret-token"));
+    }
+
+    #[test]
+    fn a_service_cleanup_fault_makes_every_gui_stop_error() {
+        let service = Arc::new(Service::new());
+        service.inject_cleanup_fault_for_test();
+        let backend = RustGuiBackend::new(Arc::clone(&service));
+        // A local run owns the service. The injected fault represents a route
+        // cleanup or worker join failure that no test can create hermetically.
+        backend.finish(Phase::Local);
+        let first = backend.stop();
+        assert!(
+            first.is_err(),
+            "a cleanup fault must fail the stop that heard it"
+        );
+        // The GUI server stops twice, and main stops once more. None of those
+        // calls may turn the recorded fault into a clean engine exit, because
+        // the Swift helper clears its durable intent on a zero exit.
+        let second = backend.stop();
+        assert!(
+            second.is_err(),
+            "the final GUI stop must keep reporting the cleanup fault"
+        );
+        let status = backend.status().unwrap();
+        assert_eq!(status["cleanup_blocked"], true);
+        assert_eq!(status["running"], false);
+        assert_eq!(status["last_stop"]["reason"], "error");
+    }
+
+    #[test]
+    fn a_panicked_tunnel_start_blocks_a_clean_gui_exit() {
+        let service = Arc::new(Service::new());
+        let backend = RustGuiBackend::new(Arc::clone(&service));
+        PANIC_NEXT_TUN_START.with(|flag| flag.set(true));
+        let error = backend.start(json!({
+            "mode":"tun",
+            "options":{"iface":"lo0"}
+        }));
+        assert!(error.is_err(), "the caught start panic is a start failure");
+        // The start guard stopped whatever the start had already created, but
+        // the panic is not proof of a clean cleanup. Every exit path reports it.
+        assert!(service.cleanup_uncertain());
+        assert!(backend.stop().is_err());
+        assert!(backend.stop().is_err());
+        assert!(matches!(*backend.phase.lock().unwrap(), Phase::Idle));
+        assert_eq!(backend.status().unwrap()["cleanup_blocked"], true);
+    }
+
+    #[test]
+    fn a_clean_gui_stop_still_reports_stopped_false_after_idle() {
+        let backend = backend();
+        backend.finish(Phase::Local);
+        let first = backend.stop().unwrap();
+        assert_eq!(first["stopped"], true);
+        let second = backend.stop().unwrap();
+        assert_eq!(second["stopped"], false);
+    }
+
+    #[test]
+    fn direct_start_errors_keep_the_real_service_stage() {
+        assert_eq!(
+            direct_start_error(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+            "admin_required"
+        );
+        assert_eq!(
+            direct_start_error(io::Error::new(io::ErrorKind::Interrupted, "stopped")),
+            "start_cancelled"
+        );
+        assert_eq!(
+            direct_start_error(io::Error::other("route_setup")),
+            "route_setup"
+        );
+        assert_eq!(
+            direct_start_error(io::Error::other("tunnel_setup")),
+            "tunnel_setup"
+        );
+        assert_eq!(
+            direct_start_error(io::Error::other("route cleanup failed")),
+            "service_start"
+        );
+        assert_eq!(
+            direct_start_error(io::Error::other("secret-token")),
+            "service_start"
+        );
     }
 
     #[test]
@@ -3828,7 +5122,8 @@ mod tests {
         let start = |port: u16| {
             backend
                 .start(json!({"mode":"socks5","options":{
-                    "host":"127.0.0.1","port":port,"iface":iface
+                    "host":"127.0.0.1","port":port,"iface":iface,
+                    "dns_servers":["127.0.0.1"]
                 }}))
                 .unwrap();
         };
@@ -4033,6 +5328,127 @@ mod tests {
         }
         stop.store(true, Ordering::Release);
         handle.join().unwrap();
+    }
+
+    /// Serve one connection: read the HELLO frame, then send `reply` raw.
+    fn raw_reply_listener(reply: Vec<u8>) -> (SocketAddr, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        // The probe first opens a bare connection to test the listener, then a
+        // second one for the exchange. Serve both the same way.
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                // One length-prefixed HELLO frame.
+                let mut length = [0u8; 2];
+                if stream.read_exact(&mut length).is_ok() {
+                    let mut hello = vec![0u8; usize::from(u16::from_be_bytes(length))];
+                    let _ = stream.read_exact(&mut hello);
+                }
+                let _ = stream.write_all(&reply);
+            }
+        });
+        (address, handle)
+    }
+
+    fn result_frame(status: pairing::PhoneStatus) -> Vec<u8> {
+        pairing::frame(&pairing::encode_result_status(status)).unwrap()
+    }
+
+    #[test]
+    fn a_valid_source_answer_is_not_source_silence() {
+        use pairing::PhoneStatus::*;
+        let identity = identity();
+        // (status, state when paired, state when unpaired)
+        let cases = [
+            (Busy, "checking", "checking"),
+            (NotActive, "not_trusted", "unpaired"),
+            (LockedOut, "not_trusted", "unpaired"),
+            (Rejected, "not_trusted", "unpaired"),
+            // Not valid answers to a status request.
+            (Denied, "not_responding", "not_responding"),
+            (TimedOut, "not_responding", "not_responding"),
+        ];
+        for (status, paired_state, unpaired_state) in cases {
+            for (paired, expected) in [(true, paired_state), (false, unpaired_state)] {
+                let (address, handle) = raw_reply_listener(result_frame(status));
+                let result = probe_once(address, paired, &identity);
+                handle.join().unwrap();
+                assert_eq!(result.state, expected, "{status:?} paired={paired}");
+                assert!(
+                    result.info.is_none(),
+                    "an unauthenticated answer has no info"
+                );
+                assert!(!result.cancelled);
+                let silent = crate::autostop::sample_from(true, true, Some(result.state))
+                    == crate::autostop::HotspotSample::DeviceGone;
+                assert_eq!(silent, expected == "not_responding", "{status:?}");
+            }
+        }
+        // A protocol error and a closed connection are not answers.
+        for reply in [vec![0, 1, 0x09], vec![0, 2, 0x04, 0x63], Vec::new()] {
+            for paired in [true, false] {
+                let (address, handle) = raw_reply_listener(reply.clone());
+                let result = probe_once(address, paired, &identity);
+                handle.join().unwrap();
+                assert_eq!(result.state, "not_responding", "reply {reply:?}");
+            }
+        }
+        // A plaintext Busy frame with trailing bytes is malformed.
+        let (address, handle) = raw_reply_listener(vec![0, 3, 0x04, 0x02, 0x00]);
+        assert_eq!(probe_once(address, true, &identity).state, "not_responding");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_busy_answer_shows_checking_without_claiming_presence() {
+        let backend = backend();
+        let run = backend.run_id.load(Ordering::Acquire);
+        let record = |state| {
+            let result = ProbeResult {
+                state,
+                info: None,
+                gateway: None,
+                trusted_by_source: None,
+                cancelled: false,
+            };
+            assert!(record_probe_for_run(
+                &backend.presence,
+                &backend.pairing,
+                &backend.run_id,
+                run,
+                &result
+            ));
+            backend.presence.lock().unwrap().state
+        };
+        // A Busy answer is recorded as checking, and the status JSON says so
+        // while a tunnel runs. Auto-stop reads checking as unverified, never
+        // as presence and never as immediate silence.
+        assert_eq!(record("checking"), Some("checking"));
+        assert_eq!(phone_state(Some("checking"), true), "checking");
+        assert_eq!(
+            crate::autostop::sample_from(true, true, Some("checking")),
+            crate::autostop::HotspotSample::Unverified
+        );
+        // A timeout is silence. A later Busy answer must not erase that
+        // silence evidence; the policy keeps the timer.
+        assert_eq!(record("not_responding"), Some("not_responding"));
+        assert_eq!(record("checking"), Some("checking"));
+        // A real authenticated answer is presence and clears the unverified
+        // run. The policy owns the bound, so the presence value stays exact.
+        assert_eq!(record("ready"), Some("ready"));
+        assert_eq!(
+            crate::autostop::sample_from(true, true, Some("ready")),
+            crate::autostop::HotspotSample::Good
+        );
+        assert_eq!(record("checking"), Some("checking"));
+        // A new run drops the stored answer.
+        backend.reset_presence();
+        assert_eq!(backend.presence.lock().unwrap().state, None);
     }
 
     #[test]

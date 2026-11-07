@@ -22,6 +22,39 @@
 //! `wintun.dll` in that directory can run code as this process. Only an
 //! administrator must be able to write to that directory.
 //!
+//! # Physical link observation
+//!
+//! [`physical_link_observation`] is a read-only, one-shot check. It resolves one
+//! interface alias or index to a LUID and GUID, holds that pair for the read,
+//! and proves it again after it reads the interface and IPv4 tables. It reads
+//! the legacy `MIB_IFROW.dwAdminStatus` and `MIB_IFROW.dwOperStatus` enums. A
+//! `CONNECTED` or `OPERATIONAL` interface with a usable IPv4 address is up. A
+//! documented down state is down. An API failure, an ambiguous target, a target
+//! that no longer resolves, or an inconsistent identity is unknown, so the
+//! policy never invents link loss.
+//!
+//! A one-shot read cannot prove that an alias still names the interface it
+//! named on an earlier sample. A rename looks like an absent alias, and a
+//! reused alias looks like a different interface. [`RetainedPhysicalLinkObserver`]
+//! is the seam for a caller that binds once after it selects the physical
+//! interface and keeps the LUID and GUID for the tunnel lifetime. The Windows
+//! direct start binds the exact index, LUID, and GUID from its outer adapter
+//! proof behind the closed direct evidence gate. The relay pins that start
+//! index, so the direct worker calls [`RetainedPhysicalLinkObserver::observe_sample`]
+//! and stops at once when the retained adapter moves to another index or is
+//! gone. The CLI and GUI auto-stop path still does not use it:
+//! `autostop::link_observation` returns `Unsupported` on Windows and the GUI
+//! maps that to unknown. That gate stays in place until an independent review
+//! and a native Windows test pass. Do not describe Windows auto-stop as
+//! working.
+//!
+//! The result says nothing about which interface is the hotspot, and a link-up
+//! result does not prove that the internet works. It creates no device and
+//! changes no route. No live Windows host has verified it yet.
+//!
+//! Every child process removes `HOTSPOTSHADE_PHONE_TOKEN` from its environment.
+//! A route or link command never inherits the source device token.
+//!
 //! The tunnel relay uses these helpers in source device proxy mode. A live
 //! Windows tunnel test is still needed. `rust-windows` CI compiles this module
 //! and runs the hermetic tests. Do not read that CI result as proof that a live
@@ -71,7 +104,8 @@
 //! configure, install, or delete as atomic.
 
 use crate::windows_route_verify::{
-    Ipv6RoutePolicy, RouteProof, RouteVerifyError, TunnelIdentity, VerifyPolicy,
+    Ipv6RoutePolicy, LiveAdapterIdentity, RetainedAdapterIdentity, RouteProof, RouteVerifyError,
+    TunnelIdentity, VerifyPolicy,
 };
 use std::ffi::{c_void, OsStr};
 use std::io;
@@ -89,10 +123,15 @@ const ERROR_PATH_NOT_FOUND: u32 = 3;
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_BUFFER_OVERFLOW: u32 = 111;
+const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 const ERROR_BAD_EXE_FORMAT: u32 = 193;
+const ERROR_NO_DATA: u32 = 232;
 const ERROR_NO_MORE_ITEMS: u32 = 259;
 const ERROR_NOT_FOUND: u32 = 1168;
+/// The environment variable that carries a source device token on the command
+/// line. A child process must never inherit it.
+const PHONE_TOKEN_ENV: &str = "HOTSPOTSHADE_PHONE_TOKEN";
 const SESSION_CAPACITY: u32 = 0x40_0000;
 const TUNNEL_MTU: usize = 1500;
 const WAIT_OBJECT_0: u32 = 0;
@@ -107,6 +146,27 @@ const SECURE_LOAD_FLAGS: u32 = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_S
 const MAX_EXECUTABLE_PATH: usize = 32768;
 /// `IF_MAX_STRING_SIZE` is 256. The alias buffer includes the terminating zero.
 const MAX_INTERFACE_ALIAS: usize = 257;
+/// `MAX_INTERFACE_NAME_LEN` from `ipmib.h`.
+const MAX_INTERFACE_NAME_LEN: usize = 256;
+/// `MAXLEN_PHYSADDR` from `ipmib.h`.
+const MAXLEN_PHYSADDR: usize = 8;
+/// `MAXLEN_IFDESCR` from `ipmib.h`.
+const MAXLEN_IFDESCR: usize = 256;
+/// `MIB_IF_ADMIN_STATUS_UP` from `ipmib.h`. This is the administrative status
+/// enum. It is not the operational status enum.
+const MIB_IF_ADMIN_STATUS_UP: u32 = 1;
+/// `MIB_IF_ADMIN_STATUS_DOWN` from `ipmib.h`.
+const MIB_IF_ADMIN_STATUS_DOWN: u32 = 2;
+/// `MIB_IF_OPER_STATUS_*` from `ipmib.h`. `MIB_IFROW.dwOperStatus` uses this
+/// legacy enum, not `IF_OPER_STATUS` from `ifdef.h`. The values differ, so a
+/// comparison against `IF_OPER_STATUS` would report a healthy interface as
+/// down.
+const MIB_IF_OPER_STATUS_NON_OPERATIONAL: u32 = 0;
+const MIB_IF_OPER_STATUS_UNREACHABLE: u32 = 1;
+const MIB_IF_OPER_STATUS_DISCONNECTED: u32 = 2;
+const MIB_IF_OPER_STATUS_CONNECTING: u32 = 3;
+const MIB_IF_OPER_STATUS_CONNECTED: u32 = 4;
+const MIB_IF_OPER_STATUS_OPERATIONAL: u32 = 5;
 
 type Handle = *mut c_void;
 
@@ -130,11 +190,105 @@ impl Guid {
     fn is_zero(&self) -> bool {
         *self == Self::ZERO
     }
+
+    /// Return the equivalent read-only route verification GUID.
+    fn route_verify_guid(self) -> crate::windows_route_verify::AdapterGuid {
+        crate::windows_route_verify::AdapterGuid::new(
+            self.data1, self.data2, self.data3, self.data4,
+        )
+    }
 }
 
 const _: () = {
     assert!(std::mem::size_of::<Guid>() == 16);
     assert!(std::mem::align_of::<Guid>() == 4);
+};
+
+/// The Windows `MIB_IFROW` layout from `ipmib.h`.
+///
+/// `GetIfEntry` fills this structure. Every field is a 32-bit value, a 16-bit
+/// value, or a byte array, so the layout is the same on x86 and x64. The
+/// compile-time size check catches a wrong field list before it can read a
+/// status from the wrong offset. The observer reads only the index and the two
+/// status values. The other fields exist because the Windows ABI requires the
+/// full structure.
+#[repr(C)]
+#[allow(dead_code)]
+struct MibIfRow {
+    name: [u16; MAX_INTERFACE_NAME_LEN],
+    index: u32,
+    kind: u32,
+    mtu: u32,
+    speed: u32,
+    phys_addr_len: u32,
+    phys_addr: [u8; MAXLEN_PHYSADDR],
+    admin_status: u32,
+    oper_status: u32,
+    last_change: u32,
+    in_octets: u32,
+    in_ucast_pkts: u32,
+    in_nucast_pkts: u32,
+    in_discards: u32,
+    in_errors: u32,
+    in_unknown_protos: u32,
+    out_octets: u32,
+    out_ucast_pkts: u32,
+    out_nucast_pkts: u32,
+    out_discards: u32,
+    out_errors: u32,
+    out_qlen: u32,
+    descr_len: u32,
+    descr: [u8; MAXLEN_IFDESCR],
+}
+
+/// The Windows `MIB_IPADDRROW` layout from `ipmib.h`.
+///
+/// `GetIpAddrTable` returns a `MIB_IPADDRTABLE` with a 4-byte row count and
+/// then this 24-byte row for each IPv4 address. `address` is in network byte
+/// order. `index` is the interface index. `w_type` holds the address flags.
+/// The other fields exist because the Windows ABI requires the full row.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct MibIpAddrRow {
+    address: u32,
+    index: u32,
+    mask: u32,
+    broadcast: u32,
+    reasm_size: u32,
+    unused: u16,
+    /// `MIB_IPADDRROW.wType`: the address flags.
+    w_type: u16,
+}
+
+/// `MIB_IPADDRROW.wType` flags from `ipmib.h`. A transient, deleted, or
+/// disconnected address cannot carry traffic for the interface. Counting one as
+/// usable could keep a stale address alive after the link lost its lease.
+const MIB_IPADDR_DISCONNECTED: u16 = 0x0008;
+const MIB_IPADDR_DELETED: u16 = 0x0040;
+const MIB_IPADDR_TRANSIENT: u16 = 0x0080;
+
+/// The largest IPv4 address table that the observer accepts. A normal table is a
+/// few kilobytes. A much larger reported size is a failed or hostile read, so
+/// cap the allocation instead of trusting the API size.
+const MAX_IPV4_ADDRESS_TABLE_BYTES: usize = 1 << 20;
+const MAX_IPV4_ADDRESS_ROWS: usize =
+    (MAX_IPV4_ADDRESS_TABLE_BYTES - 4) / mem::size_of::<MibIpAddrRow>();
+
+// `GetIfEntry` reads and writes a fixed `MIB_IFROW`. Check the total size, the
+// alignment, and the field offsets that the observer reads against the header
+// on both supported architectures.
+const _: () = {
+    assert!(mem::size_of::<MibIfRow>() == 860);
+    assert!(mem::align_of::<MibIfRow>() == 4);
+    assert!(mem::offset_of!(MibIfRow, index) == 512);
+    assert!(mem::offset_of!(MibIfRow, admin_status) == 540);
+    assert!(mem::offset_of!(MibIfRow, oper_status) == 544);
+    assert!(mem::size_of::<MibIpAddrRow>() == 24);
+    assert!(mem::align_of::<MibIpAddrRow>() == 4);
+    assert!(mem::offset_of!(MibIpAddrRow, address) == 0);
+    assert!(mem::offset_of!(MibIpAddrRow, index) == 4);
+    assert!(mem::offset_of!(MibIpAddrRow, w_type) == 22);
 };
 
 type WintunCreateAdapterFn =
@@ -184,9 +338,12 @@ extern "system" {
     fn GetBestInterface(destination: u32, index: *mut u32) -> u32;
     fn ConvertInterfaceAliasToLuid(alias: *const u16, luid: *mut u64) -> u32;
     fn ConvertInterfaceGuidToLuid(guid: *const Guid, luid: *mut u64) -> u32;
+    fn ConvertInterfaceIndexToLuid(index: u32, luid: *mut u64) -> u32;
     fn ConvertInterfaceLuidToAlias(luid: *const u64, alias: *mut u16, length: usize) -> u32;
     fn ConvertInterfaceLuidToGuid(luid: *const u64, guid: *mut Guid) -> u32;
     fn ConvertInterfaceLuidToIndex(luid: *const u64, index: *mut u32) -> u32;
+    fn GetIfEntry(row: *mut MibIfRow) -> u32;
+    fn GetIpAddrTable(table: *mut c_void, size: *mut u32, order: i32) -> u32;
 }
 
 fn wide(value: &str) -> Vec<u16> {
@@ -889,8 +1046,7 @@ struct SystemRunner;
 impl CommandRunner for SystemRunner {
     fn run(&self, program: &Path, args: &[String]) -> io::Result<()> {
         use std::os::windows::process::CommandExt;
-        let output = Command::new(program)
-            .args(args)
+        let output = system_command(program, args)
             .creation_flags(CREATE_NO_WINDOW)
             .output()?;
         if output.status.success() {
@@ -903,6 +1059,19 @@ impl CommandRunner for SystemRunner {
             )))
         }
     }
+}
+
+/// Build a child command that cannot inherit the source device token.
+///
+/// The CLI reads `HOTSPOTSHADE_PHONE_TOKEN` and removes it from the process
+/// environment. This function removes it again for every child, so a route or
+/// link command never receives the token even when a caller still holds it in
+/// the environment. `netsh` needs no part of it.
+fn system_command(program: &Path, args: &[String]) -> Command {
+    let mut command = Command::new(program);
+    command.args(args);
+    command.env_remove(PHONE_TOKEN_ENV);
+    command
 }
 
 /// Owns one adapter handle.
@@ -1974,6 +2143,17 @@ pub fn default_interface_index() -> io::Result<u32> {
     Ok(index)
 }
 
+/// Return the current default IPv4 gateway and its interface index.
+///
+/// The lookup is read-only. It uses the best route to a public destination, so
+/// it names the same adapter that [`default_interface_index`] selects. Use it
+/// before installing the two `/1` routes. After those routes point at the
+/// tunnel adapter, the lookup names the tunnel and a caller must reject it.
+pub fn default_ipv4_gateway() -> io::Result<(Ipv4Addr, u32)> {
+    crate::windows_route_verify::default_ipv4_gateway()
+        .map_err(|_| io::Error::other("default IPv4 gateway lookup failed"))
+}
+
 /// Return true when the current process token has the Administrators group
 /// enabled.
 ///
@@ -2023,6 +2203,775 @@ pub fn is_elevated() -> bool {
         )
     };
     checked != 0 && member != 0
+}
+
+// ---------------------------------------------------------------------------
+// Physical interface link observation
+// ---------------------------------------------------------------------------
+
+/// The current LUID for an interface index, or `Ok(None)` when Windows reports
+/// that no interface has this index.
+fn interface_luid_from_index(index: u32) -> io::Result<Option<u64>> {
+    if !valid_interface_index(index) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interface index must be a nonzero 24-bit number",
+        ));
+    }
+    let mut luid: u64 = 0;
+    let status = unsafe { ConvertInterfaceIndexToLuid(index, &mut luid) };
+    if !interface_lookup_result(status)? {
+        return Ok(None);
+    }
+    if luid == 0 {
+        return Err(io::Error::other("the interface index has a zero LUID"));
+    }
+    Ok(Some(luid))
+}
+
+/// Map the legacy `MIB_IFROW.dwAdminStatus` value.
+///
+/// `1` is up and `2` is down. `3` is the testing state, and any other value is
+/// not a documented administrative state. Both are unknown, not down, because
+/// the observer must not invent link loss from a value it does not understand.
+fn admin_status_state(value: u32) -> LinkStatus {
+    match value {
+        MIB_IF_ADMIN_STATUS_UP => LinkStatus::Up,
+        MIB_IF_ADMIN_STATUS_DOWN => LinkStatus::Down,
+        _ => LinkStatus::Unknown,
+    }
+}
+
+/// Map the legacy `MIB_IFROW.dwOperStatus` value.
+///
+/// `GetIfEntry` uses `MIB_IF_OPER_STATUS_*` from `ipmib.h`, not
+/// `IF_OPER_STATUS` from `ifdef.h`. `4` (connected) and `5` (operational) are
+/// up. `0` (non-operational), `1` (unreachable), and `2` (disconnected) are
+/// down. `3` (connecting) is transient, and any other value is not a documented
+/// operational state, so both are unknown. A healthy interface reports `5`, not
+/// `1`.
+fn oper_status_state(value: u32) -> LinkStatus {
+    match value {
+        MIB_IF_OPER_STATUS_CONNECTED | MIB_IF_OPER_STATUS_OPERATIONAL => LinkStatus::Up,
+        MIB_IF_OPER_STATUS_NON_OPERATIONAL
+        | MIB_IF_OPER_STATUS_UNREACHABLE
+        | MIB_IF_OPER_STATUS_DISCONNECTED => LinkStatus::Down,
+        MIB_IF_OPER_STATUS_CONNECTING => LinkStatus::Unknown,
+        _ => LinkStatus::Unknown,
+    }
+}
+
+/// Read the administrative and operational state of one interface index.
+///
+/// `GetIfEntry` fills a `MIB_IFROW`. The function returns `Ok(None)` only for
+/// the documented not-found codes. Any other error is returned, because a
+/// failed read is not evidence that the interface is down.
+fn read_interface_status(index: u32) -> io::Result<Option<InterfaceStatus>> {
+    if !valid_interface_index(index) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interface index must be a nonzero 24-bit number",
+        ));
+    }
+    // The API writes every field, but start from zero so a partial write
+    // cannot expose stack data or an old status.
+    let mut row: MibIfRow = unsafe { mem::zeroed() };
+    row.index = index;
+    let status = unsafe { GetIfEntry(&mut row) };
+    if status != 0 {
+        return match status {
+            // Microsoft documents ERROR_NOT_FOUND when the interface index
+            // does not name an entry. Do not treat ERROR_INVALID_PARAMETER as
+            // absence: a wrong request shape is an unknown read, not proof
+            // that the interface is gone.
+            ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_NOT_FOUND => Ok(None),
+            _ => Err(io::Error::from_raw_os_error(status as i32)),
+        };
+    }
+    if row.index != index {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "GetIfEntry returned another interface index",
+        ));
+    }
+    Ok(Some(InterfaceStatus {
+        admin: admin_status_state(row.admin_status),
+        oper: oper_status_state(row.oper_status),
+    }))
+}
+
+/// Read the IPv4 address table as rows with the interface index and flags.
+///
+/// The table is not evidence about one interface until the caller filters by
+/// index. A missing table, buffer error, or layout error cannot prove that an
+/// interface has no address and is reported as an inconclusive observation.
+fn ipv4_address_table() -> io::Result<Vec<Ipv4AddressEntry>> {
+    let mut size: u32 = 0;
+    let status = unsafe { GetIpAddrTable(ptr::null_mut(), &mut size, 0) };
+    if status == ERROR_NO_DATA {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    if status != ERROR_INSUFFICIENT_BUFFER {
+        if status == 0 && size == 0 {
+            return Err(io::Error::other("empty IPv4 address table response"));
+        }
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    // The table can grow between the size query and the read. Retry a bounded
+    // number of times, then report an inconclusive read.
+    for _ in 0..3 {
+        if size < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the IPv4 address table size is invalid",
+            ));
+        }
+        if size as usize > MAX_IPV4_ADDRESS_TABLE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the IPv4 address table is too large",
+            ));
+        }
+        // Allocate 4-byte words. `GetIpAddrTable` writes a `MIB_IPADDRTABLE`
+        // through this pointer, so a byte buffer's alignment is not enough.
+        let words = (size as usize).div_ceil(4);
+        let mut buffer = vec![0u32; words];
+        let mut filled = size;
+        let status = unsafe { GetIpAddrTable(buffer.as_mut_ptr().cast(), &mut filled, 0) };
+        match status {
+            0 => {
+                // SAFETY: `buffer` owns `words * 4` initialized bytes.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), buffer.len() * 4)
+                };
+                // Some Windows versions leave `pdwSize` at its input value or
+                // report padding beyond the last row. The parser accepts a
+                // reported size with safe slack, and it never reads past the
+                // buffer.
+                let reported = if filled == 0 { size } else { filled };
+                return parse_ipv4_address_table(bytes, reported);
+            }
+            ERROR_NO_DATA => return Err(io::Error::from_raw_os_error(status as i32)),
+            ERROR_INSUFFICIENT_BUFFER if filled > size => {
+                if filled as usize > MAX_IPV4_ADDRESS_TABLE_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the IPv4 address table is too large",
+                    ));
+                }
+                size = filled;
+            }
+            code => return Err(io::Error::from_raw_os_error(code as i32)),
+        }
+    }
+    Err(io::Error::other(
+        "the IPv4 address table did not fit a bounded buffer",
+    ))
+}
+
+/// One `MIB_IPADDRROW`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Ipv4AddressEntry {
+    index: u32,
+    address: Ipv4Addr,
+    flags: u16,
+}
+
+/// Parse a `MIB_IPADDRTABLE` buffer.
+///
+/// The 4-byte row count and the 24-byte row stride are the documented layout.
+/// A reported size larger than `4 + count * 24` is accepted as safe slack: the
+/// API can report padding beyond the last row. A reported size smaller than the
+/// rows need, or larger than the buffer, is a layout mismatch, not an empty
+/// table. The row count is capped before any allocation. Rows are read with
+/// `read_unaligned` so parsing does not depend on the caller's alignment.
+fn parse_ipv4_address_table(buffer: &[u8], reported: u32) -> io::Result<Vec<Ipv4AddressEntry>> {
+    let reported = reported as usize;
+    if reported < 4 || reported > buffer.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the IPv4 address table reported size is outside its buffer",
+        ));
+    }
+    let Some(header) = buffer.get(..4) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the IPv4 address table is shorter than its header",
+        ));
+    };
+    let count = u32::from_ne_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    if count > MAX_IPV4_ADDRESS_ROWS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the IPv4 address row count is too large",
+        ));
+    }
+    let stride = mem::size_of::<MibIpAddrRow>();
+    let needed = 4usize
+        .checked_add(count.checked_mul(stride).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the IPv4 address row count is too large",
+            )
+        })?)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the IPv4 address table is too large",
+            )
+        })?;
+    if needed > reported {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the IPv4 address table layout does not match the documented row size",
+        ));
+    }
+    let mut rows = Vec::with_capacity(count);
+    for position in 0..count {
+        let offset = 4 + position * stride;
+        // SAFETY: `offset + stride <= needed <= reported <= buffer.len()`.
+        // The pointer comes from a byte buffer, and `read_unaligned` accepts
+        // it.
+        let row =
+            unsafe { ptr::read_unaligned(buffer.as_ptr().add(offset).cast::<MibIpAddrRow>()) };
+        rows.push(Ipv4AddressEntry {
+            index: row.index,
+            address: Ipv4Addr::from(row.address.to_ne_bytes()),
+            flags: row.w_type,
+        });
+    }
+    Ok(rows)
+}
+
+/// True when an address can carry traffic on the physical interface.
+///
+/// The classifier rejects the `0.0.0.0/8` "this network" range, loopback
+/// (`127.0.0.0/8`), the limited broadcast address, multicast, and the APIPA
+/// range `169.254.0.0/16`. A link-local APIPA address means DHCP did not
+/// complete. It is not a usable hotspot address.
+fn usable_ipv4(address: Ipv4Addr) -> bool {
+    !address.is_unspecified()
+        && address.octets()[0] != 0
+        && !address.is_loopback()
+        && !address.is_broadcast()
+        && !address.is_multicast()
+        && !(address.octets()[0] == 169 && address.octets()[1] == 254)
+}
+
+/// True when the address row is live and usable.
+///
+/// A transient, deleted, or disconnected address is stale. A primary, dynamic,
+/// or DNS-eligible address is usable when the address itself passes
+/// [`usable_ipv4`].
+fn usable_ipv4_entry(entry: &Ipv4AddressEntry) -> bool {
+    entry.flags & (MIB_IPADDR_TRANSIENT | MIB_IPADDR_DELETED | MIB_IPADDR_DISCONNECTED) == 0
+        && usable_ipv4(entry.address)
+}
+
+/// The identity that one observation resolved from an interface alias or
+/// index, or that a retained observer kept from its binding.
+///
+/// A one-shot read uses the target once to resolve this pair. A retained
+/// observer keeps the pair and never resolves the alias again. Every later read
+/// proves this LUID and GUID. The observer never selects an interface by its up
+/// state, and it never keeps an index as identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PhysicalIdentity {
+    luid: u64,
+    guid: Guid,
+}
+
+/// The administrative and operational state of one interface row.
+///
+/// Each field is the already-mapped legacy enum. `Unknown` keeps a transient or
+/// undocumented raw value from becoming link loss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InterfaceStatus {
+    admin: LinkStatus,
+    oper: LinkStatus,
+}
+
+/// One interface row that an observation proved for the retained identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IdentifiedRow {
+    index: u32,
+    luid: u64,
+    guid: Guid,
+    status: InterfaceStatus,
+    ipv4: Vec<Ipv4AddressEntry>,
+}
+
+/// The evidence from one read of the Windows interface tables.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LinkProbe {
+    /// An API call failed, or the reads disagreed. Unknown is not link loss.
+    Unavailable,
+    /// The requested alias or index did not resolve, or it resolved to more
+    /// than one interface. A one-shot read cannot prove that this is the same
+    /// interface that an earlier sample saw. Unknown is not link loss.
+    Unresolved,
+    /// A retained LUID and GUID no longer name an interface. Removal is
+    /// conclusive only when both lookups report absence, or the GUID proves
+    /// that Windows reused the LUID for another adapter.
+    Removed,
+    /// The tables proved one row for the identity that the alias or index
+    /// resolved to.
+    Identified {
+        identity: PhysicalIdentity,
+        row: IdentifiedRow,
+    },
+}
+
+/// The three states that the auto-stop policy can use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinkStatus {
+    Up,
+    Down,
+    Unknown,
+}
+
+/// The interface table reads that one observation needs.
+///
+/// The real implementation calls `iphlpapi.dll`. A test implementation returns
+/// fixed values and creates no device and no route.
+trait LinkTables {
+    fn luid_for_alias(&self, alias: &str) -> io::Result<Option<u64>>;
+    fn index_for_luid(&self, luid: u64) -> io::Result<Option<u32>>;
+    fn luid_for_index(&self, index: u32) -> io::Result<Option<u64>>;
+    fn guid_for_luid(&self, luid: u64) -> io::Result<Option<Guid>>;
+    fn interface_status(&self, index: u32) -> io::Result<Option<InterfaceStatus>>;
+    fn ipv4_addresses(&self) -> io::Result<Vec<Ipv4AddressEntry>>;
+}
+
+struct SystemLinkTables;
+
+impl LinkTables for SystemLinkTables {
+    fn luid_for_alias(&self, alias: &str) -> io::Result<Option<u64>> {
+        interface_alias_luid(alias)
+    }
+
+    fn index_for_luid(&self, luid: u64) -> io::Result<Option<u32>> {
+        interface_index_lookup(luid)
+    }
+
+    fn luid_for_index(&self, index: u32) -> io::Result<Option<u64>> {
+        interface_luid_from_index(index)
+    }
+
+    fn guid_for_luid(&self, luid: u64) -> io::Result<Option<Guid>> {
+        interface_guid_from_luid(luid)
+    }
+
+    fn interface_status(&self, index: u32) -> io::Result<Option<InterfaceStatus>> {
+        read_interface_status(index)
+    }
+
+    fn ipv4_addresses(&self) -> io::Result<Vec<Ipv4AddressEntry>> {
+        ipv4_address_table()
+    }
+}
+
+fn validate_link_target(target: &str) -> io::Result<()> {
+    let length = target.chars().count();
+    if length == 0
+        || length > MAX_INTERFACE_NAME_LEN
+        || target.contains('\0')
+        || target.chars().any(char::is_control)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid interface name",
+        ));
+    }
+    Ok(())
+}
+
+/// Return a numeric interface index only for an all-digit target.
+///
+/// A numeric alias is legal on Windows. A target that parses as a number is
+/// therefore not automatically an index. [`resolve_target_with`] reads both
+/// forms and requires them to agree when both exist.
+fn numeric_interface_index(target: &str) -> Option<u32> {
+    if target.is_empty() || !target.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let index = target.parse::<u32>().ok()?;
+    valid_interface_index(index).then_some(index)
+}
+
+/// Normalize one LUID lookup. A zero LUID on success is inconsistent, not an
+/// absent interface, so it maps to the same failure as an API error.
+fn lookup_luid(result: io::Result<Option<u64>>) -> Result<Option<u64>, ()> {
+    match result {
+        Ok(Some(luid)) if luid != 0 => Ok(Some(luid)),
+        Ok(Some(_)) => Err(()),
+        Ok(None) => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+/// The result of resolving one target without selecting an interface by its
+/// link state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetResolution {
+    Luid(u64),
+    /// No index and no alias currently names an interface.
+    Absent,
+    /// A numeric target names one index and a different interface alias. The
+    /// caller cannot tell which interface the person meant.
+    Ambiguous,
+    Unavailable,
+}
+
+/// Resolve one alias or numeric index to a LUID.
+///
+/// A numeric target is read as both an index and an alias, because Windows
+/// allows an alias made of digits. When both forms exist they must name the
+/// same LUID. A disagreement is ambiguous, and an API error is unavailable.
+/// Absence of both forms is not evidence that an earlier interface is gone:
+/// the alias may have been renamed, or the index may have changed.
+fn resolve_target_with(tables: &dyn LinkTables, target: &str) -> TargetResolution {
+    let index_luid = match numeric_interface_index(target) {
+        Some(index) => match lookup_luid(tables.luid_for_index(index)) {
+            Ok(value) => value,
+            Err(()) => return TargetResolution::Unavailable,
+        },
+        None => None,
+    };
+    let alias_luid = match lookup_luid(tables.luid_for_alias(target)) {
+        Ok(value) => value,
+        Err(()) => return TargetResolution::Unavailable,
+    };
+    match (index_luid, alias_luid) {
+        (None, None) => TargetResolution::Absent,
+        (Some(index), Some(alias)) if index != alias => TargetResolution::Ambiguous,
+        (Some(luid), _) | (_, Some(luid)) => TargetResolution::Luid(luid),
+    }
+}
+
+/// Read one LUID once and prove that the index and the GUID stayed with it for
+/// the whole read.
+///
+/// `expected_guid` is `Some` for a retained observer. A different GUID then
+/// proves that Windows reused the LUID for another adapter, so the retained
+/// interface is gone and the other adapter's status is not read. With `None`
+/// the observer binds to the GUID it reads now. A disagreement between the
+/// index and the GUID lookup is unknown, not removal.
+fn probe_luid_with(tables: &dyn LinkTables, luid: u64, expected_guid: Option<Guid>) -> LinkProbe {
+    if luid == 0 {
+        return LinkProbe::Unavailable;
+    }
+    let index = match tables.index_for_luid(luid) {
+        Ok(value) => value,
+        Err(_) => return LinkProbe::Unavailable,
+    };
+    let guid = match tables.guid_for_luid(luid) {
+        Ok(value) => value,
+        Err(_) => return LinkProbe::Unavailable,
+    };
+    let (index, guid) = match (index, guid) {
+        (None, None) => return LinkProbe::Removed,
+        (Some(index), Some(guid)) => (index, guid),
+        // One lookup found the LUID and the other did not. The tables disagree,
+        // so the answer is unknown.
+        (None, Some(_)) | (Some(_), None) => return LinkProbe::Unavailable,
+    };
+    if !valid_interface_index(index) || guid.is_zero() {
+        return LinkProbe::Unavailable;
+    }
+    if let Some(expected) = expected_guid {
+        if guid != expected {
+            // The retained LUID now names another adapter. The interface this
+            // observer bound to is gone. Do not read the other adapter's
+            // status or addresses and present them as the retained interface.
+            return LinkProbe::Removed;
+        }
+    }
+    let identity = PhysicalIdentity { luid, guid };
+    let reverse_luid = match tables.luid_for_index(index) {
+        Ok(Some(value)) if value == luid => value,
+        // The index now names another interface, or the table did not answer.
+        Ok(_) => return LinkProbe::Unavailable,
+        Err(_) => return LinkProbe::Unavailable,
+    };
+    let status = match tables.interface_status(index) {
+        Ok(Some(status)) => status,
+        // The index is in the LUID table but not the status table. That is an
+        // inconsistent read, not proof of link loss.
+        Ok(None) => return LinkProbe::Unavailable,
+        Err(_) => return LinkProbe::Unavailable,
+    };
+    let ipv4 = match tables.ipv4_addresses() {
+        Ok(rows) => rows.into_iter().filter(|row| row.index == index).collect(),
+        Err(_) => return LinkProbe::Unavailable,
+    };
+    // Prove the identity again after the address read. This catches a removed
+    // adapter and a reused index or LUID during the observation.
+    match tables.luid_for_index(index) {
+        Ok(Some(value)) if value == luid => {}
+        _ => return LinkProbe::Unavailable,
+    }
+    let final_guid = match tables.guid_for_luid(luid) {
+        Ok(Some(value)) if value == guid => value,
+        _ => return LinkProbe::Unavailable,
+    };
+    LinkProbe::Identified {
+        identity,
+        row: IdentifiedRow {
+            index,
+            luid: reverse_luid,
+            guid: final_guid,
+            status,
+            ipv4,
+        },
+    }
+}
+
+/// Resolve and read one target once. A target that no longer resolves is
+/// unknown, because a one-shot read cannot tell a rename from a removal.
+fn probe_with(tables: &dyn LinkTables, target: &str) -> LinkProbe {
+    match resolve_target_with(tables, target) {
+        TargetResolution::Luid(luid) => probe_luid_with(tables, luid, None),
+        TargetResolution::Absent | TargetResolution::Ambiguous => LinkProbe::Unresolved,
+        TargetResolution::Unavailable => LinkProbe::Unavailable,
+    }
+}
+
+/// One retained link observation with the live index.
+///
+/// A caller that pinned an interface index at start must compare the
+/// `interface_index` field with that pin. The observer follows the retained
+/// LUID and GUID, so a link change can move the same adapter to a new index.
+/// The pinned index then names no adapter, or it names another adapter after
+/// Windows reuses it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetainedLinkSample {
+    /// True for a conclusive up link, false for a conclusive down link.
+    pub up: bool,
+    /// The live index for the retained identity, or `None` when the retained
+    /// identity is gone.
+    pub interface_index: Option<u32>,
+}
+
+/// A retained interface identity for repeated link observations.
+///
+/// Bind once after the tunnel selects the physical interface, then call
+/// [`observe`](Self::observe) for every sample of that tunnel's lifetime. The
+/// observer resolves the index and the status from the retained LUID and GUID.
+/// It never resolves the alias again, so a rename does not look like a removed
+/// interface, and a reused alias does not select another interface. A caller
+/// that also pinned an index must use [`observe_sample`](Self::observe_sample)
+/// and stop when the live index differs from its pin, because the pin does not
+/// follow the adapter.
+///
+/// The Windows direct start binds [`bind_retained`](Self::bind_retained) with
+/// the exact index, LUID, and GUID from its outer adapter proof. That path does
+/// not resolve an alias. It stays behind the closed direct evidence gate. The
+/// CLI and GUI do not use this observer, because `autostop::link_observation`
+/// returns `Unsupported` on Windows. Windows auto-stop therefore stays off
+/// until an independent review and a native Windows test pass. Do not describe
+/// Windows auto-stop as working.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetainedPhysicalLinkObserver {
+    identity: PhysicalIdentity,
+}
+
+impl RetainedPhysicalLinkObserver {
+    /// Bind to one interface by alias or numeric index.
+    ///
+    /// An absent, ambiguous, or unreadable target is an error. The observer
+    /// holds no address or token. A production direct start must not use this
+    /// path: it must retain the exact identity from its outer adapter proof and
+    /// call [`bind_retained`](Self::bind_retained) instead.
+    pub fn bind(target: &str) -> io::Result<Self> {
+        Self::bind_with(&SystemLinkTables, target)
+    }
+
+    /// Bind to one exact retained adapter identity.
+    ///
+    /// The caller must retain the index, LUID, and GUID from the same proof
+    /// that selected the physical outer adapter. This function reads the live
+    /// index and GUID for the retained LUID once and fails closed when either
+    /// differs from the retained value. It never resolves an alias and never
+    /// selects an interface by its link state. Later observations follow the
+    /// retained LUID and GUID, so an index change for the same adapter is not
+    /// link loss here. A caller that pinned the returned index must compare
+    /// [`observe_sample`](Self::observe_sample) with that pin and stop when the
+    /// index differs.
+    pub fn bind_retained(identity: RetainedAdapterIdentity) -> io::Result<Self> {
+        Self::bind_retained_with(&SystemLinkTables, identity)
+    }
+
+    /// Observe the retained interface. A conclusive down state returns
+    /// `Ok(false)`. An inconclusive read returns `Err`.
+    pub fn observe(&self) -> io::Result<bool> {
+        self.observe_with(&SystemLinkTables)
+    }
+
+    /// Observe the retained interface and return its live index.
+    ///
+    /// A caller that pinned an index at start must compare the returned index
+    /// with that pin. The observer follows the retained LUID and GUID, so a link
+    /// change can move the same adapter to a new index. Continuing to use the
+    /// old pin would then send outer traffic to no adapter, or to another
+    /// adapter after Windows reuses the index. An absent index means the
+    /// retained identity is gone. An inconclusive read returns `Err`.
+    pub fn observe_sample(&self) -> io::Result<RetainedLinkSample> {
+        self.observe_sample_with(&SystemLinkTables)
+    }
+
+    fn bind_with(tables: &dyn LinkTables, target: &str) -> io::Result<Self> {
+        validate_link_target(target)?;
+        match resolve_target_with(tables, target) {
+            TargetResolution::Luid(luid) => {
+                let guid = match tables.guid_for_luid(luid) {
+                    Ok(Some(guid)) if !guid.is_zero() => guid,
+                    Ok(_) => {
+                        return Err(io::Error::other("the interface identity is unavailable"));
+                    }
+                    Err(_) => {
+                        return Err(io::Error::other("the interface identity is unavailable"));
+                    }
+                };
+                Ok(Self {
+                    identity: PhysicalIdentity { luid, guid },
+                })
+            }
+            TargetResolution::Absent => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "the interface is not present",
+            )),
+            TargetResolution::Ambiguous => {
+                Err(io::Error::other("the interface target is ambiguous"))
+            }
+            TargetResolution::Unavailable => {
+                Err(io::Error::other("the interface identity is unavailable"))
+            }
+        }
+    }
+
+    fn bind_retained_with(
+        tables: &dyn LinkTables,
+        retained: RetainedAdapterIdentity,
+    ) -> io::Result<Self> {
+        let unavailable = || io::Error::other("the retained interface identity is unavailable");
+        // Read the live identity for the retained LUID. The retained GUID is
+        // compared below, after the read proves that the index and LUID still
+        // describe one row.
+        let probe = probe_luid_with(tables, retained.interface_luid(), None);
+        let LinkProbe::Identified { row, .. } = probe else {
+            return Err(unavailable());
+        };
+        retained
+            .matches(LiveAdapterIdentity {
+                interface_index: row.index,
+                interface_guid: row.guid.route_verify_guid(),
+            })
+            .map_err(|_| unavailable())?;
+        // The match above proved that the live GUID is the retained GUID, so
+        // the observer can keep the live value without another conversion.
+        Ok(Self {
+            identity: PhysicalIdentity {
+                luid: retained.interface_luid(),
+                guid: row.guid,
+            },
+        })
+    }
+
+    fn observe_with(&self, tables: &dyn LinkTables) -> io::Result<bool> {
+        self.observe_sample_with(tables).map(|sample| sample.up)
+    }
+
+    fn observe_sample_with(&self, tables: &dyn LinkTables) -> io::Result<RetainedLinkSample> {
+        let probe = probe_luid_with(tables, self.identity.luid, Some(self.identity.guid));
+        let interface_index = match &probe {
+            LinkProbe::Identified { row, .. } => Some(row.index),
+            LinkProbe::Removed => None,
+            LinkProbe::Unavailable | LinkProbe::Unresolved => {
+                return Err(io::Error::other("the physical link state is unknown"))
+            }
+        };
+        match classify_link(&probe) {
+            LinkStatus::Up => Ok(RetainedLinkSample {
+                up: true,
+                interface_index,
+            }),
+            LinkStatus::Down => Ok(RetainedLinkSample {
+                up: false,
+                interface_index,
+            }),
+            LinkStatus::Unknown => Err(io::Error::other("the physical link state is unknown")),
+        }
+    }
+}
+
+/// Classify one probe. This function is pure and reads no interface.
+///
+/// A row counts only when its index is valid, its LUID matches the identity,
+/// and its GUID matches the identity. A mismatch means the table moved under
+/// the observation, so the answer is unknown. A present row that is
+/// administratively or operationally down is a conclusive down. A transient or
+/// undocumented raw status is unknown. A present, up row without a live usable
+/// IPv4 address is down, because the tunnel cannot use it.
+fn classify_link(probe: &LinkProbe) -> LinkStatus {
+    match probe {
+        LinkProbe::Unavailable | LinkProbe::Unresolved => LinkStatus::Unknown,
+        LinkProbe::Removed => LinkStatus::Down,
+        LinkProbe::Identified { identity, row } => {
+            if !valid_interface_index(row.index)
+                || row.luid != identity.luid
+                || row.guid != identity.guid
+            {
+                return LinkStatus::Unknown;
+            }
+            match row.status.admin {
+                LinkStatus::Down => return LinkStatus::Down,
+                LinkStatus::Unknown => return LinkStatus::Unknown,
+                LinkStatus::Up => {}
+            }
+            match row.status.oper {
+                LinkStatus::Down => LinkStatus::Down,
+                LinkStatus::Unknown => LinkStatus::Unknown,
+                LinkStatus::Up => {
+                    if row.ipv4.iter().any(usable_ipv4_entry) {
+                        LinkStatus::Up
+                    } else {
+                        LinkStatus::Down
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Observe the physical interface that an alias or numeric index names.
+///
+/// The target is resolved once per call. It may be an interface alias or an
+/// interface index, the forms that the tunnel start path accepts. The observer
+/// retains the LUID and GUID for the whole read and proves them again after
+/// the address read. A conclusive down state returns `Ok(false)`. An
+/// inconclusive read returns `Err`, so the auto-stop policy can treat it as
+/// unknown instead of link loss.
+///
+/// This is a one-shot observation. It resolves the target again on every call,
+/// so it cannot tell an alias rename or alias reuse from a removal across
+/// samples. Use [`RetainedPhysicalLinkObserver`] for a long-lived sample loop.
+/// The Windows auto-stop gate is still closed, so this function does not enable
+/// production auto-stop.
+///
+/// A link-up result with a usable IPv4 address does not prove that the
+/// interface is a hotspot, that it is the hotspot that the tunnel uses, or
+/// that the internet works. It proves only that the interface exists, is
+/// administratively and operationally up, and has one live unicast IPv4
+/// address. Never use this result to choose a physical interface or a source
+/// device.
+pub fn physical_link_observation(target: &str) -> io::Result<bool> {
+    validate_link_target(target)?;
+    match classify_link(&probe_with(&SystemLinkTables, target)) {
+        LinkStatus::Up => Ok(true),
+        LinkStatus::Down => Ok(false),
+        LinkStatus::Unknown => Err(io::Error::other("the physical link state is unknown")),
+    }
 }
 
 #[cfg(test)]
@@ -3272,5 +4221,893 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
         assert!(error.to_string().contains("wintun.dll"), "{error}");
         assert!(error.to_string().contains("missing"), "{error}");
+    }
+
+    #[test]
+    fn the_system_command_cannot_inherit_the_phone_token() {
+        assert_eq!(PHONE_TOKEN_ENV, "HOTSPOTSHADE_PHONE_TOKEN");
+        let command = system_command(&test_netsh(), &["interface".into(), "ipv4".into()]);
+        assert_eq!(command.get_program(), test_netsh().as_os_str());
+        let removed = command
+            .get_envs()
+            .filter(|(name, value)| *name == OsStr::new(PHONE_TOKEN_ENV) && value.is_none())
+            .count();
+        assert_eq!(removed, 1);
+    }
+
+    #[test]
+    fn interface_table_layouts_match_the_windows_headers() {
+        // Both structures are fixed on x86 and x64. A wrong field list would
+        // read an operational status or an address from the wrong offset.
+        assert_eq!(mem::size_of::<MibIfRow>(), 860);
+        assert_eq!(mem::align_of::<MibIfRow>(), 4);
+        assert_eq!(mem::size_of::<MibIpAddrRow>(), 24);
+        assert_eq!(mem::align_of::<MibIpAddrRow>(), 4);
+        assert_eq!(mem::offset_of!(MibIfRow, index), 512);
+        assert_eq!(mem::offset_of!(MibIfRow, admin_status), 540);
+        assert_eq!(mem::offset_of!(MibIfRow, oper_status), 544);
+        assert_eq!(mem::offset_of!(MibIpAddrRow, w_type), 22);
+    }
+
+    fn ipv4_table_buffer(rows: &[(Ipv4Addr, u32, u16)]) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&(rows.len() as u32).to_ne_bytes());
+        for (address, index, flags) in rows {
+            let mut row = [0u8; 24];
+            row[..4].copy_from_slice(&address.octets());
+            row[4..8].copy_from_slice(&index.to_ne_bytes());
+            row[22..24].copy_from_slice(&flags.to_ne_bytes());
+            buffer.extend_from_slice(&row);
+        }
+        buffer
+    }
+
+    #[test]
+    fn the_address_table_parser_reads_the_documented_layout() {
+        let buffer = ipv4_table_buffer(&[
+            (Ipv4Addr::new(192, 168, 1, 20), 7, 0),
+            (Ipv4Addr::new(169, 254, 1, 1), 9, 0),
+        ]);
+        let rows = parse_ipv4_address_table(&buffer, buffer.len() as u32).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                Ipv4AddressEntry {
+                    index: 7,
+                    address: Ipv4Addr::new(192, 168, 1, 20),
+                    flags: 0,
+                },
+                Ipv4AddressEntry {
+                    index: 9,
+                    address: Ipv4Addr::new(169, 254, 1, 1),
+                    flags: 0,
+                },
+            ]
+        );
+
+        // A reported size smaller than the rows need, or larger than the
+        // buffer, is a layout error, not an empty table.
+        assert!(parse_ipv4_address_table(&buffer, buffer.len() as u32 - 1).is_err());
+        assert!(parse_ipv4_address_table(&buffer, buffer.len() as u32 + 1).is_err());
+        let mut shortened = buffer.clone();
+        shortened.pop();
+        assert!(parse_ipv4_address_table(&shortened, shortened.len() as u32).is_err());
+
+        // The API can report padding beyond the last row. Safe slack is not a
+        // layout error, and the parser reads only the rows the count names.
+        let mut padded = buffer.clone();
+        padded.extend_from_slice(&[0xff; 16]);
+        assert_eq!(
+            parse_ipv4_address_table(&padded, padded.len() as u32).unwrap(),
+            rows
+        );
+
+        // An empty table is valid.
+        let empty = 0u32.to_ne_bytes();
+        assert!(parse_ipv4_address_table(&empty, 4).unwrap().is_empty());
+        assert!(parse_ipv4_address_table(&[], 0).is_err());
+    }
+
+    #[test]
+    fn the_address_table_parser_keeps_the_address_flags() {
+        let buffer = ipv4_table_buffer(&[
+            (Ipv4Addr::new(192, 168, 1, 20), 7, 0),
+            (Ipv4Addr::new(192, 168, 1, 21), 7, MIB_IPADDR_TRANSIENT),
+            (Ipv4Addr::new(192, 168, 1, 22), 7, MIB_IPADDR_DELETED),
+        ]);
+        let rows = parse_ipv4_address_table(&buffer, buffer.len() as u32).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].flags, 0);
+        assert_eq!(rows[1].flags, MIB_IPADDR_TRANSIENT);
+        assert_eq!(rows[2].flags, MIB_IPADDR_DELETED);
+    }
+
+    #[test]
+    fn the_address_table_parser_rejects_an_unbounded_row_count() {
+        let mut buffer = ((MAX_IPV4_ADDRESS_ROWS + 1) as u32).to_ne_bytes().to_vec();
+        buffer.extend_from_slice(&[0; 4]);
+        assert!(parse_ipv4_address_table(&buffer, buffer.len() as u32).is_err());
+    }
+
+    /// Fixed interface table values for the link observer. It creates no
+    /// device and changes no route.
+    struct FakeLinkTables {
+        alias: Result<Option<u64>, ()>,
+        index: Result<Option<u32>, ()>,
+        reverse_luid: Result<Option<u64>, ()>,
+        /// The first `luid_for_index` answer for a numeric target. `None` uses
+        /// `reverse_luid`, which keeps the older single-index tests simple.
+        numeric_luid: Option<Result<Option<u64>, ()>>,
+        luid_for_index_reads: Mutex<usize>,
+        guid: Result<Option<Guid>, ()>,
+        guid_after: Option<Guid>,
+        guid_reads: Mutex<usize>,
+        status: Result<Option<InterfaceStatus>, ()>,
+        addresses: Result<Vec<Ipv4AddressEntry>, ()>,
+    }
+
+    impl Default for FakeLinkTables {
+        fn default() -> Self {
+            Self {
+                alias: Ok(Some(TEST_LUID)),
+                index: Ok(Some(TEST_INDEX)),
+                reverse_luid: Ok(Some(TEST_LUID)),
+                numeric_luid: None,
+                luid_for_index_reads: Mutex::new(0),
+                guid: Ok(Some(test_guid())),
+                guid_after: None,
+                guid_reads: Mutex::new(0),
+                status: Ok(Some(InterfaceStatus {
+                    admin: LinkStatus::Up,
+                    oper: LinkStatus::Up,
+                })),
+                addresses: Ok(vec![Ipv4AddressEntry {
+                    index: TEST_INDEX,
+                    address: Ipv4Addr::new(192, 168, 1, 20),
+                    flags: 0,
+                }]),
+            }
+        }
+    }
+
+    fn fake_error() -> io::Error {
+        io::Error::other("fake API failure")
+    }
+
+    impl LinkTables for FakeLinkTables {
+        fn luid_for_alias(&self, _: &str) -> io::Result<Option<u64>> {
+            self.alias.map_err(|_| fake_error())
+        }
+
+        fn index_for_luid(&self, _: u64) -> io::Result<Option<u32>> {
+            self.index.map_err(|_| fake_error())
+        }
+
+        fn luid_for_index(&self, _: u32) -> io::Result<Option<u64>> {
+            let mut reads = self.luid_for_index_reads.lock().unwrap();
+            let first = *reads == 0;
+            *reads += 1;
+            let result = if first {
+                self.numeric_luid.unwrap_or(self.reverse_luid)
+            } else {
+                self.reverse_luid
+            };
+            result.map_err(|_| fake_error())
+        }
+
+        fn guid_for_luid(&self, _: u64) -> io::Result<Option<Guid>> {
+            let mut reads = self.guid_reads.lock().unwrap();
+            let after = *reads > 0;
+            *reads += 1;
+            match (&self.guid, self.guid_after) {
+                (Err(()), _) => Err(fake_error()),
+                (Ok(_), Some(guid)) if after => Ok(Some(guid)),
+                (Ok(value), _) => Ok(*value),
+            }
+        }
+
+        fn interface_status(&self, _: u32) -> io::Result<Option<InterfaceStatus>> {
+            self.status.map_err(|_| fake_error())
+        }
+
+        fn ipv4_addresses(&self) -> io::Result<Vec<Ipv4AddressEntry>> {
+            self.addresses.clone().map_err(|_| fake_error())
+        }
+    }
+
+    fn link_status(tables: &FakeLinkTables) -> LinkStatus {
+        classify_link(&probe_with(tables, "Ethernet"))
+    }
+
+    fn address_entry(index: u32, address: &str) -> Ipv4AddressEntry {
+        address_entry_with_flags(index, address, 0)
+    }
+
+    fn address_entry_with_flags(index: u32, address: &str, flags: u16) -> Ipv4AddressEntry {
+        Ipv4AddressEntry {
+            index,
+            address: address.parse().unwrap(),
+            flags,
+        }
+    }
+
+    fn up_status() -> InterfaceStatus {
+        InterfaceStatus {
+            admin: LinkStatus::Up,
+            oper: LinkStatus::Up,
+        }
+    }
+
+    #[test]
+    fn usable_ipv4_rejects_non_unicast_and_unconfigured_addresses() {
+        for unusable in [
+            "0.0.0.0",
+            "0.1.2.3",
+            "0.255.255.255",
+            "127.0.0.1",
+            "127.255.255.254",
+            "255.255.255.255",
+            "224.0.0.1",
+            "239.255.255.250",
+            "169.254.10.20",
+            "169.254.0.1",
+        ] {
+            assert!(!usable_ipv4(unusable.parse().unwrap()), "{unusable}");
+        }
+        for usable in ["10.0.0.2", "172.20.10.2", "192.168.1.20", "100.64.0.2"] {
+            assert!(usable_ipv4(usable.parse().unwrap()), "{usable}");
+        }
+    }
+
+    #[test]
+    fn the_legacy_operational_status_enum_maps_to_the_right_state() {
+        // GetIfEntry uses the legacy MIB_IF_OPER_STATUS_* values. A healthy
+        // interface reports 5, and 4 is connected. The old code compared
+        // against IF_OPER_STATUS 1, which is unreachable here, so it marked a
+        // healthy link down.
+        assert_eq!(
+            oper_status_state(MIB_IF_OPER_STATUS_NON_OPERATIONAL),
+            LinkStatus::Down
+        );
+        assert_eq!(
+            oper_status_state(MIB_IF_OPER_STATUS_UNREACHABLE),
+            LinkStatus::Down
+        );
+        assert_eq!(
+            oper_status_state(MIB_IF_OPER_STATUS_DISCONNECTED),
+            LinkStatus::Down
+        );
+        assert_eq!(
+            oper_status_state(MIB_IF_OPER_STATUS_CONNECTING),
+            LinkStatus::Unknown
+        );
+        assert_eq!(
+            oper_status_state(MIB_IF_OPER_STATUS_CONNECTED),
+            LinkStatus::Up
+        );
+        assert_eq!(
+            oper_status_state(MIB_IF_OPER_STATUS_OPERATIONAL),
+            LinkStatus::Up
+        );
+        assert_eq!(oper_status_state(6), LinkStatus::Unknown);
+        assert_eq!(oper_status_state(u32::MAX), LinkStatus::Unknown);
+    }
+
+    #[test]
+    fn the_administrative_status_enum_maps_to_the_right_state() {
+        assert_eq!(admin_status_state(MIB_IF_ADMIN_STATUS_UP), LinkStatus::Up);
+        assert_eq!(
+            admin_status_state(MIB_IF_ADMIN_STATUS_DOWN),
+            LinkStatus::Down
+        );
+        // Testing is not a usable administrative state. An undocumented value
+        // is unknown, not down.
+        assert_eq!(admin_status_state(3), LinkStatus::Unknown);
+        assert_eq!(admin_status_state(0), LinkStatus::Unknown);
+        assert_eq!(admin_status_state(4), LinkStatus::Unknown);
+    }
+
+    #[test]
+    fn a_connected_or_operational_interface_with_a_usable_address_is_up() {
+        for oper in [MIB_IF_OPER_STATUS_CONNECTED, MIB_IF_OPER_STATUS_OPERATIONAL] {
+            let tables = FakeLinkTables {
+                status: Ok(Some(InterfaceStatus {
+                    admin: LinkStatus::Up,
+                    oper: oper_status_state(oper),
+                })),
+                ..FakeLinkTables::default()
+            };
+            assert_eq!(link_status(&tables), LinkStatus::Up, "{oper}");
+        }
+    }
+
+    #[test]
+    fn a_present_up_interface_with_a_usable_address_is_up() {
+        let tables = FakeLinkTables::default();
+        assert_eq!(link_status(&tables), LinkStatus::Up);
+    }
+
+    #[test]
+    fn a_down_or_disabled_interface_is_down() {
+        for status in [
+            InterfaceStatus {
+                admin: LinkStatus::Up,
+                oper: LinkStatus::Down,
+            },
+            InterfaceStatus {
+                admin: LinkStatus::Down,
+                oper: LinkStatus::Up,
+            },
+            InterfaceStatus {
+                admin: LinkStatus::Down,
+                oper: LinkStatus::Down,
+            },
+        ] {
+            let tables = FakeLinkTables {
+                status: Ok(Some(status)),
+                ..FakeLinkTables::default()
+            };
+            assert_eq!(link_status(&tables), LinkStatus::Down);
+        }
+    }
+
+    #[test]
+    fn a_transient_administrative_or_operational_state_is_unknown() {
+        for status in [
+            InterfaceStatus {
+                admin: LinkStatus::Unknown,
+                oper: LinkStatus::Up,
+            },
+            InterfaceStatus {
+                admin: LinkStatus::Up,
+                oper: LinkStatus::Unknown,
+            },
+        ] {
+            let tables = FakeLinkTables {
+                status: Ok(Some(status)),
+                ..FakeLinkTables::default()
+            };
+            assert_eq!(link_status(&tables), LinkStatus::Unknown);
+        }
+    }
+
+    #[test]
+    fn an_up_interface_without_a_usable_ipv4_address_is_down() {
+        for address in [
+            "169.254.10.20",
+            "127.0.0.1",
+            "0.0.0.0",
+            "0.1.2.3",
+            "227.1.1.1",
+            "255.255.255.255",
+        ] {
+            let tables = FakeLinkTables {
+                addresses: Ok(vec![address_entry(TEST_INDEX, address)]),
+                ..FakeLinkTables::default()
+            };
+            assert_eq!(link_status(&tables), LinkStatus::Down, "{address}");
+        }
+        let tables = FakeLinkTables {
+            addresses: Ok(Vec::new()),
+            ..FakeLinkTables::default()
+        };
+        assert_eq!(link_status(&tables), LinkStatus::Down);
+    }
+
+    #[test]
+    fn one_usable_address_among_unusable_ones_is_up() {
+        let tables = FakeLinkTables {
+            addresses: Ok(vec![
+                address_entry(TEST_INDEX, "169.254.10.20"),
+                address_entry(TEST_INDEX, "192.168.1.20"),
+            ]),
+            ..FakeLinkTables::default()
+        };
+        assert_eq!(link_status(&tables), LinkStatus::Up);
+    }
+
+    #[test]
+    fn a_transient_deleted_or_disconnected_address_is_not_usable() {
+        for flags in [
+            MIB_IPADDR_TRANSIENT,
+            MIB_IPADDR_DELETED,
+            MIB_IPADDR_DISCONNECTED,
+        ] {
+            let tables = FakeLinkTables {
+                addresses: Ok(vec![address_entry_with_flags(
+                    TEST_INDEX,
+                    "192.168.1.20",
+                    flags,
+                )]),
+                ..FakeLinkTables::default()
+            };
+            assert_eq!(link_status(&tables), LinkStatus::Down, "{flags:#06x}");
+        }
+
+        // A primary or dynamic address without a stale flag is usable.
+        for flags in [0x0001, 0x0004, 0x0100] {
+            let tables = FakeLinkTables {
+                addresses: Ok(vec![address_entry_with_flags(
+                    TEST_INDEX,
+                    "192.168.1.20",
+                    flags,
+                )]),
+                ..FakeLinkTables::default()
+            };
+            assert_eq!(link_status(&tables), LinkStatus::Up, "{flags:#06x}");
+        }
+    }
+
+    #[test]
+    fn a_target_that_no_longer_resolves_is_unknown_not_down() {
+        // A one-shot read cannot tell a renamed alias or a changed index from
+        // a removed interface. Unknown keeps the policy from inventing loss.
+        for tables in [
+            FakeLinkTables {
+                alias: Ok(None),
+                ..FakeLinkTables::default()
+            },
+            FakeLinkTables {
+                alias: Ok(None),
+                reverse_luid: Ok(None),
+                ..FakeLinkTables::default()
+            },
+        ] {
+            assert_eq!(link_status(&tables), LinkStatus::Unknown);
+        }
+        let numeric = FakeLinkTables {
+            alias: Ok(None),
+            reverse_luid: Ok(None),
+            ..FakeLinkTables::default()
+        };
+        assert_eq!(
+            classify_link(&probe_with(&numeric, "7")),
+            LinkStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn a_retained_interface_that_is_gone_is_down() {
+        for tables in [
+            FakeLinkTables {
+                index: Ok(None),
+                guid: Ok(None),
+                ..FakeLinkTables::default()
+            },
+            FakeLinkTables {
+                guid: Ok(Some(other_guid())),
+                ..FakeLinkTables::default()
+            },
+        ] {
+            let observer =
+                RetainedPhysicalLinkObserver::bind_with(&FakeLinkTables::default(), "Ethernet")
+                    .unwrap();
+            assert!(!observer.observe_with(&tables).unwrap());
+        }
+    }
+
+    #[test]
+    fn an_api_failure_is_unknown_not_link_loss() {
+        let failures: Vec<FakeLinkTables> = vec![
+            FakeLinkTables {
+                alias: Err(()),
+                ..FakeLinkTables::default()
+            },
+            FakeLinkTables {
+                guid: Err(()),
+                ..FakeLinkTables::default()
+            },
+            FakeLinkTables {
+                guid: Ok(None),
+                ..FakeLinkTables::default()
+            },
+            FakeLinkTables {
+                index: Err(()),
+                ..FakeLinkTables::default()
+            },
+            FakeLinkTables {
+                reverse_luid: Err(()),
+                ..FakeLinkTables::default()
+            },
+            FakeLinkTables {
+                reverse_luid: Ok(None),
+                ..FakeLinkTables::default()
+            },
+            FakeLinkTables {
+                status: Err(()),
+                ..FakeLinkTables::default()
+            },
+            FakeLinkTables {
+                status: Ok(None),
+                ..FakeLinkTables::default()
+            },
+            FakeLinkTables {
+                addresses: Err(()),
+                ..FakeLinkTables::default()
+            },
+        ];
+        for tables in failures {
+            assert_eq!(link_status(&tables), LinkStatus::Unknown);
+        }
+    }
+
+    #[test]
+    fn a_recycled_index_is_unknown() {
+        // The index that the retained LUID resolves to now belongs to another
+        // interface. The row cannot prove that it is the retained interface.
+        let tables = FakeLinkTables {
+            reverse_luid: Ok(Some(TEST_LUID + 1)),
+            ..FakeLinkTables::default()
+        };
+        assert_eq!(link_status(&tables), LinkStatus::Unknown);
+    }
+
+    #[test]
+    fn a_recycled_luid_is_unknown() {
+        // The alias still resolves, but the LUID changes to another GUID
+        // during the observation.
+        let tables = FakeLinkTables {
+            guid_after: Some(other_guid()),
+            ..FakeLinkTables::default()
+        };
+        assert_eq!(link_status(&tables), LinkStatus::Unknown);
+    }
+
+    #[test]
+    fn a_zero_index_or_luid_is_unknown() {
+        for tables in [
+            FakeLinkTables {
+                index: Ok(Some(0)),
+                ..FakeLinkTables::default()
+            },
+            FakeLinkTables {
+                alias: Ok(Some(0)),
+                ..FakeLinkTables::default()
+            },
+        ] {
+            assert_eq!(link_status(&tables), LinkStatus::Unknown);
+        }
+    }
+
+    #[test]
+    fn a_numeric_target_uses_the_interface_index() {
+        // The CLI can name the physical interface by index. When no alias of
+        // the same name exists, the index supplies the LUID.
+        let tables = FakeLinkTables {
+            alias: Ok(None),
+            ..FakeLinkTables::default()
+        };
+        assert_eq!(classify_link(&probe_with(&tables, "7")), LinkStatus::Up);
+    }
+
+    #[test]
+    fn a_missing_numeric_index_and_alias_is_unknown() {
+        let tables = FakeLinkTables {
+            alias: Ok(None),
+            reverse_luid: Ok(None),
+            ..FakeLinkTables::default()
+        };
+        assert_eq!(
+            classify_link(&probe_with(&tables, "7")),
+            LinkStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn a_numeric_alias_is_used_when_the_index_is_absent() {
+        // Windows permits an alias made of digits. If no index has that
+        // number, the alias still names a real interface.
+        let tables = FakeLinkTables {
+            alias: Ok(Some(TEST_LUID)),
+            numeric_luid: Some(Ok(None)),
+            index: Ok(Some(9)),
+            addresses: Ok(vec![address_entry(9, "192.168.1.20")]),
+            ..FakeLinkTables::default()
+        };
+        assert_eq!(classify_link(&probe_with(&tables, "7")), LinkStatus::Up);
+    }
+
+    #[test]
+    fn a_numeric_index_and_alias_that_disagree_are_ambiguous() {
+        // The same digit string names one index and a different alias. The
+        // observer must not choose one silently.
+        let tables = FakeLinkTables {
+            alias: Ok(Some(TEST_LUID + 1)),
+            ..FakeLinkTables::default()
+        };
+        assert_eq!(
+            classify_link(&probe_with(&tables, "7")),
+            LinkStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn an_index_change_keeps_the_same_identity() {
+        // A link change can assign a new index. The LUID and GUID still name
+        // the same interface, so the observation follows it.
+        let tables = FakeLinkTables {
+            index: Ok(Some(9)),
+            addresses: Ok(vec![address_entry(9, "192.168.1.20")]),
+            ..FakeLinkTables::default()
+        };
+        assert_eq!(link_status(&tables), LinkStatus::Up);
+    }
+
+    #[test]
+    fn addresses_are_read_only_for_the_observed_index() {
+        // An address on another interface never makes this interface up.
+        let tables = FakeLinkTables {
+            index: Ok(Some(9)),
+            addresses: Ok(vec![address_entry(TEST_INDEX, "192.168.1.20")]),
+            ..FakeLinkTables::default()
+        };
+        assert_eq!(link_status(&tables), LinkStatus::Down);
+    }
+
+    #[test]
+    fn the_classifier_rejects_a_row_with_a_foreign_identity() {
+        let identity = PhysicalIdentity {
+            luid: TEST_LUID,
+            guid: test_guid(),
+        };
+        for row in [
+            IdentifiedRow {
+                index: TEST_INDEX,
+                luid: TEST_LUID + 1,
+                guid: test_guid(),
+                status: up_status(),
+                ipv4: vec![address_entry(TEST_INDEX, "192.168.1.20")],
+            },
+            IdentifiedRow {
+                index: TEST_INDEX,
+                luid: TEST_LUID,
+                guid: other_guid(),
+                status: up_status(),
+                ipv4: vec![address_entry(TEST_INDEX, "192.168.1.20")],
+            },
+            IdentifiedRow {
+                index: 0,
+                luid: TEST_LUID,
+                guid: test_guid(),
+                status: up_status(),
+                ipv4: vec![address_entry(TEST_INDEX, "192.168.1.20")],
+            },
+        ] {
+            let probe = LinkProbe::Identified {
+                identity,
+                row: row.clone(),
+            };
+            assert_eq!(classify_link(&probe), LinkStatus::Unknown, "{row:?}");
+        }
+    }
+
+    #[test]
+    fn a_retained_observer_follows_the_luid_after_an_alias_rename() {
+        // Bind once. A later sample does not read the alias, so a renamed
+        // alias cannot look like a removed interface.
+        let observer =
+            RetainedPhysicalLinkObserver::bind_with(&FakeLinkTables::default(), "Ethernet")
+                .unwrap();
+        let renamed = FakeLinkTables {
+            alias: Err(()),
+            ..FakeLinkTables::default()
+        };
+        assert!(observer.observe_with(&renamed).unwrap());
+    }
+
+    #[test]
+    fn a_retained_observer_follows_an_index_change() {
+        // The LUID and GUID survive a link change that assigns a new index.
+        let observer =
+            RetainedPhysicalLinkObserver::bind_with(&FakeLinkTables::default(), "Ethernet")
+                .unwrap();
+        let tables = FakeLinkTables {
+            index: Ok(Some(9)),
+            addresses: Ok(vec![address_entry(9, "192.168.1.20")]),
+            ..FakeLinkTables::default()
+        };
+        assert!(observer.observe_with(&tables).unwrap());
+    }
+
+    #[test]
+    fn a_retained_sample_reports_the_live_index() {
+        // The sample must carry the index that the retained LUID resolves to,
+        // so a caller can detect that its start pin is stale.
+        let observer =
+            RetainedPhysicalLinkObserver::bind_with(&FakeLinkTables::default(), "Ethernet")
+                .unwrap();
+        assert_eq!(
+            observer
+                .observe_sample_with(&FakeLinkTables::default())
+                .unwrap(),
+            RetainedLinkSample {
+                up: true,
+                interface_index: Some(TEST_INDEX),
+            }
+        );
+        let moved = FakeLinkTables {
+            index: Ok(Some(9)),
+            addresses: Ok(vec![address_entry(9, "192.168.1.20")]),
+            ..FakeLinkTables::default()
+        };
+        assert_eq!(
+            observer.observe_sample_with(&moved).unwrap(),
+            RetainedLinkSample {
+                up: true,
+                interface_index: Some(9),
+            }
+        );
+    }
+
+    #[test]
+    fn a_removed_retained_identity_has_no_live_index() {
+        let observer =
+            RetainedPhysicalLinkObserver::bind_with(&FakeLinkTables::default(), "Ethernet")
+                .unwrap();
+        let removed = FakeLinkTables {
+            index: Ok(None),
+            guid: Ok(None),
+            ..FakeLinkTables::default()
+        };
+        assert_eq!(
+            observer.observe_sample_with(&removed).unwrap(),
+            RetainedLinkSample {
+                up: false,
+                interface_index: None,
+            }
+        );
+        let reused = FakeLinkTables {
+            guid: Ok(Some(other_guid())),
+            ..FakeLinkTables::default()
+        };
+        assert_eq!(
+            observer.observe_sample_with(&reused).unwrap(),
+            RetainedLinkSample {
+                up: false,
+                interface_index: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_retained_sample_api_failure_is_unknown() {
+        let observer =
+            RetainedPhysicalLinkObserver::bind_with(&FakeLinkTables::default(), "Ethernet")
+                .unwrap();
+        let failed = FakeLinkTables {
+            index: Err(()),
+            ..FakeLinkTables::default()
+        };
+        assert!(observer.observe_sample_with(&failed).is_err());
+    }
+
+    #[test]
+    fn a_retained_observer_does_not_read_a_reused_alias_or_luid() {
+        // The alias now names another interface. The retained observer ignores
+        // the alias and sees the retained LUID with a different GUID. It
+        // reports the retained interface gone instead of reading the other
+        // adapter's status as up.
+        let observer =
+            RetainedPhysicalLinkObserver::bind_with(&FakeLinkTables::default(), "Ethernet")
+                .unwrap();
+        let reused = FakeLinkTables {
+            alias: Ok(Some(TEST_LUID + 1)),
+            index: Ok(Some(9)),
+            guid: Ok(Some(other_guid())),
+            addresses: Ok(vec![address_entry(9, "192.168.1.20")]),
+            ..FakeLinkTables::default()
+        };
+        assert!(!observer.observe_with(&reused).unwrap());
+    }
+
+    #[test]
+    fn a_retained_observer_api_failure_is_unknown() {
+        let observer =
+            RetainedPhysicalLinkObserver::bind_with(&FakeLinkTables::default(), "Ethernet")
+                .unwrap();
+        let failed = FakeLinkTables {
+            index: Err(()),
+            ..FakeLinkTables::default()
+        };
+        assert!(observer.observe_with(&failed).is_err());
+    }
+
+    fn retained_test_identity() -> RetainedAdapterIdentity {
+        let guid = test_guid();
+        RetainedAdapterIdentity::new(
+            TEST_INDEX,
+            TEST_LUID,
+            crate::windows_route_verify::AdapterGuid::new(
+                guid.data1, guid.data2, guid.data3, guid.data4,
+            ),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_retained_binding_uses_the_exact_identity_without_an_alias_lookup() {
+        // The alias lookup fails. The exact binding still succeeds because it
+        // reads only the retained LUID, GUID, and index.
+        let tables = FakeLinkTables {
+            alias: Err(()),
+            ..FakeLinkTables::default()
+        };
+        let observer =
+            RetainedPhysicalLinkObserver::bind_retained_with(&tables, retained_test_identity())
+                .unwrap();
+        assert!(observer.observe_with(&tables).unwrap());
+    }
+
+    #[test]
+    fn a_retained_binding_rejects_a_changed_index_guid_or_luid() {
+        // The retained identity is one exact triple. A different live index or
+        // GUID, an absent LUID, or a failed read must fail closed at bind.
+        for tables in [
+            FakeLinkTables {
+                index: Ok(Some(TEST_INDEX + 1)),
+                ..FakeLinkTables::default()
+            },
+            FakeLinkTables {
+                guid: Ok(Some(other_guid())),
+                ..FakeLinkTables::default()
+            },
+            FakeLinkTables {
+                index: Ok(None),
+                ..FakeLinkTables::default()
+            },
+            FakeLinkTables {
+                index: Err(()),
+                ..FakeLinkTables::default()
+            },
+            FakeLinkTables {
+                reverse_luid: Ok(Some(TEST_LUID + 1)),
+                ..FakeLinkTables::default()
+            },
+        ] {
+            assert!(RetainedPhysicalLinkObserver::bind_retained_with(
+                &tables,
+                retained_test_identity()
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn a_retained_observer_rejects_an_absent_or_ambiguous_binding() {
+        let absent = FakeLinkTables {
+            alias: Ok(None),
+            ..FakeLinkTables::default()
+        };
+        assert_eq!(
+            RetainedPhysicalLinkObserver::bind_with(&absent, "Ethernet")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+
+        let ambiguous = FakeLinkTables {
+            alias: Ok(Some(TEST_LUID + 1)),
+            ..FakeLinkTables::default()
+        };
+        assert!(RetainedPhysicalLinkObserver::bind_with(&ambiguous, "7").is_err());
+
+        let failed = FakeLinkTables {
+            alias: Err(()),
+            ..FakeLinkTables::default()
+        };
+        assert!(RetainedPhysicalLinkObserver::bind_with(&failed, "Ethernet").is_err());
+    }
+
+    #[test]
+    fn the_link_observer_rejects_an_invalid_target_before_a_call() {
+        for target in ["", "bad\0name", "bad\nname"] {
+            let error = physical_link_observation(target).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{target:?}");
+        }
+        let long = "a".repeat(MAX_INTERFACE_NAME_LEN + 1);
+        assert_eq!(
+            physical_link_observation(&long).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 }

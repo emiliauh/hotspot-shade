@@ -2,8 +2,9 @@ using Windows.Storage;
 
 namespace HotspotShade.WinUI2.Services
 {
-    // Local Windows settings for the demo appearance and ping choice. The
-    // store holds no credential and no source device data.
+    // Local Windows settings: the appearance, Let ping work, and the Activity
+    // details choice. The store holds no credential and no source device
+    // data.
     public sealed class LocalSettingsStore
     {
         private readonly ApplicationDataContainer container;
@@ -52,7 +53,7 @@ namespace HotspotShade.WinUI2.Services
             }
             catch
             {
-                // A settings failure must not stop the demo UI.
+                // A settings failure must not stop the window.
             }
         }
     }

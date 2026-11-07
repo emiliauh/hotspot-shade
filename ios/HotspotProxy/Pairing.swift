@@ -23,10 +23,43 @@ struct PairingError: Error, Equatable {
 }
 
 /// The proxy credentials that the phone sends to a paired laptop.
+///
+/// The port must be 1024 to 65535 and must not be the pairing port. The host
+/// must be a usable dotted IPv4 hotspot address. The token must be 1 to 255
+/// printable ASCII bytes. The initializer returns nil for any other value, the
+/// same rule as rust/src/source_pairing.rs and the Kotlin responder.
 struct PairingCredentials: Equatable {
     let host: String
     let port: UInt16
     let token: String
+
+    init?(host: String, port: UInt16, token: String) {
+        guard PairingProtocol.isUsableHost(host),
+              PairingProtocol.isUsableProxyPort(port),
+              PairingProtocol.isValidToken(token) else { return nil }
+        self.host = host
+        self.port = port
+        self.token = token
+    }
+
+    /// Build a value from wire bytes after the shape checks of
+    /// `PairingProtocol.decodeCredentials`. The laptop side accepts what the
+    /// wire format allows, as rust/src/pairing.rs does.
+    fileprivate init(wireHost host: String, port: UInt16, token: String) {
+        self.host = host
+        self.port = port
+        self.token = token
+    }
+}
+
+/// The display and debug text redact the token. A log line must not hold a
+/// credential.
+extension PairingCredentials: CustomStringConvertible, CustomDebugStringConvertible {
+    var description: String {
+        "PairingCredentials(host: \"\(host)\", port: \(port), token: \"[redacted]\")"
+    }
+
+    var debugDescription: String { description }
 }
 
 struct PairingPhoneInfo {
@@ -48,6 +81,13 @@ struct PairingKeys {
     let sas: Data
 }
 
+/// The display and debug text hide the key material.
+extension PairingKeys: CustomStringConvertible, CustomDebugStringConvertible {
+    var description: String { "PairingKeys([redacted])" }
+
+    var debugDescription: String { description }
+}
+
 enum PairingProtocol {
     static let port: UInt16 = 18090
     static let maxFrame = 512
@@ -59,6 +99,11 @@ enum PairingProtocol {
     static let helloLength = 66
     static let challengeLength = 34
     static let revealLength = 65
+    /// The largest number of bytes that a frame reader holds. It equals
+    /// `MAX_BUFFERED` in rust/src/source_pairing.rs.
+    static let maxBuffered = 4 * (2 + maxFrame)
+    /// The largest number of AEAD nonces that one session may use.
+    static let maxSessionNonces = 4
     static let commitLabel = Data("hotspotshade-commit-v1".utf8)
     static let pairLabel = Data("hotspotshade-pair-v1".utf8)
 
@@ -125,11 +170,47 @@ enum PairingProtocol {
                                                using: SymmetricKey(data: keys.kProof))
     }
 
+    /// The four octets of a strict dotted IPv4 text. Reject a leading zero, a
+    /// non-ASCII digit, a zone, and any count of parts but four.
+    static func parseIPv4(_ text: String) -> [UInt8]? {
+        let parts = text.utf8.split(separator: 0x2e, omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return nil }
+        var octets: [UInt8] = []
+        for part in parts {
+            guard !part.isEmpty, part.count <= 3,
+                  part.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }),
+                  part.count == 1 || part.first != 0x30,
+                  let value = UInt8(String(decoding: part, as: UTF8.self)) else { return nil }
+            octets.append(value)
+        }
+        return octets
+    }
+
+    /// A usable hotspot address: a strict IPv4 text that is neither the
+    /// unspecified address nor a multicast address.
+    static func isUsableHost(_ text: String) -> Bool {
+        guard let octets = parseIPv4(text) else { return false }
+        return octets != [0, 0, 0, 0] && !(224...239).contains(octets[0])
+    }
+
+    /// A proxy port: 1024 to 65535, and not the pairing port.
+    static func isUsableProxyPort(_ port: UInt16) -> Bool {
+        port >= 1024 && port != Self.port
+    }
+
+    /// A token: 1 to 255 printable ASCII bytes. It goes into a SOCKS5
+    /// password field.
+    static func isValidToken(_ token: String) -> Bool {
+        let bytes = token.utf8
+        return !bytes.isEmpty && bytes.count <= 255 && bytes.allSatisfy { $0 >= 0x21 && $0 <= 0x7e }
+    }
+
     /// RESULT plaintext: [port:u16][token_len:u8][token][host_len:u8][host].
     static func encodeCredentials(_ credentials: PairingCredentials) throws -> Data {
         let token = Data(credentials.token.utf8)
         let host = Data(credentials.host.utf8)
-        guard credentials.port != 0, !token.isEmpty, token.count <= 255, !host.isEmpty, host.count <= 255 else {
+        guard isUsableProxyPort(credentials.port), isValidToken(credentials.token),
+              isUsableHost(credentials.host), host.count <= 255 else {
             throw PairingError(reason: "invalid credentials")
         }
         var out = Data([UInt8(credentials.port >> 8), UInt8(credentials.port & 0xff), UInt8(token.count)])
@@ -147,11 +228,14 @@ enum PairingProtocol {
         let tokenLength = Int(b[2])
         guard port != 0, tokenLength > 0, b.count >= 4 + tokenLength else { throw PairingError(reason: "bad plaintext") }
         let hostLength = Int(b[3 + tokenLength])
-        guard hostLength > 0, b.count == 4 + tokenLength + hostLength,
-              let token = String(bytes: b[3..<(3 + tokenLength)], encoding: .utf8),
-              let host = String(bytes: b[(4 + tokenLength)...], encoding: .utf8)
+        guard hostLength > 0, b.count == 4 + tokenLength + hostLength else { throw PairingError(reason: "bad plaintext") }
+        // The token is printable ASCII. It goes into a SOCKS5 password field.
+        let tokenBytes = b[3..<(3 + tokenLength)]
+        guard tokenBytes.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }),
+              let hostText = String(bytes: b[(4 + tokenLength)...], encoding: .utf8),
+              parseIPv4(hostText) != nil
         else { throw PairingError(reason: "bad plaintext") }
-        return PairingCredentials(host: host, port: port, token: token)
+        return PairingCredentials(wireHost: hostText, port: port, token: String(decoding: tokenBytes, as: UTF8.self))
     }
 
     /// ChaCha20-Poly1305 with key k_enc and aad h. Return ciphertext || tag.
@@ -183,8 +267,11 @@ enum PairingProtocol {
     }
 
     static func encodeStatus(_ info: PairingPhoneInfo, challenge: Data) throws -> Data {
+        // The host length counts UTF-8 bytes, not characters. The port and the
+        // host follow the credential rule in rust/src/source_pairing.rs.
         let host = Data(info.host.utf8)
-        guard challenge.count == 16, host.count <= 21 else { throw PairingError(reason: "invalid status") }
+        guard challenge.count == 16, isUsableProxyPort(info.port), isUsableHost(info.host),
+              !host.isEmpty, host.count <= 21 else { throw PairingError(reason: "invalid status") }
         let seq = info.sequence
         var result = challenge + Data([UInt8(truncatingIfNeeded: seq >> 24), UInt8(truncatingIfNeeded: seq >> 16),
                                        UInt8(truncatingIfNeeded: seq >> 8), UInt8(truncatingIfNeeded: seq),
@@ -221,18 +308,31 @@ enum PairingProtocol {
         Data([result, PairingStatus.ok.rawValue]) + nonce + ciphertext
     }
 
-    /// Prefix the payload with its u16 big-endian length.
-    static func frame(_ payload: Data) -> Data {
-        precondition(!payload.isEmpty && payload.count <= maxFrame)
+    /// Prefix the payload with its u16 big-endian length. An empty or oversize
+    /// payload throws. It never traps, so a bad outgoing frame fails one
+    /// session and not the app.
+    static func frame(_ payload: Data) throws -> Data {
+        guard !payload.isEmpty, payload.count <= maxFrame else { throw PairingError(reason: "invalid frame payload") }
         return Data([UInt8(payload.count >> 8), UInt8(payload.count & 0xff)]) + payload
     }
 }
 
-/// Collect frames from a byte stream. Reject an empty or oversize frame.
+/// Collect frames from a byte stream. Reject an empty or oversize frame. The
+/// reader holds at most `PairingProtocol.maxBuffered` bytes.
 struct PairingFrameReader {
     private var buffer = Data()
 
-    mutating func push(_ bytes: Data) { buffer += bytes }
+    /// Add bytes. A value that would pass the cap throws. The caller must
+    /// close the connection and call `PairingResponder.receiveInvalid`.
+    mutating func push(_ bytes: Data) throws {
+        guard bytes.count <= PairingProtocol.maxBuffered - buffer.count else {
+            throw PairingError(reason: "frame buffer full")
+        }
+        buffer += bytes
+    }
+
+    /// The byte count that the reader holds now.
+    var bufferedCount: Int { buffer.count }
 
     /// Return the next complete frame, or nil when more bytes are needed.
     mutating func next() throws -> Data? {
@@ -344,6 +444,10 @@ final class PairingResponder {
     /// The largest peer identifier that the responder accepts. A source
     /// address text is shorter than this limit.
     static let maximumPeerLength = 64
+    /// The largest number of live sessions. A HELLO over the cap answers Busy,
+    /// so unproven handshakes cannot accumulate. The pairing listener also
+    /// limits its connection count.
+    static let maximumSessions = 4
     // Limit untrusted challenges before generating an ephemeral key. A
     // per-address limit alone is not enough when a peer changes addresses.
     static let challengeWindow: TimeInterval = 60
@@ -354,6 +458,17 @@ final class PairingResponder {
     /// The largest number of unknown challenges across all source addresses
     /// in `challengeWindow`.
     static let maximumUnknownChallenges = 8
+    /// The largest number of challenges for a claimed trusted key from one
+    /// source address in `challengeWindow`. A trusted public key is public, so
+    /// the claim is unproven until the REVEAL proof. A verified proof refunds
+    /// exactly the charge that its own session paid, so a real target device is
+    /// not limited by its own status checks and a staggered unproven session
+    /// keeps its charge and expiry. This budget bounds the key generation that
+    /// an unproven claim can cause.
+    static let maximumKnownPeerChallenges = 8
+    /// The largest number of challenges for a claimed trusted key across all
+    /// source addresses in `challengeWindow`.
+    static let maximumKnownChallenges = 16
 
     struct Output: Equatable {
         var connection: Int
@@ -373,12 +488,28 @@ final class PairingResponder {
         let ephemeral: Curve25519.KeyAgreement.PrivateKey
         let known: Bool
         let flags: UInt8
+        /// The source address that opened the session. The challenge charge
+        /// and its refund use this key, so a later frame cannot name another
+        /// address.
+        let peer: String
+        /// The challenge charge that this session paid. A verified known proof
+        /// refunds this exact charge and no other.
+        let charge: UInt64
         var shownActive: Bool
         var deadline: TimeInterval
         /// The time of the first inactive notice for a live prompt. The
         /// extension cap starts at this value.
         var firstDeactivate: TimeInterval?
         var stage: Stage
+        /// The AEAD nonces that this session sealed with. A repeat, or a fifth
+        /// nonce, ends the session without a reply, as the Rust responder does.
+        var nonces: [Data] = []
+    }
+    /// One charge in a challenge budget. Each charge keeps its own time, so a
+    /// refund for another session cannot move this charge's expiry.
+    private struct ChallengeCharge {
+        let id: UInt64
+        let at: TimeInterval
     }
     private struct Budget {
         var failures: [TimeInterval] = []
@@ -395,10 +526,19 @@ final class PairingResponder {
     private var budgets: [String: Budget] = [:]
     private var decision: Int?
     private var unknownBudget: [String: [TimeInterval]] = [:]
-    /// The times of the unknown challenges for each source address. The sum
+    /// The charges of the unknown challenges for each source address. The sum
     /// of the lists is at most `maximumUnknownChallenges`, so the map stays
     /// small.
-    private var unknownChallenges: [String: [TimeInterval]] = [:]
+    private var unknownChallenges: [String: [ChallengeCharge]] = [:]
+    /// The charges of the challenges for a claimed trusted key, for each source
+    /// address. The sum of the lists is at most `maximumKnownChallenges`, so
+    /// the map stays small too. Each charge has a unique identifier, so a
+    /// refund removes the proven session's charge and no other.
+    private var knownChallenges: [String: [ChallengeCharge]] = [:]
+    /// The next challenge identifier. It is unique for the life of the
+    /// responder. Wrapping after 2^64 charges cannot collide with a live
+    /// charge in practice.
+    private var nextChallengeID: UInt64 = 0
     private var lastNow: TimeInterval = 0
     private var inactive = false
     private var failures: [String: [TimeInterval]] = [:]
@@ -460,9 +600,13 @@ final class PairingResponder {
             case .authenticated(let keys): return receiveStatus(frame, connection: connection, keys: keys, now: now)
             }
         }
+        if sessions.count >= Self.maximumSessions { return reply(connection, .busy, log: false) }
         guard let (lS, commit) = try? PairingProtocol.decodeHello(frame) else { return bad(connection, now: now) }
         let known = trust.contains(lS)
         let flags = frame.count == 67 ? frame.last! : 0
+        // Flags 3 would mean status-only and forget at the same time. Protocol
+        // v1 defines bit 0 and bit 1 only. Fail closed on the combination.
+        if flags > 2 { return reply(connection, .rejected, log: false) }
         if !known && flags != 0 { return reply(connection, .rejected, log: false) }
         if !known && isLocked(now: now, peer: peer) { return reply(connection, .lockedOut) }
         if !known, let budget = budgets[peer], now < budget.until { return reply(connection, .rejected) }
@@ -470,21 +614,25 @@ final class PairingResponder {
             // A source device with pairing off answers NotActive. It must not
             // charge the challenge budget, or the peer is locked out later.
             guard credentials() != nil else { return reply(connection, .notActive) }
-            pruneChallenges(now: now)
-            // Charge both challenge budgets before the ephemeral key exists.
-            // An active attacker must not get a fresh handshake for each
-            // connection attempt.
-            guard !challengeBudgetUsed(peer: peer) else {
-                return reply(connection, .busy, log: false)
-            }
-            unknownChallenges[peer, default: []].append(now)
         }
+        pruneChallenges(now: now)
+        // Charge the per-address and global challenge budgets before the
+        // ephemeral key exists. A claimed trusted key is unproven until the
+        // REVEAL proof, so it pays the known budget. An active attacker must
+        // not get a fresh handshake for each connection attempt.
+        guard !challengeBudgetUsed(peer: peer, known: known) else {
+            return reply(connection, .busy, log: false)
+        }
+        let charge = chargeChallenge(peer: peer, now: now, known: known)
         let ephemeral = ephemeralKey()
-        sessions[connection] = Session(connection: connection, lS: lS, commit: commit, ephemeral: ephemeral,
-                                       known: known, flags: flags, shownActive: false, deadline: now + 5,
-                                       firstDeactivate: nil, stage: .awaitingReveal)
         let challenge = PairingProtocol.encodeChallenge(pE: ephemeral.publicKey.rawRepresentation, known: known)
-        return Output(connection: connection, frames: [PairingProtocol.frame(challenge)])
+        // A frame that cannot be built fails this session. It stores nothing.
+        guard let challengeFrame = try? PairingProtocol.frame(challenge) else { return abort(connection) }
+        sessions[connection] = Session(connection: connection, lS: lS, commit: commit, ephemeral: ephemeral,
+                                       known: known, flags: flags, peer: peer, charge: charge,
+                                       shownActive: false, deadline: now + 5,
+                                       firstDeactivate: nil, stage: .awaitingReveal)
+        return Output(connection: connection, frames: [challengeFrame])
     }
     /// Handle a frame parser error for a connection. This method removes the
     /// session and the decision before it checks the peer text. A failed check
@@ -579,16 +727,52 @@ final class PairingResponder {
         return now < until
     }
     /// True when the source address or the whole responder has no challenge
-    /// budget left for the current window. Call `pruneChallenges` first.
-    private func challengeBudgetUsed(peer: String) -> Bool {
+    /// budget left for the current window. A claimed trusted key uses its own
+    /// budget. Call `pruneChallenges` first.
+    private func challengeBudgetUsed(peer: String, known: Bool) -> Bool {
+        if known {
+            let peerCount = knownChallenges[peer]?.count ?? 0
+            let total = knownChallenges.values.reduce(0) { $0 + $1.count }
+            return peerCount >= Self.maximumKnownPeerChallenges || total >= Self.maximumKnownChallenges
+        }
         let peerCount = unknownChallenges[peer]?.count ?? 0
         let total = unknownChallenges.values.reduce(0) { $0 + $1.count }
         return peerCount >= Self.maximumPeerChallenges || total >= Self.maximumUnknownChallenges
     }
+    /// Charge one challenge and return its identifier. The caller stores the
+    /// identifier in the session that the charge paid for. The budget check
+    /// runs first, so the map never holds more than its global limit.
+    @discardableResult
+    private func chargeChallenge(peer: String, now: TimeInterval, known: Bool) -> UInt64 {
+        let id = nextChallengeID
+        nextChallengeID &+= 1
+        let charge = ChallengeCharge(id: id, at: now)
+        if known {
+            knownChallenges[peer, default: []].append(charge)
+        } else {
+            unknownChallenges[peer, default: []].append(charge)
+        }
+        return id
+    }
+    /// Return one known-challenge charge after a verified proof. The caller
+    /// passes the identifier that the proven session recorded, so the refund
+    /// cannot return a later unproven charge for the same address. A charge
+    /// that already expired is a no-op. A target device that holds the key is
+    /// not limited by its own status checks.
+    private func refundKnownChallenge(peer: String, charge: UInt64) {
+        guard var charges = knownChallenges[peer] else { return }
+        charges.removeAll { $0.id == charge }
+        knownChallenges[peer] = charges.isEmpty ? nil : charges
+    }
     private func pruneChallenges(now: TimeInterval) {
-        unknownChallenges = unknownChallenges.compactMapValues { times in
+        unknownChallenges = Self.pruneChallengeMap(unknownChallenges, now: now)
+        knownChallenges = Self.pruneChallengeMap(knownChallenges, now: now)
+    }
+    private static func pruneChallengeMap(_ map: [String: [ChallengeCharge]],
+                                          now: TimeInterval) -> [String: [ChallengeCharge]] {
+        map.compactMapValues { charges in
             // A backwards clock is not evidence that the window has expired.
-            let kept = times.filter { now < $0 || now - $0 < Self.challengeWindow }
+            let kept = charges.filter { now < $0.at || now - $0.at < Self.challengeWindow }
             return kept.isEmpty ? nil : kept
         }
     }
@@ -652,6 +836,15 @@ final class PairingResponder {
         let keys = PairingProtocol.deriveKeys(ee: ee, es: es, h: PairingProtocol.transcriptHash(lS: current.lS, lE: lE, pE: pE))
         guard PairingProtocol.verifyProof(keys, proof) else { return bad(id, now: now) }
         if current.known {
+            // The proof shows that the peer holds the claimed key, so the
+            // challenge was not wasted work. Refund exactly this session's
+            // charge, not the latest charge for the address, so a staggered
+            // unproven session keeps its own charge and its own expiry.
+            refundKnownChallenge(peer: current.peer, charge: current.charge)
+            // The trust list can change while the handshake runs (the person
+            // taps Forget). Recheck it before the source device sends the
+            // credentials or accepts a command.
+            guard trust.contains(current.lS) else { return reply(id, .rejected) }
             if current.flags != 0 {
                 var authenticated = current
                 authenticated.stage = .authenticated(keys)
@@ -681,45 +874,84 @@ final class PairingResponder {
         decision = id
         return Output(connection: id)
     }
+    /// Check a fresh AEAD nonce for this session. The nonce must be 12 bytes,
+    /// must not repeat, and must be within `maxSessionNonces`.
+    private func freshNonce(_ used: [Data]) -> Data? {
+        let value = nonce()
+        return Self.isFreshNonce(value, used: used) ? value : nil
+    }
+    /// The nonce rule for one session. The protocol reaches at most two
+    /// nonces, so the tests call this to cover the fifth-nonce limit.
+    static func isFreshNonce(_ value: Data, used: [Data]) -> Bool {
+        value.count == 12 && !used.contains(value) && used.count < PairingProtocol.maxSessionNonces
+    }
     private func success(_ current: Session, keys: PairingKeys, now: TimeInterval, addTrust: Bool = false) -> Output {
-        let nonceBytes = nonce()
-        guard let credentials = credentials(), let ciphertext = try? PairingProtocol.seal(keys, nonce: nonceBytes, credentials: credentials)
-        else { return reply(current.connection, .notActive) }
+        guard let credentials = credentials() else { return reply(current.connection, .notActive) }
+        // A failed nonce or frame ends the session with no reply, as Rust does
+        // with an error from the responder.
+        guard let nonceBytes = freshNonce(current.nonces),
+              let ciphertext = try? PairingProtocol.seal(keys, nonce: nonceBytes, credentials: credentials),
+              let wire = try? PairingProtocol.frame(PairingProtocol.encodeResultOK(nonce: nonceBytes, ciphertext: ciphertext))
+        else { return abort(current.connection) }
         // Add the target device to the trust store only after the result is
         // ready. A failed result must not leave a trusted key behind.
         if addTrust { trust.add(current.lS) }
         var authenticated = current
         authenticated.stage = .authenticated(keys)
         authenticated.deadline = now + 5
+        authenticated.nonces.append(nonceBytes)
         sessions[current.connection] = authenticated
-        let message = PairingProtocol.encodeResultOK(nonce: nonceBytes, ciphertext: ciphertext)
-        return Output(connection: current.connection, frames: [PairingProtocol.frame(message)], close: false, status: .ok)
+        return Output(connection: current.connection, frames: [wire], close: false, status: .ok)
     }
     private func receiveStatus(_ frame: Data, connection: Int, keys: PairingKeys, now: TimeInterval) -> Output {
         // Read the session once. The trust list can change between HELLO and this frame, so
         // no code below may assume that a session or a trusted key still exists.
         guard let session = sessions[connection] else { return reply(connection, .rejected) }
+        // The command must have a body and the key must still be trusted.
+        guard frame.count >= 29, trust.contains(session.lS) else {
+            sessions.removeValue(forKey: connection)
+            return reply(connection, .rejected)
+        }
         if session.flags == 2 {
             sessions.removeValue(forKey: connection)
-            if frame.count >= 29, frame.first == 0x07, trust.contains(session.lS),
-               let request = try? PairingProtocol.openMessage(keys, nonce: Data(frame.dropFirst().prefix(12)), ciphertext: Data(frame.dropFirst(13))),
-               request.isEmpty {
-                trust.remove(session.lS)
-                return reply(connection, .ok, log: false)
-            }
-            return reply(connection, .rejected)
+            guard frame.first == 0x07,
+                  let request = try? PairingProtocol.openMessage(keys, nonce: Data(frame.dropFirst().prefix(12)), ciphertext: Data(frame.dropFirst(13))),
+                  request.isEmpty else { return reply(connection, .rejected) }
+            trust.remove(session.lS)
+            return reply(connection, .ok, log: false)
         }
-        guard trust.contains(session.lS), frame.count >= 29, frame.first == 0x05,
+        // Flags 3 is refused at HELLO. A value above 1 cannot name a status
+        // request or a forget request.
+        guard session.flags <= 1, frame.first == 0x05,
               let request = try? PairingProtocol.openMessage(keys, nonce: Data(frame.dropFirst().prefix(12)), ciphertext: Data(frame.dropFirst(13))),
-              request.count == 17, let info = statusProvider(),
-              let plaintext = try? PairingProtocol.encodeStatus(info, challenge: Data(request.prefix(16))) else {
+              request.count == 17, request.last == 0, let info = statusProvider() else {
             sessions.removeValue(forKey: connection)
             return reply(connection, .rejected)
         }
-        let responseNonce = nonce()
-        guard let response = try? PairingProtocol.sealMessage(keys, nonce: responseNonce, plaintext: plaintext) else { return reply(connection, .rejected) }
+        // The source device must still hold the pairing credentials, and the
+        // status must name the hotspot address that it paired on. A new proxy
+        // port is allowed: the target device learns it from this answer.
+        guard let live = credentials(), info.host == live.host else {
+            sessions.removeValue(forKey: connection)
+            return reply(connection, .rejected)
+        }
+        // An unusable status or a failed nonce, seal, or frame ends the session
+        // with no reply, as Rust does with an error from the responder.
         sessions.removeValue(forKey: connection)
-        return Output(connection: connection, frames: [PairingProtocol.frame(Data([0x06]) + responseNonce + response)], close: true)
+        guard let plaintext = try? PairingProtocol.encodeStatus(info, challenge: Data(request.prefix(16))),
+              let responseNonce = freshNonce(session.nonces),
+              let response = try? PairingProtocol.sealMessage(keys, nonce: responseNonce, plaintext: plaintext),
+              let wire = try? PairingProtocol.frame(Data([0x06]) + responseNonce + response)
+        else { return abort(connection) }
+        return Output(connection: connection, frames: [wire], close: true)
+    }
+    /// End the session with no reply and close the connection. The Rust
+    /// responder returns an error for these cases, and the host closes the
+    /// socket. No status is logged.
+    private func abort(_ connection: Int) -> Output {
+        sessions.removeValue(forKey: connection)
+        if decision == connection { decision = nil }
+        return Output(connection: connection, frames: [], close: true, status: nil)
     }
     private func bad(_ connection: Int, now: TimeInterval) -> Output {
         let peer = peers[connection] ?? ""
@@ -753,6 +985,19 @@ final class PairingResponder {
         return reply(connection, status)
     }
     private func reply(_ connection: Int, _ status: PairingStatus, log: Bool = true) -> Output {
-        Output(connection: connection, frames: [PairingProtocol.frame(PairingProtocol.encodeResult(status))], close: true, status: log ? status : nil)
+        // A RESULT status is two bytes, so the frame cannot fail. Handle the
+        // failure anyway: the reply is then empty and the host closes the socket.
+        let frames = (try? PairingProtocol.frame(PairingProtocol.encodeResult(status))).map { [$0] } ?? []
+        return Output(connection: connection, frames: frames, close: true, status: log ? status : nil)
     }
+}
+
+/// The display and debug text show a frame count, not frame bytes. A RESULT
+/// frame holds the sealed credentials, so no log line may print the content.
+extension PairingResponder.Output: CustomStringConvertible, CustomDebugStringConvertible {
+    var description: String {
+        "Output(connection: \(connection), frame_count: \(frames.count), close: \(close), status: \(status.map { "\($0)" } ?? "nil"))"
+    }
+
+    var debugDescription: String { description }
 }

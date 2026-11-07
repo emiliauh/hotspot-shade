@@ -1,0 +1,22 @@
+    name: Release audit and CI graph check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Check the shell scripts parse
+        run: bash -n scripts/*.sh scripts/tests/*.sh
+      - name: Audit release metadata, workflow policy, and tree hygiene
+        run: sh scripts/release_audit.sh
+      - name: Validate the CI dependency graph
+        run: sh scripts/ci_graph_check.sh
+      - name: Ensure zip is available for the artifact tests
+        run: |
+          if ! command -v zip >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y zip
+          fi
+      - name: Test the release audit, the manifest, and the graph check
+        run: bash scripts/tests/release_pipeline_test.sh
+      - name: Test the portable artifact version extractor
+        run: bash scripts/tests/artifact_versions_test.sh
+      - name: Test the Mach-O version record reader
+        run: HS_MACHO_TEST_NO_CONTAINER=1 bash scripts/tests/macho_version_test.sh

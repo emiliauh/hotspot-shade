@@ -21,6 +21,159 @@ func makeNoDelayTCPParameters() -> NWParameters {
     NWParameters(tls: nil, tcp: makeNoDelayTCPOptions())
 }
 
+/// The listener operations that the proxy uses.
+///
+/// `NetworkProxyListener` is the only production implementation of this seam.
+/// A test injects a fake through `ProxyListenerFactory` and drives the same
+/// state and connection handlers that Network.framework calls. The seam is
+/// always compiled, so the test exercises the same server path as production
+/// and only the listener object changes.
+protocol ProxyListenerHandle: AnyObject {
+    var state: NWListener.State { get }
+    func setStateUpdateHandler(_ handler: ((NWListener.State) -> Void)?)
+    func setNewConnectionHandler(_ handler: ((NWConnection) -> Void)?)
+    func start(queue: DispatchQueue)
+    func cancel()
+}
+
+/// Bridge the seam to `NWListener`. It keeps the handler types simple for a
+/// fake and does not add methods to the SDK type.
+final class NetworkProxyListener: ProxyListenerHandle {
+    private let listener: NWListener
+
+    init(parameters: NWParameters) throws {
+        listener = try NWListener(using: parameters)
+    }
+
+    var state: NWListener.State { listener.state }
+
+    func setStateUpdateHandler(_ handler: ((NWListener.State) -> Void)?) {
+        listener.stateUpdateHandler = handler
+    }
+
+    func setNewConnectionHandler(_ handler: ((NWConnection) -> Void)?) {
+        listener.newConnectionHandler = handler
+    }
+
+    func start(queue: DispatchQueue) {
+        listener.start(queue: queue)
+    }
+
+    func cancel() {
+        listener.cancel()
+    }
+}
+
+/// Create the listener for one proxy run. `NetworkProxyListenerFactory` is the
+/// production path. A test supplies a fake that never opens a socket.
+protocol ProxyListenerFactory {
+    func makeListener(parameters: NWParameters) throws -> any ProxyListenerHandle
+}
+
+struct NetworkProxyListenerFactory: ProxyListenerFactory {
+    func makeListener(parameters: NWParameters) throws -> any ProxyListenerHandle {
+        try NetworkProxyListener(parameters: parameters)
+    }
+}
+
+/// The bounded waiting policy for the main proxy listener.
+///
+/// A listener reports `.waiting` while its required local endpoint is not
+/// available. The condition can clear by itself, so the server allows one
+/// bounded wait. It never waits without a bound: a listener that stays waiting
+/// accepts no connection, so `Listening` and `Starting` would both be
+/// misleading after the bound. When the bound passes, the run ends as a
+/// recoverable failure and the person starts the proxy again. Nothing starts a
+/// replacement listener.
+struct ProxyListenerWaitPolicy {
+    /// The longest one waiting episode may last.
+    static let seconds: TimeInterval = 10
+
+    /// The bound for one waiting episode.
+    let limit: TimeInterval
+    /// The end of the current episode, or nil when no wait is active.
+    private(set) var deadline: TimeInterval?
+
+    init(limit: TimeInterval = ProxyListenerWaitPolicy.seconds) {
+        // A zero, negative, or non-finite limit cannot bound the wait. Keep
+        // the default in that case.
+        self.limit = limit.isFinite && limit > 0 ? limit : Self.seconds
+    }
+
+    /// True while a bound is active.
+    var isWaiting: Bool { deadline != nil }
+
+    /// Start the one bound of this episode. A later waiting event in the same
+    /// episode does not extend it.
+    mutating func begin(now: TimeInterval) {
+        guard deadline == nil else { return }
+        deadline = (now.isFinite ? now : 0) + limit
+    }
+
+    /// The time left before the bound, in seconds. An absent or passed bound
+    /// gives zero.
+    func remaining(now: TimeInterval) -> TimeInterval {
+        guard let deadline, now.isFinite else { return 0 }
+        return max(0, deadline - now)
+    }
+
+    /// True once the bound passed. It ends the episode.
+    mutating func expire(now: TimeInterval) -> Bool {
+        guard let deadline, now.isFinite, now >= deadline else { return false }
+        self.deadline = nil
+        return true
+    }
+
+    /// End the episode with no failure.
+    mutating func clear() {
+        deadline = nil
+    }
+}
+
+/// Compare two byte strings without an early return.
+///
+/// The loop runs over the longer input. A length difference is folded into the
+/// result, so a matching prefix with a different length is not equal. Every
+/// byte is read and combined, so the time does not follow the first differing
+/// byte. Use it for the source device token check. The token still crosses the
+/// hotspot link in cleartext; this is a timing hardening, not encryption.
+func constantTimeEquals(_ lhs: [UInt8], _ rhs: [UInt8]) -> Bool {
+    var difference = lhs.count ^ rhs.count
+    let count = max(lhs.count, rhs.count)
+    for index in 0..<count {
+        let left = index < lhs.count ? lhs[index] : 0
+        let right = index < rhs.count ? rhs[index] : 0
+        difference |= Int(left ^ right)
+    }
+    return difference == 0
+}
+
+/// The parameters for one destination TCP connection.
+///
+/// Every Release build and every device build pins the outer connection to the
+/// cellular interface. A Debug Simulator build with the explicit test keys can
+/// use the host path instead, so a test destination on loopback is reachable
+/// without a cellular bearer. See "Simulator test override" in `ios/README.md`.
+func makeOutboundTCPParameters() -> NWParameters {
+    let parameters = makeNoDelayTCPParameters()
+    parameters.requiredInterfaceType = .cellular
+    #if DEBUG
+    if HotspotInterface.testCellularPathActive() { return makeNoDelayTCPParameters() }
+    #endif
+    return parameters
+}
+
+/// The UDP form of `makeOutboundTCPParameters`. The mocked path is the same
+/// explicit Debug Simulator override.
+func makeOutboundUDPParameters() -> NWParameters {
+    let parameters = NWParameters.udp
+    parameters.requiredInterfaceType = .cellular
+    #if DEBUG
+    if HotspotInterface.testCellularPathActive() { return NWParameters.udp }
+    #endif
+    return parameters
+}
+
 extension RelayHalfClose.Side {
     /// The end reason for a failed socket operation on this side. A failed FIN
     /// write on the connection to the target device is a client socket error.
@@ -29,9 +182,272 @@ extension RelayHalfClose.Side {
     }
 }
 
+/// Reframe the first TLS ClientHello on one relay direction.
+///
+/// The relay carries opaque bytes. This shaper changes only the TLS record
+/// framing of the first ClientHello handshake message. It does not change one
+/// handshake byte, so the transcript hash is unchanged. TLS peers reassemble
+/// handshake messages across records (RFC 8446 section 5.1), so small records
+/// are legal.
+///
+/// It does not hide SNI, JA3/JA4, the destination address, DNS names, flow
+/// size, or timing. It does not change the TLS version: a byte relay cannot
+/// force the client's TLS version, and this shaper does not try. It does not
+/// control TCP segmentation; the writes are small, but the local stack and the
+/// network can coalesce them.
+///
+/// The first record or records of the flow are buffered until the first
+/// ClientHello is complete. That message is written again as records with 1 to
+/// 8 payload bytes. Every later byte passes through unchanged. A non-TLS
+/// first byte, a record that is not a handshake record, a message that is not
+/// a ClientHello, a message above the cap, or a record count above the cap
+/// turns the whole flow into a plain pass-through, byte for byte. The shaper
+/// rejects a byte as soon as it rules out a ClientHello, so a short
+/// request/response protocol does not wait for a five byte record header or a
+/// complete handshake message.
+///
+/// The parse runs before the buffer cap check. A complete ClientHello is
+/// reframed even when the same call also delivered a large tail. With a small
+/// custom cap, a split prefix may exceed the cap before its record completes
+/// and pass through. The cap bounds bytes held while awaiting a decision.
+///
+/// A client that ends the stream before the ClientHello is complete must call
+/// `finish` before the half-close. `finish` releases the held bytes unchanged,
+/// in order, exactly once. Dropping the shaper instead would lose them.
+///
+/// This is a port of `rust/src/tls_shape.rs`. Shaping is off unless a caller
+/// creates a shaper. It holds no address, host name, or SNI value, and it must
+/// not log one.
+struct ClientHelloShaper {
+    enum State: Equatable {
+        /// Waiting for a record header or a complete ClientHello.
+        case buffering
+        /// The first ClientHello was reframed. Later bytes pass through.
+        case reframed
+        /// The flow is not a shapeable TLS ClientHello. All bytes pass through.
+        case passThrough
+    }
+
+    /// A TLS handshake record content type.
+    static let handshakeContentType: UInt8 = 22
+    /// The TLS major version. A record that does not start with 3 is not TLS.
+    static let tlsMajor: UInt8 = 3
+    /// The handshake type of a ClientHello.
+    static let clientHelloType: UInt8 = 1
+    /// The largest record payload in TLS 1.2 and 1.3.
+    static let maxRecordPayload = 16_384
+    /// The fixed part of a ClientHello: handshake header, version, random, and
+    /// session id length.
+    static let minClientHelloMessage = 4 + 2 + 32 + 1
+
+    private enum RecordStep {
+        case needMore
+        case passThrough
+        case progress
+    }
+
+    let maxChunk: Int
+    let maxClientHello: Int
+    let maxRecords: Int
+    let maxBuffered: Int
+
+    private var raw: [UInt8] = []
+    private var payload: [UInt8] = []
+    private var consumed = 0
+    private var records = 0
+    private var version: (UInt8, UInt8) = (3, 1)
+
+    private(set) var state: State = .buffering
+
+    init(maxChunk: Int = 8,
+         maxClientHello: Int = 16 * 1024,
+         maxRecords: Int = 4096,
+         maxBuffered: Int = 64 * 1024) {
+        self.maxChunk = min(max(1, maxChunk), 8)
+        self.maxClientHello = max(maxClientHello, Self.minClientHelloMessage)
+        self.maxRecords = max(1, maxRecords)
+        self.maxBuffered = max(maxBuffered, self.maxClientHello)
+    }
+
+    var isBuffering: Bool { state == .buffering }
+
+    /// The number of bytes held while the flow waits for a ClientHello.
+    var bufferedCount: Int { raw.count }
+
+    /// Release the bytes still held, unchanged and in order, once, when the
+    /// client ends the stream. Call it before the half-close. A second call
+    /// returns nothing, and no later byte is shaped. Without this call the
+    /// bytes of an incomplete ClientHello are lost at end of stream.
+    mutating func finish() -> [Data] {
+        guard state == .buffering else { return [] }
+        return passThrough()
+    }
+
+    /// Feed the next bytes from the client. The returned pieces go out in
+    /// order. While the ClientHello is shaped, each piece is one complete TLS
+    /// record. A pass-through piece is the unmodified input.
+    mutating func feed(_ data: Data) -> [Data] {
+        guard state == .buffering else { return data.isEmpty ? [] : [data] }
+        guard !data.isEmpty else { return [] }
+        raw.append(contentsOf: data)
+        while true {
+            if payload.count < 4 {
+                switch takeRecord() {
+                case .needMore:
+                    // Parse before the buffer cap. A complete ClientHello is
+                    // reframed even when this feed also carried a large tail,
+                    // so the result does not depend on where the stream was
+                    // split. The cap applies only to bytes still waiting for
+                    // a decision.
+                    return raw.count > maxBuffered ? passThrough() : []
+                case .passThrough: return passThrough()
+                case .progress: continue
+                }
+            }
+            if payload[0] != Self.clientHelloType { return passThrough() }
+            let declared = (Int(payload[1]) << 16) | (Int(payload[2]) << 8) | Int(payload[3])
+            let messageLength = declared + 4
+            if messageLength < Self.minClientHelloMessage || messageLength > maxClientHello {
+                return passThrough()
+            }
+            if payload.count < messageLength {
+                switch takeRecord() {
+                case .needMore:
+                    return raw.count > maxBuffered ? passThrough() : []
+                case .passThrough: return passThrough()
+                case .progress: continue
+                }
+            }
+            return reframe(messageLength)
+        }
+    }
+
+    /// Read one handshake record from the raw buffer.
+    ///
+    /// Each header byte is checked as soon as it is available. A record that
+    /// cannot be a handshake record is rejected without waiting for the rest
+    /// of the header or payload.
+    private mutating func takeRecord() -> RecordStep {
+        let available = raw.count - consumed
+        if available == 0 { return .needMore }
+        if raw[consumed] != Self.handshakeContentType { return .passThrough }
+        if available < 2 { return .needMore }
+        if raw[consumed + 1] != Self.tlsMajor { return .passThrough }
+        if available < 5 { return .needMore }
+        let length = (Int(raw[consumed + 3]) << 8) | Int(raw[consumed + 4])
+        if length == 0 || length > Self.maxRecordPayload { return .passThrough }
+        if payload.count < 4 {
+            // Handshake header bytes can span records. Only the bytes inside
+            // the current record belong to this prefix.
+            let inRecord = min(available - 5, length)
+            let needed = min(4 - payload.count, inRecord)
+            var prefix = payload
+            prefix.append(contentsOf: raw[(consumed + 5)..<(consumed + 5 + needed)])
+            if !prefix.isEmpty && prefix[0] != Self.clientHelloType {
+                return .passThrough
+            }
+            if prefix.count >= 4 {
+                let declared = (Int(prefix[1]) << 16)
+                    | (Int(prefix[2]) << 8)
+                    | Int(prefix[3])
+                let messageLength = declared + 4
+                if messageLength < Self.minClientHelloMessage || messageLength > maxClientHello {
+                    return .passThrough
+                }
+            }
+        }
+        if available - 5 < length { return .needMore }
+        if records == 0 { version = (raw[consumed + 1], raw[consumed + 2]) }
+        let start = consumed + 5
+        payload.append(contentsOf: raw[start..<(start + length)])
+        consumed = start + length
+        records += 1
+        if records > maxRecords { return .passThrough }
+        return .progress
+    }
+
+    /// Emit the ClientHello as small records, then the bytes after it.
+    private mutating func reframe(_ messageLength: Int) -> [Data] {
+        // The cap covers every record written back, including the records that
+        // carry handshake bytes after the ClientHello. Without the leftover
+        // count, a hello plus a full record of later handshake bytes could pass
+        // the cap check and then emit more records than the cap allows.
+        let leftoverBytes = payload.count - messageLength
+        let leftoverRecords = (leftoverBytes + Self.maxRecordPayload - 1) / Self.maxRecordPayload
+        if recordsFor(messageLength) + leftoverRecords > maxRecords { return passThrough() }
+        var chunks: [Data] = []
+        var offset = 0
+        var index = 0
+        while offset < messageLength {
+            let size = min(1 + (index % maxChunk), messageLength - offset)
+            chunks.append(frame(version: version, payload: payload[offset..<(offset + size)]))
+            offset += size
+            index += 1
+        }
+        // Handshake bytes that followed the ClientHello in the same records
+        // stay in order and unchanged. Only their record framing is new.
+        var rest = messageLength
+        while rest < payload.count {
+            let size = min(Self.maxRecordPayload, payload.count - rest)
+            chunks.append(frame(version: version, payload: payload[rest..<(rest + size)]))
+            rest += size
+        }
+        // Bytes after the records that carried the ClientHello were never
+        // touched. They go out exactly as they arrived.
+        if consumed < raw.count {
+            chunks.append(Data(raw[consumed...]))
+        }
+        state = .reframed
+        raw.removeAll(keepingCapacity: false)
+        payload.removeAll(keepingCapacity: false)
+        consumed = 0
+        records = 0
+        return chunks
+    }
+
+    /// Build one handshake record.
+    private func frame(version: (UInt8, UInt8), payload: ArraySlice<UInt8>) -> Data {
+        let length = UInt16(payload.count)
+        var out = Data(capacity: 5 + payload.count)
+        out.append(Self.handshakeContentType)
+        out.append(version.0)
+        out.append(version.1)
+        out.append(UInt8(length >> 8))
+        out.append(UInt8(length & 0xff))
+        out.append(contentsOf: payload)
+        return out
+    }
+
+    /// Give up shaping and release every buffered byte unchanged.
+    private mutating func passThrough() -> [Data] {
+        let bytes = Data(raw)
+        state = .passThrough
+        raw.removeAll(keepingCapacity: false)
+        payload.removeAll(keepingCapacity: false)
+        consumed = 0
+        records = 0
+        return bytes.isEmpty ? [] : [bytes]
+    }
+
+    /// The number of records that a split of `length` bytes needs.
+    private func recordsFor(_ length: Int) -> Int {
+        var count = 0
+        var offset = 0
+        while offset < length {
+            offset += 1 + (count % maxChunk)
+            count += 1
+        }
+        return count
+    }
+}
+
 final class ProxyServer {
     struct Snapshot {
         var state = "Stopped"
+        /// Counts each failure that the server reports. The app records the
+        /// value when it requests a start, so a queued snapshot from an older
+        /// failure cannot end the new request.
+        var failureRevision = 0
         var clients = 0
         /// Open sessions that passed the SOCKS authentication.
         var authenticatedSessions = 0
@@ -56,6 +472,12 @@ final class ProxyServer {
         var pairingPromptID: UUID?
         var pairingReady = false
         var pairingFailureCount = 0
+        /// True when the pairing listener could not bind or become ready. The
+        /// Dashboard and Settings show a plain pairing-unavailable line.
+        var pairingUnavailable = false
+        /// The last pairing timeout, denial, or lockout. The app shows it for
+        /// 60 seconds or until the next pairing event. It holds no code.
+        var pairingNotice: PairingNotice?
         /// The trusted target device count. It follows every trust change.
         var trustedCount = 0
         /// Counts once for every trust change, so the app records one line.
@@ -79,13 +501,29 @@ final class ProxyServer {
     // - The ICMP echo selector and its tasks run on `queue`, because they share
     //   the selector cache.
     private let queue = DispatchQueue(label: "hotspotproxy.server")
+    private let queueKey = DispatchSpecificKey<Bool>()
     /// The parent of every session queue. It is concurrent, so the sessions
     /// run in parallel.
     private static let sessionTarget = DispatchQueue(label: "hotspotproxy.sessions",
                                                      qos: .userInitiated, attributes: .concurrent)
-    private var listener: NWListener?
+    private let listenerFactory: any ProxyListenerFactory
+    private var listener: (any ProxyListenerHandle)?
+    /// The bound for one waiting episode. Production uses the default. The
+    /// hermetic test passes a short value.
+    private var listenerWait: ProxyListenerWaitPolicy
+    /// Guards the one waiting timer for the current run and episode. A timer
+    /// from an older run or an older episode cannot end a newer run.
+    private var listenerWaitTimer: DispatchWorkItem?
+    private var listenerWaitID: UUID?
+    /// The endpoint of the current run. The ready line and an activation
+    /// reconciliation use it. It is cleared with the run.
+    private var listenerEndpoint: (address: String, port: UInt16)?
     private var sessions: [UUID: ProxySession] = [:]
     private var echoSelector: ExperimentalICMPSelector?
+    #if PROXY_LISTENER_LIFECYCLE_TESTING
+    /// The fake-listener test must not start real cellular preflight probes.
+    var suppressICMPSelectorForLifecycleTest = false
+    #endif
     private let echoTiming = ExperimentalICMPTimingAggregate()
     private var snapshot = Snapshot()
     private var generation = UUID()
@@ -107,6 +545,10 @@ final class ProxyServer {
     private var authenticatedSessions = 0
     private var lastAuthenticatedTraffic: Date?
     private var lastTrafficPublish: Date?
+    /// Reframe the first ClientHello on each new TCP flow. Off by default.
+    /// Only an explicit `configureTlsShape(true)` turns it on. This changes
+    /// TLS record framing only. It does not hide SNI or the destination.
+    private var tlsShapeEnabled = false
     // Pairing runs independently of the proxy listener.
     private let trust: ObservableTrustStore
     // Use the responder on `queue` only. It reads the credentials there.
@@ -134,11 +576,26 @@ final class ProxyServer {
     private var nextPairingID = 0
     private var pairingTick: DispatchWorkItem?
     private var sceneActive = true
-    private static let maximumPairingConnections = 4
-    private static let pairingConnectionSeconds: TimeInterval = 130
+    /// The accept order and the first-frame state of the pairing sockets. A
+    /// socket with no complete frame is not yet a responder session.
+    private var pairingSlots = PairingConnectionSlots(maximum: 4)
+    /// The bound on a socket that has not sent a complete frame. The responder
+    /// owns every later deadline, so no second absolute bound can cut a prompt.
+    private var pairingFirstFrameTimers: [Int: DispatchWorkItem] = [:]
+    /// The bound on the final reply send. The responder removes its session
+    /// before a terminal reply, so its deadline no longer covers the socket.
+    /// This timer starts only after a terminal reply, never while a prompt is
+    /// live.
+    private var pairingReplyTimers: [Int: DispatchWorkItem] = [:]
+    private static let pairingReplySeconds: TimeInterval = 5
 
-    init(trust: ObservableTrustStore) {
+    init(trust: ObservableTrustStore,
+         listenerFactory: any ProxyListenerFactory = NetworkProxyListenerFactory(),
+         listenerWaitSeconds: TimeInterval = ProxyListenerWaitPolicy.seconds) {
         self.trust = trust
+        self.listenerFactory = listenerFactory
+        self.listenerWait = ProxyListenerWaitPolicy(limit: listenerWaitSeconds)
+        queue.setSpecific(key: queueKey, value: true)
         // Raise the file limit once. A failure is recorded only. The capacity
         // state follows the observed soft limit. An unknown limit stays
         // unknown, so the start fails instead of claiming the nominal cap.
@@ -196,6 +653,7 @@ final class ProxyServer {
             self.snapshot.trustedCount = self.trust.count
             guard let endpointPort = NWEndpoint.Port(rawValue: port), port != 0 else {
                 self.snapshot.state = "Failed"
+                self.snapshot.failureRevision += 1
                 self.snapshot.error = "The proxy port is not valid. Choose another port."
                 self.log(self.snapshot.error!)
                 return
@@ -206,6 +664,7 @@ final class ProxyServer {
                 // The Dashboard hides an unknown error text, so the plain
                 // reason goes in the capacity line.
                 self.snapshot.state = "Failed"
+                self.snapshot.failureRevision += 1
                 self.snapshot.error = PlainMessage.startFailed
                 self.snapshot.capacityWarning = availability.startFailureMessage
                 self.snapshot.clients = 0
@@ -216,6 +675,7 @@ final class ProxyServer {
                 // A stopped run still owns closing sockets. A start with no
                 // free descriptor budget fails. The app does not retry.
                 self.snapshot.state = "Failed"
+                self.snapshot.failureRevision += 1
                 self.snapshot.error = PlainMessage.startFailed
                 self.snapshot.capacityWarning =
                     SessionCapacity.Runtime.busyMessage(retiringSessions: retiring)
@@ -229,12 +689,17 @@ final class ProxyServer {
                 self.snapshot.capacityWarning = SessionCapacity.capacityWarning(limits: limits)
             }
             do {
+                // Read once. A later configuration change applies to the next
+                // run, not to flows this listener already accepts.
+                let tlsShape = self.tlsShapeEnabled
                 let parameters = makeNoDelayTCPParameters()
                 parameters.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(hotspotAddress), port: endpointPort)
-                let listener = try NWListener(using: parameters)
+                let listener = try self.listenerFactory.makeListener(parameters: parameters)
                 let generation = UUID()
                 self.generation = generation
                 self.listener = listener
+                self.listenerEndpoint = (hotspotAddress, port)
+                self.clearListenerWait()
                 self.updatePairingTimer()
                 self.snapshot.state = "Starting"
                 self.snapshot.error = nil
@@ -242,43 +707,28 @@ final class ProxyServer {
                 if let warning = self.snapshot.capacityWarning {
                     self.log(warning)
                 }
-                listener.stateUpdateHandler = { [weak self, weak listener] state in
-                    guard let self = self, self.generation == generation else { return }
+                listener.setStateUpdateHandler { [weak self, weak listener] state in
+                    // The generation ties this callback to one run. The
+                    // identity check rejects a late callback after the slot
+                    // moved to another listener. An intentional stop changes
+                    // the generation before it cancels the listener, so its
+                    // cancelled callback never reaches a case here.
+                    guard let self = self, let listener = listener,
+                          self.generation == generation,
+                          let current = self.listener, current === listener else { return }
                     switch state {
                     case .ready:
-                        self.snapshot.state = "Listening"
-                        self.snapshot.error = nil
-                        self.log("Listening on \(hotspotAddress):\(port).")
-                        if self.echoSelector == nil {
-                            let selector = ExperimentalICMPSelector(queue: self.queue) { [weak self] message in
-                                self?.log(message)
-                            }
-                            self.echoSelector = selector
-                            selector.start()
-                        }
-                    case .waiting(let error):
-                        self.snapshot.error = Self.listenerError(error, port: port)
-                        self.log(self.snapshot.error!)
+                        self.listenerReady()
+                    case .waiting:
+                        self.listenerWaiting(listener)
                     case .failed(let error):
-                        self.snapshot.state = "Failed"
-                        self.snapshot.error = Self.listenerError(error, port: port)
-                        listener?.cancel()
-                        self.listener = nil
-                        self.updatePairingTimer()
-                        self.echoSelector?.stop()
-                        self.echoSelector = nil
-                        // Record the end of every established relay in this
-                        // run before the generation changes. A late callback
-                        // from this run cannot then reach the next run.
-                        self.closeSessions()
-                        self.generation = UUID()
-                        self.log(self.snapshot.error!)
+                        self.listenerFailed(listener, error: Self.listenerError(error, port: port))
                     case .cancelled:
-                        break
+                        self.listenerWasCancelled(listener)
                     default: break
                     }
                 }
-                listener.newConnectionHandler = { [weak self] connection in
+                listener.setNewConnectionHandler { [weak self] connection in
                     guard let self = self, self.generation == generation else {
                         connection.cancel()
                         return
@@ -293,6 +743,7 @@ final class ProxyServer {
                     let sessionQueue = DispatchQueue(label: "hotspotproxy.session",
                                                      qos: .userInitiated, target: Self.sessionTarget)
                     let session = ProxySession(id: id, client: connection, token: token,
+                                               tlsShape: tlsShape,
                                                queue: sessionQueue, controlQueue: self.queue,
                                                echoSelector: self.echoSelector, onEchoTiming: { [weak self] sample in
                         // A late echo sample from an earlier run must not
@@ -379,10 +830,218 @@ final class ProxyServer {
             } catch {
                 self.capacity.stopRun(now: ProxySession.clock())
                 self.snapshot.state = "Failed"
+                self.snapshot.failureRevision += 1
                 self.snapshot.error = "Cannot start listener: \(error.localizedDescription)"
                 self.log(self.snapshot.error!)
             }
         }
+    }
+
+    /// End the current run after the listener reported `.failed`. Run it on
+    /// `queue` from the matching state callback. The caller already checked the
+    /// generation and the listener identity.
+    private func listenerFailed(_ listener: any ProxyListenerHandle, error: String) {
+        snapshot.state = "Failed"
+        snapshot.failureRevision += 1
+        snapshot.error = error
+        // End the run before the cancel. The cancelled callback belongs to the
+        // old generation, so it cannot end a later run or overwrite the error.
+        endListenerRun()
+        listener.cancel()
+        log(error)
+    }
+
+    /// End a run whose listener reported `.cancelled` with no app stop.
+    ///
+    /// iOS can cancel a listener while it suspends the app, without any app
+    /// call. Reporting `Listening` then would be false, and the old listener
+    /// slot would make a later start return early with no visible change.
+    /// Generation separates this event from an intentional stop: `stop`
+    /// changes the generation before it cancels the listener, so its
+    /// `.cancelled` callback is ignored. This ends the run and releases the
+    /// slot. It does not start a replacement, because the proxy is not
+    /// persistent and iOS can suspend the app again. The person starts the
+    /// proxy again when they choose.
+    private func listenerWasCancelled(_ listener: any ProxyListenerHandle) {
+        snapshot.state = "Failed"
+        snapshot.failureRevision += 1
+        snapshot.error = Self.listenerCancelledMessage
+        // The listener reported its own cancellation. Do not cancel it again.
+        endListenerRun()
+        log(Self.listenerCancelledMessage)
+    }
+
+    /// Record a ready listener. Run it on `queue` from the matching state
+    /// callback, or from activation reconciliation when the callback was lost.
+    /// The caller already checked the generation and the listener identity.
+    private func listenerReady() {
+        let wasListening = snapshot.state == "Listening"
+        clearListenerWait()
+        snapshot.state = "Listening"
+        snapshot.error = nil
+        if wasListening {
+            publish()
+        } else if let endpoint = listenerEndpoint {
+            log("Listening on \(endpoint.address):\(endpoint.port).")
+        } else {
+            log("Listening.")
+        }
+        #if PROXY_LISTENER_LIFECYCLE_TESTING
+        if suppressICMPSelectorForLifecycleTest { return }
+        #endif
+        if echoSelector == nil {
+            let selector = ExperimentalICMPSelector(queue: queue) { [weak self] message in
+                self?.log(message)
+            }
+            echoSelector = selector
+            selector.start()
+        }
+    }
+
+    /// Record a listener that waits for its required local endpoint. Run it on
+    /// `queue` from the matching callback, or from activation reconciliation.
+    ///
+    /// A listener that waits accepts no connection, so do not report
+    /// `Listening` during the wait. `Starting` covers both the first start and
+    /// a later recovery. One waiting episode has one bound: a repeated waiting
+    /// event does not extend it. A new episode starts only after the listener
+    /// reports ready again.
+    private func listenerWaiting(_ listener: any ProxyListenerHandle, resuming: Bool = false) {
+        let now = ProxySession.clock()
+        let wasWaiting = listenerWait.isWaiting
+        if resuming, listenerWait.expire(now: now) {
+            // The bound passed while the app was inactive and the timer did
+            // not run. End the run now instead of waiting forever.
+            listenerWaitTimedOut(listener)
+            return
+        }
+        listenerWait.begin(now: now)
+        snapshot.state = "Starting"
+        snapshot.error = Self.listenerWaitingMessage
+        if wasWaiting {
+            publish()
+        } else {
+            log(Self.listenerWaitingMessage)
+        }
+        scheduleListenerWaitTimer(now: now)
+    }
+
+    /// Arm the one timer for the current waiting episode. It checks the run,
+    /// the episode, and the listener before it acts, so a cancelled timer or a
+    /// late callback cannot end a newer run.
+    private func scheduleListenerWaitTimer(now: TimeInterval) {
+        listenerWaitTimer?.cancel()
+        listenerWaitTimer = nil
+        listenerWaitID = nil
+        guard listenerWait.isWaiting, let listener = listener else { return }
+        let generation = self.generation
+        let id = UUID()
+        listenerWaitID = id
+        let delay = listenerWait.remaining(now: now) + 0.05
+        let item = DispatchWorkItem { [weak self, weak listener] in
+            guard let self = self, let listener = listener,
+                  self.generation == generation,
+                  self.listenerWaitID == id,
+                  self.listener === listener else { return }
+            // A state callback may have been delayed while the app was
+            // suspended. Reconcile before a due timer cancels a ready listener.
+            switch listener.state {
+            case .ready:
+                self.listenerReady()
+                return
+            case .failed(let error):
+                let message = self.listenerEndpoint.map { Self.listenerError(error, port: $0.port) }
+                    ?? "Cannot start listener: \(error.localizedDescription)"
+                self.listenerFailed(listener, error: message)
+                return
+            case .cancelled:
+                self.listenerWasCancelled(listener)
+                return
+            default:
+                break
+            }
+            let now = ProxySession.clock()
+            if self.listenerWait.expire(now: now) {
+                self.listenerWaitTimedOut(listener)
+            } else if self.listenerWait.isWaiting {
+                // A timer that fired before its deadline waits for the rest.
+                self.scheduleListenerWaitTimer(now: now)
+            }
+        }
+        listenerWaitTimer = item
+        queue.asyncAfter(deadline: .now() + max(0, delay), execute: item)
+    }
+
+    /// End a run whose listener stayed waiting for its whole bound.
+    ///
+    /// The listener accepts no connection while it waits. After the bound, the
+    /// run ends as a recoverable failure instead of reporting Listening or
+    /// Starting forever. The person starts the proxy again. No replacement
+    /// listener starts by itself.
+    private func listenerWaitTimedOut(_ listener: any ProxyListenerHandle) {
+        snapshot.state = "Failed"
+        snapshot.failureRevision += 1
+        snapshot.error = Self.listenerWaitExpiredMessage
+        // End the run before the cancel, so the cancelled callback belongs to
+        // the old generation and cannot touch a later run.
+        endListenerRun()
+        listener.cancel()
+        log(Self.listenerWaitExpiredMessage)
+    }
+
+    /// End the current waiting episode with no failure.
+    private func clearListenerWait() {
+        listenerWaitTimer?.cancel()
+        listenerWaitTimer = nil
+        listenerWaitID = nil
+        listenerWait.clear()
+    }
+
+    /// Reconcile the main listener when the app becomes active.
+    ///
+    /// iOS can cancel or fail a listener while it suspends the app, and the
+    /// state callback may never arrive. A waiting listener can also pass its
+    /// bound while the app does not run. Read the current listener once: end
+    /// its run, or restore a bound that is still valid. The check uses the
+    /// listener slot, so an old listener cannot affect a newer run.
+    private func reconcileProxyListenerOnActivation() {
+        guard let listener = listener else { return }
+        switch listener.state {
+        case .ready:
+            // The ready callback may have been lost while the app was inactive.
+            listenerReady()
+        case .waiting:
+            listenerWaiting(listener, resuming: true)
+        case .failed(let error):
+            let message = listenerEndpoint.map { Self.listenerError(error, port: $0.port) }
+                ?? "Cannot start listener: \(error.localizedDescription)"
+            listenerFailed(listener, error: message)
+        case .cancelled:
+            listenerWasCancelled(listener)
+        default:
+            break
+        }
+    }
+
+    /// Release the listener and the state owned by its run. The caller sets the
+    /// visible state and error first, then logs, so this method publishes
+    /// nothing.
+    ///
+    /// The generation changes before the caller cancels the listener. A late
+    /// `.ready`, `.cancelled`, session start, or connect report from this run
+    /// then fails its generation guard and cannot reach the next run.
+    private func endListenerRun() {
+        clearListenerWait()
+        listenerEndpoint = nil
+        listener = nil
+        // Record the end of every established relay in this run before the
+        // generation changes. A late callback from this run cannot then reach
+        // the next run.
+        closeSessions()
+        generation = UUID()
+        updatePairingTimer()
+        echoSelector?.stop()
+        echoSelector = nil
     }
 
     /// Make room for one new session. The phase-aware rule closes only a
@@ -498,21 +1157,33 @@ final class ProxyServer {
         return "Cannot start listener: \(error.localizedDescription)"
     }
 
+    /// The plain message for a listener that the system cancelled. It names no
+    /// address, port, or error. iOS can suspend the app and cancel the listener
+    /// without an app call, so the server reports the end and waits for the
+    /// person to start the proxy again.
+    static let listenerCancelledMessage = ListenerDisplayText.cancelled
+
+    /// The plain message while a listener waits for its local endpoint. It
+    /// names no address, port, or error. The wait is bounded, so the message
+    /// never claims that the proxy is listening.
+    static let listenerWaitingMessage = ListenerDisplayText.waiting
+
+    /// The plain message for a listener that stayed waiting for its whole
+    /// bound. It names no address, port, or error. The run is recoverable: the
+    /// person starts the proxy again, and nothing starts it by itself.
+    static let listenerWaitExpiredMessage = ListenerDisplayText.waitExpired
+
     /// Stop the listener and close every session. Pass `reason` when the app
     /// stops the proxy by itself. The reason stays visible in the status.
     func stop(reason: String? = nil) {
         queue.async { [weak self] in
             guard let self = self else { return }
-            // Record the end of every established relay in this run before
-            // the generation changes. A late callback from this run cannot
-            // then reach the next run.
-            self.closeSessions()
-            self.generation = UUID()
-            self.listener?.cancel()
-            self.listener = nil
-            self.updatePairingTimer()
-            self.echoSelector?.stop()
-            self.echoSelector = nil
+            let listener = self.listener
+            // Release the run before the cancel. The generation change makes
+            // the cancelled callback from this listener an old-run event, so
+            // an intentional stop never reports a failure.
+            self.endListenerRun()
+            listener?.cancel()
             self.snapshot.capacityWarning =
                 SessionCapacity.capacityWarning(limits: self.capacity.limits)
             self.snapshot.state = "Stopped"
@@ -521,21 +1192,86 @@ final class ProxyServer {
         }
     }
 
-    // MARK: Pairing
-    // The pairing listener binds to the hotspot address only.
-    func configurePairing(port: UInt16, token: String) {
+    /// Reframe the first ClientHello on each new TCP flow.
+    ///
+    /// Off by default. Call this before `start`. It changes TLS record framing
+    /// only. It does not hide SNI, the destination, DNS names, or flow shape,
+    /// and it does not control TCP segmentation. It never changes one
+    /// handshake byte. The app has no visible control for it yet.
+    func configureTlsShape(_ enabled: Bool) {
         queue.async { [weak self] in
-            guard let self = self else { return }
-            self.pairingPort = port
-            self.pairingToken = token
-            if let credentials = self.pairingCredentials {
-                self.pairingCredentials = PairingCredentials(host: credentials.host, port: port, token: token)
-            }
-            self.updatePairingTimer()
+            self?.tlsShapeEnabled = enabled
         }
     }
 
+    // MARK: Pairing
+    // The pairing listener binds to the hotspot address only.
+    //
+    // A listener needs both a port and a non-empty token. The app calls
+    // `suspendPairing` when it has no usable token, and every later scene
+    // change must keep the listener down. These guards are the one place that
+    // decides. Pairing must never hand out a token the app cannot use.
+    private var pairingConfigured: Bool {
+        pairingPort != 0 && !pairingToken.isEmpty
+    }
+
+    func configurePairing(port: UInt16, token: String) {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            guard PairingProtocol.isUsableProxyPort(port), PairingProtocol.isValidToken(token) else {
+                self.suspendPairingOnQueue()
+                return
+            }
+            self.pairingPort = port
+            self.pairingToken = token
+            if let credentials = self.pairingCredentials {
+                // Both values passed the guard above. A nil here would mean an
+                // unusable host, so the status answer then has no credentials.
+                self.pairingCredentials = PairingCredentials(host: credentials.host, port: port, token: token)
+            }
+            self.updatePairingTimer()
+            // Resume at once after a token load that succeeded later. The app
+            // may already be active when it retries the keychain read.
+            if self.sceneActive { self.checkPairingHotspot() }
+        }
+    }
+
+    /// Acknowledge suspension on the server queue before returning. Work
+    /// already sent to Network.framework can still reach its peer; cancellation
+    /// cannot recall an in-flight frame. No later frame is started by this
+    /// listener after the queue has processed the suspension.
+    func suspendPairing() {
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            suspendPairingOnQueue()
+        } else {
+            queue.sync { suspendPairingOnQueue() }
+        }
+    }
+
+    #if DEBUG
+    /// Lets the hermetic wiring test hold the server queue at a known point.
+    func enqueuePairingTestWork(_ work: @escaping () -> Void) {
+        queue.async(execute: work)
+    }
+    #endif
+
+    /// Run on `queue`.
+    private func suspendPairingOnQueue() {
+        pairingPort = 0
+        pairingToken = ""
+        pairingTimer?.cancel()
+        pairingTimer = nil
+        stopPairingListener()
+    }
+
     private func checkPairingHotspot() {
+        // A scene change, the poll timer, and the policy all pass through here.
+        // Without a port and a token there is nothing to offer, so the listener
+        // stays down until `configurePairing` supplies both.
+        guard pairingConfigured else {
+            if pairingListener != nil { stopPairingListener() }
+            return
+        }
         let observation: PairingListenerPolicy.Observation
         switch HotspotInterface.observe() {
         case .present(let address): observation = .present(address)
@@ -545,7 +1281,13 @@ final class ProxyServer {
         let interval = listener != nil ? HotspotPoll.runningSeconds : HotspotPoll.stoppedSeconds
         switch pairingPolicy.observe(observation, listening: pairingListener != nil, pollInterval: interval) {
         case .start(let address):
-            pairingCredentials = PairingCredentials(host: address, port: pairingPort, token: pairingToken)
+            // The pairing credentials need a usable IPv4 hotspot address. Any
+            // other address is a failed start, not a listener with no result.
+            guard let credentials = PairingCredentials(host: address, port: pairingPort, token: pairingToken) else {
+                pairingFailed()
+                return
+            }
+            pairingCredentials = credentials
             startPairingListener(hotspotAddress: address)
         case .stop: stopPairingListener()
         case .none: break
@@ -553,11 +1295,13 @@ final class ProxyServer {
     }
 
     private func pairingFailed() {
-        stopPairingListener()
-        if pairingPolicy.failed() != nil {
-            snapshot.pairingFailureCount += 1
-            publish()
-        }
+        // Keep the unavailable line through a retry failure. A normal stop
+        // clears it, so a missing hotspot does not blame the pairing port.
+        stopPairingListener(clearUnavailable: false)
+        let firstFailure = pairingPolicy.failed() != nil
+        snapshot.pairingUnavailable = true
+        if firstFailure { snapshot.pairingFailureCount += 1 }
+        publish()
     }
 
     private func clearPairingGrace() {
@@ -599,8 +1343,12 @@ final class ProxyServer {
             if self.sceneActive != active { self.pairingPolicy.resetObservations() }
             self.sceneActive = active
             if active {
+                // A cancellation, failure, or expired wait can happen while the
+                // app is inactive and send no callback. Reconcile it before the
+                // Dashboard shows an old state.
+                self.reconcileProxyListenerOnActivation()
                 self.checkPairingHotspot()
-                if let listener = self.pairingListener {
+                if self.pairingConfigured, let listener = self.pairingListener {
                     if case .ready = listener.state {
                         self.clearPairingGrace()
                         self.pairingReady = true
@@ -633,6 +1381,9 @@ final class ProxyServer {
     private func updatePairingTimer() {
         pairingTimer?.cancel()
         pairingTimer = nil
+        // No token and no port means no listener to keep alive. A scene change
+        // must not restart the poll for a suspended listener.
+        guard pairingConfigured else { return }
         guard let interval = HotspotPoll.interval(proxyRunning: listener != nil, active: sceneActive) else { return }
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + interval, repeating: interval)
@@ -659,8 +1410,14 @@ final class ProxyServer {
 
     private func startPairingListener(hotspotAddress: String) {
         // Check the guard first. A second call must not replace the generation
-        // of the live listener and stop its callbacks.
-        guard pairingListener == nil, let port = NWEndpoint.Port(rawValue: PairingProtocol.port) else { return }
+        // of the live listener and stop its callbacks. A suspended listener has
+        // no port and no token, so it never binds.
+        guard pairingConfigured,
+              pairingListener == nil,
+              let port = NWEndpoint.Port(rawValue: PairingProtocol.port) else { return }
+        // A new bind attempt is the next pairing event, so an old timeout line
+        // no longer describes the current state.
+        snapshot.pairingNotice = nil
         let generation = UUID()
         pairingGeneration = generation
         do {
@@ -676,6 +1433,7 @@ final class ProxyServer {
                     self.pairingReady = self.sceneActive
                     self.pairingPolicy.ready()
                     self.snapshot.pairingReady = self.sceneActive
+                    self.snapshot.pairingUnavailable = false
                     self.publish()
                 case .failed:
                     self.pairingFailed()
@@ -690,13 +1448,24 @@ final class ProxyServer {
                 }
             }
             listener.newConnectionHandler = { [weak self] connection in
-                guard let self = self, self.pairingGeneration == generation,
-                      self.pairingConnections.count < Self.maximumPairingConnections else {
+                guard let self = self, self.pairingGeneration == generation else {
                     connection.cancel()
                     return
                 }
                 let id = self.nextPairingID
                 self.nextPairingID += 1
+                // The live prompt is never evicted. Every other socket can be
+                // closed to admit a legitimate target check.
+                let protected = self.responder.pendingPrompt?.connection
+                switch self.pairingSlots.admit(id, protected: protected) {
+                case .accept:
+                    break
+                case .evict(let victim):
+                    self.closePairing(victim)
+                case .refuse:
+                    connection.cancel()
+                    return
+                }
                 self.pairingConnections[id] = connection
                 self.pairingReaders[id] = PairingFrameReader()
                 connection.stateUpdateHandler = { [weak self] state in
@@ -707,10 +1476,7 @@ final class ProxyServer {
                     }
                 }
                 connection.start(queue: self.queue)
-                // A silent target device cannot hold a pairing slot for long.
-                self.queue.asyncAfter(deadline: .now() + Self.pairingConnectionSeconds) { [weak self] in
-                    self?.closePairing(id)
-                }
+                self.schedulePairingFirstFrameLimit(id)
             }
             listener.start(queue: queue)
             beginPairingGrace()
@@ -719,7 +1485,7 @@ final class ProxyServer {
         }
     }
 
-    private func stopPairingListener() {
+    private func stopPairingListener(clearUnavailable: Bool = true) {
         clearPairingGrace()
         pairingGeneration = UUID()
         pairingListener?.cancel()
@@ -727,6 +1493,10 @@ final class ProxyServer {
         pairingReady = false
         pairingCredentials = nil
         snapshot.pairingReady = false
+        if clearUnavailable { snapshot.pairingUnavailable = false }
+        // A listener stop is a pairing event, so an old result line no longer
+        // applies. The unavailable line is set separately by `pairingFailed`.
+        snapshot.pairingNotice = nil
         publish()
         pairingTick?.cancel()
         pairingTick = nil
@@ -738,10 +1508,15 @@ final class ProxyServer {
         guard let connection = pairingConnections[id] else { return }
         connection.receive(minimumIncompleteLength: 1, maximumLength: 1024) { [weak self] data, _, eof, error in
             guard let self = self, self.pairingConnections[id] != nil, var reader = self.pairingReaders[id] else { return }
-            if let data = data, !data.isEmpty { reader.push(data) }
             do {
+                // The reader refuses a push that passes its cap. The catch
+                // below closes the connection through `receiveInvalid`.
+                if let data = data, !data.isEmpty { try reader.push(data) }
                 while let frame = try reader.next() {
                     self.pairingReaders[id] = reader
+                    // A complete frame makes this a real session. The responder
+                    // owns every deadline from here, including the prompt.
+                    self.notePairingFrame(id)
                     let now = ProxySession.clock()
                     if let expired = self.responder.tick(now: now) {
                         self.applyPairing(expired)
@@ -781,8 +1556,16 @@ final class ProxyServer {
 
     private func applyPairing(_ output: PairingResponder.Output) {
         let id = output.connection
+        if let notice = Self.pairingNotice(for: output.status) {
+            snapshot.pairingNotice = notice
+        } else if output.status != nil {
+            // Any other pairing result is the next event. An old timeout line
+            // no longer describes it.
+            snapshot.pairingNotice = nil
+        }
         if let status = output.status { log(Self.pairingMessage(status)) }
         guard let connection = pairingConnections[id] else { return }
+        if output.close { schedulePairingReplyLimit(id) }
         for (index, frame) in output.frames.enumerated() {
             let last = index == output.frames.count - 1
             connection.send(content: frame, completion: .contentProcessed { [weak self] _ in
@@ -801,7 +1584,9 @@ final class ProxyServer {
 
     /// The live phone state for a status request from a paired target device. Run it on `queue`.
     private func pairingInfo() -> PairingPhoneInfo? {
-        guard let credentials = pairingCredentials else { return nil }
+        // A suspended listener has no credentials to report. A port of 0 would
+        // tell a target device to connect nowhere.
+        guard pairingConfigured, let credentials = pairingCredentials else { return nil }
         return PairingPhoneInfo(proxyRunning: listener != nil && snapshot.state == "Listening",
                                 foreground: sceneActive,
                                 connections: UInt16(min(authenticatedSessions, Int(UInt16.max))),
@@ -809,7 +1594,44 @@ final class ProxyServer {
                                 host: credentials.host)
     }
 
+    /// A complete frame arrived. The responder session now owns the deadline.
+    /// Cancel the first-frame bound and stop treating the socket as idle.
+    private func notePairingFrame(_ id: Int) {
+        guard pairingSlots.isWaiting(id) else { return }
+        pairingSlots.receivedFrame(id)
+        pairingFirstFrameTimers.removeValue(forKey: id)?.cancel()
+    }
+
+    /// Bound a socket that has not sent a complete frame. This is the only
+    /// absolute connection bound. A socket that sent a frame is governed by
+    /// the responder deadline, so the inactive prompt extension is not cut.
+    private func schedulePairingFirstFrameLimit(_ id: Int) {
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self, self.pairingSlots.isWaiting(id) else { return }
+            self.closePairing(id)
+        }
+        pairingFirstFrameTimers[id] = item
+        queue.asyncAfter(deadline: .now() + PairingConnectionSlots.firstFrameSeconds,
+                         execute: item)
+    }
+
+    /// Bound the final reply send. The responder removed its session before
+    /// this output, so the session deadline cannot close a stuck socket. The
+    /// timer starts only for a terminal reply, so it cannot cut a live prompt.
+    private func schedulePairingReplyLimit(_ id: Int) {
+        pairingReplyTimers.removeValue(forKey: id)?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self, self.pairingConnections[id] != nil else { return }
+            self.closePairing(id)
+        }
+        pairingReplyTimers[id] = item
+        queue.asyncAfter(deadline: .now() + Self.pairingReplySeconds, execute: item)
+    }
+
     private func closePairing(_ id: Int) {
+        pairingFirstFrameTimers.removeValue(forKey: id)?.cancel()
+        pairingReplyTimers.removeValue(forKey: id)?.cancel()
+        pairingSlots.remove(id)
         pairingReaders.removeValue(forKey: id)
         if let connection = pairingConnections.removeValue(forKey: id) {
             connection.cancel()
@@ -832,6 +1654,10 @@ final class ProxyServer {
         }
         let prompt = responder.pendingPrompt
         if snapshot.pairingCode != prompt?.code || snapshot.pairingPromptID != prompt?.id {
+            // A new prompt is the next pairing event. An old timeout line no
+            // longer applies. A prompt that just ended keeps its result line
+            // until the expiry or the next event.
+            if prompt != nil { snapshot.pairingNotice = nil }
             snapshot.pairingCode = prompt?.code
             snapshot.pairingPromptID = prompt?.id
             publish()
@@ -839,6 +1665,17 @@ final class ProxyServer {
     }
 
     // These lines hold no key and no token.
+    private static func pairingNotice(for status: PairingStatus?) -> PairingNotice? {
+        let message: String
+        switch status {
+        case .denied: message = PairingNoticeText.denied
+        case .timedOut: message = PairingNoticeText.expired
+        case .lockedOut: message = PairingNoticeText.lockedOut
+        default: return nil
+        }
+        return PairingNotice(message: message, at: Date())
+    }
+
     private static func pairingMessage(_ status: PairingStatus) -> String {
         switch status {
         case .ok: return "Pairing finished. The target device received the proxy port and token."
@@ -1067,6 +1904,9 @@ private final class ProxySession {
     private var outbound: NWConnection?
     /// The clean EOF state of the TCP relay. The session queue owns it.
     private var relayHalfClose = RelayHalfClose()
+    /// Reframe the first ClientHello of the client to destination direction.
+    /// Nil is off. A value is released after the first ClientHello.
+    private var clientHelloShaper: ClientHelloShaper?
     private let token: [UInt8]
     /// The one serial queue for this session. All socket handlers and all
     /// session state run here.
@@ -1158,7 +1998,7 @@ private final class ProxySession {
     private var inboundDatagramWriting = false
     private var outboundDatagramConnection: NWConnection?
 
-    init(id: UUID, client: NWConnection, token: String, queue: DispatchQueue,
+    init(id: UUID, client: NWConnection, token: String, tlsShape: Bool, queue: DispatchQueue,
          controlQueue: DispatchQueue,
          echoSelector: ExperimentalICMPSelector?, onEchoTiming: @escaping (ExperimentalICMPTiming.Sample) -> Void,
          onConnect: @escaping (ConnectReport) -> Void,
@@ -1172,6 +2012,7 @@ private final class ProxySession {
         self.id = id
         self.client = client
         self.token = Array(token.utf8)
+        self.clientHelloShaper = tlsShape ? ClientHelloShaper() : nil
         self.queue = queue
         self.controlQueue = controlQueue
         self.echoSelector = echoSelector
@@ -1722,7 +2563,13 @@ private final class ProxySession {
                 self.read(1) { length in
                     guard length[0] > 0 else { self.send([1, 1]) { self.close("Authentication failed.") }; return }
                     self.read(Int(length[0])) { password in
-                        let valid = username == Array("hotspotshade".utf8) && password == self.token
+                        // Compare both fields in constant time. Do not stop
+                        // after the user name, and do not compare the token
+                        // with an early-return equality.
+                        let userValid = constantTimeEquals(
+                            username, Array(ProxyProtocol.socksUsername.utf8))
+                        let tokenValid = constantTimeEquals(password, self.token)
+                        let valid = userValid && tokenValid
                         self.send([1, valid ? 0 : 1]) {
                             if valid {
                                 self.authenticated = true
@@ -1956,8 +2803,7 @@ private final class ProxySession {
     private func connectDatagram(host: String, port: NWEndpoint.Port) {
         beginConnecting()
         let maker = {
-            let parameters = NWParameters.udp
-            parameters.requiredInterfaceType = .cellular
+            let parameters = makeOutboundUDPParameters()
             return NWConnection(host: NWEndpoint.Host(host), port: port, using: parameters)
         }
         watchConnect(maker: maker, transport: .udp, host: host, port: port) { [weak self] connection in
@@ -2057,8 +2903,7 @@ private final class ProxySession {
     private func connect(host: String, port: NWEndpoint.Port) {
         beginConnecting()
         let maker = {
-            let parameters = makeNoDelayTCPParameters()
-            parameters.requiredInterfaceType = .cellular
+            let parameters = makeOutboundTCPParameters()
             return NWConnection(host: NWEndpoint.Host(host), port: port, using: parameters)
         }
         watchConnect(maker: maker, transport: .tcp, host: host, port: port) { [weak self] connection in
@@ -2283,20 +3128,32 @@ private final class ProxySession {
                 self.touch()
                 self.noteRelayHalfClose()
                 self.forward(data ?? Data(), to: destination, side: side) { [weak self] in
-                    self?.finishWrite(to: destination, side: side.other)
+                    self?.flushShaper(to: destination, side: side) { [weak self] in
+                        self?.finishWrite(to: destination, side: side.other)
+                    }
                 }
             case .finish:
                 self.touch()
                 self.noteRelayHalfClose()
-                self.finishWrite(to: destination, side: side.other)
+                self.flushShaper(to: destination, side: side) { [weak self] in
+                    self?.finishWrite(to: destination, side: side.other)
+                }
             }
         }
     }
 
     // Send one piece of data. The completion runs after the stack processed it.
+    // Only the client to destination direction is shaped. The destination to
+    // client bytes are never rewritten.
     private func forward(_ data: Data, to destination: NWConnection,
                          side: RelayHalfClose.Side,
                          completion: @escaping () -> Void) {
+        if side == .client, var shaper = clientHelloShaper, shaper.isBuffering {
+            let chunks = shaper.feed(data)
+            clientHelloShaper = shaper.isBuffering ? shaper : nil
+            sendShaped(chunks, at: 0, to: destination, side: side, completion: completion)
+            return
+        }
         destination.send(content: data, completion: .contentProcessed { [weak self] error in
             guard let self = self, !self.closed else { return }
             if error != nil {
@@ -2306,6 +3163,42 @@ private final class ProxySession {
             }
             self.touch()
             completion()
+        })
+    }
+
+    // Release any bytes the shaper still holds when the client half-closes.
+    // They left in order and unchanged, once, before the FIN. Only the client
+    // to destination direction has a shaper.
+    private func flushShaper(to destination: NWConnection, side: RelayHalfClose.Side,
+                             completion: @escaping () -> Void) {
+        guard side == .client, var shaper = clientHelloShaper else {
+            completion()
+            return
+        }
+        clientHelloShaper = nil
+        sendShaped(shaper.finish(), at: 0, to: destination, side: side,
+                   completion: completion)
+    }
+
+    // Send the shaped pieces in order. One send completion starts the next, so
+    // a busy destination socket applies backpressure.
+    private func sendShaped(_ chunks: [Data], at index: Int, to destination: NWConnection,
+                            side: RelayHalfClose.Side,
+                            completion: @escaping () -> Void) {
+        guard index < chunks.count else {
+            completion()
+            return
+        }
+        destination.send(content: chunks[index], completion: .contentProcessed { [weak self] error in
+            guard let self = self, !self.closed else { return }
+            if error != nil {
+                self.markEstablishedEnd(side.other.socketErrorEnd)
+                self.close("Relay failed.")
+                return
+            }
+            self.touch()
+            self.sendShaped(chunks, at: index + 1, to: destination, side: side,
+                            completion: completion)
         })
     }
 

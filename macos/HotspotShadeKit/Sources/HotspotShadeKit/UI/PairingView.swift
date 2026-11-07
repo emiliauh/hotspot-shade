@@ -39,8 +39,7 @@ public struct PairingView: View {
                     }
                 } else {
                     Text(groupedCode)
-                        .font(.system(size: 40, weight: .semibold, design: .rounded))
-                        .monospacedDigit()
+                        .font(.system(.largeTitle, design: .rounded).weight(.semibold).monospacedDigit())
                         .textSelection(.enabled)
                         .accessibilityLabel(AccessibilityText.code(groupedCode))
                 }

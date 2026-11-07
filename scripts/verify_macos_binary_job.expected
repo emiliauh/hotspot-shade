@@ -1,0 +1,21 @@
+    name: Verify macOS binary artifact
+    needs: [rust-macos]
+    outputs:
+      sha256:
+        description: SHA-256 of the verified macOS binary
+        value: ${{ steps.digest.outputs.sha256 }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: hotspotshade-macos-arm64
+          path: artifact
+      - name: Audit the downloaded binary
+        run: sh scripts/release_audit.sh --artifacts artifact
+      - name: Record the verified artifact digest
+        id: digest
+        run: |
+          digest=$(sh scripts/release_manifest.sh --digest artifact/hotspotshade)
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"

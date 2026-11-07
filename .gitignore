@@ -12,6 +12,18 @@ wintun.dll
 *.pem
 *.key
 *.mobileprovision
+*.p12
+*.p8
+*.cer
+*.keystore
+*.jks
+*.pcap
+*.pcapng
+.env
+.env.*
+!.env.example
+*.rlib
+/snapshot-fallback.png
 # OS and editor files
 .DS_Store
 __pycache__/

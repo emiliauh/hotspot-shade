@@ -60,23 +60,35 @@ pub mod environment;
 pub mod environment_linux;
 pub mod failures;
 pub mod gui;
+mod normalized_udp;
 pub mod packet;
 pub mod pairing;
 pub mod source_pairing;
 pub mod tcp;
+pub mod tls_shape;
 pub mod udp_responder;
 #[cfg(any(windows, test))]
+pub mod windows_credential_handoff;
+#[cfg(any(windows, test))]
 pub mod windows_native_routes;
+#[cfg(any(windows, test))]
+pub(crate) mod windows_pairing;
+#[cfg(any(windows, test))]
+pub mod windows_physical_path;
 #[cfg(any(windows, test))]
 pub mod windows_relay_wait;
 pub mod windows_route_verify;
 
+#[cfg(unix)]
+pub mod credential_handoff;
 #[cfg(unix)]
 pub mod gui_backend;
 #[cfg(windows)]
 pub mod gui_backend_windows;
 #[cfg(unix)]
 pub mod ipv6;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos_upgrade_lock;
 #[cfg(any(unix, windows))]
 pub mod phone;
 #[cfg(unix)]
@@ -90,14 +102,18 @@ pub mod platform;
 pub mod platform_linux;
 #[cfg(unix)]
 pub mod privileged;
+pub mod redact;
 pub mod relay;
 pub mod relay_poll;
+pub mod secret_env;
 #[cfg(any(unix, windows))]
 pub mod service;
 #[cfg(unix)]
 pub mod socks;
 #[cfg(unix)]
 pub mod speed_diag;
+#[cfg(target_os = "macos")]
+pub mod tunnel_grant;
 #[cfg(unix)]
 pub mod udp_diag;
 

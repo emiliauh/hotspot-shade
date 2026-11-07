@@ -20,6 +20,7 @@ Phones are source devices. Desktops are target devices. Each phone app must matc
 - Pairing works without manual addresses, ports, or tokens. The source device picks a random proxy port and tells the target device. Cancel and Forget behave as documented.
 - The source device app stays alive in the background by default and explains its status in plain text.
 - The target apps show real service state. They do not claim success from stale data, a demo, or a simulated preview.
+- Opening a target app and using its ordinary interface must not require administrator privileges. Ask for them only when an operation actually needs them, such as installing the protected helper or starting the tunnel and changing routes. Pairing, settings, and viewing status must remain usable without an administrator prompt.
 - The tunnel turns itself off when the hotspot link or the source device is gone. Nothing restarts it by itself.
 - Ping works in source device proxy mode, and the apps say whether it is on or off.
 - Failures and stalls are inspectable on the target device without exposing tokens, keys, addresses, or personal traffic.
@@ -34,8 +35,41 @@ Phones are source devices. Desktops are target devices. Each phone app must matc
 - No Python code, scripts, or dependency.
 - No persistent proxy and no automatic restart after a loss.
 - No source device app requirement for direct mode. The optional source proxy must not replace or weaken direct mode.
-- No credential exposure. The source device token never goes to the browser, a log, a status report, or a diagnostics report.
+- No credential disclosure by the service. The service never sends the source
+  device token to the browser, a log, a status report, or a diagnostics report.
+  The manual fallback accepts a token typed by the person into the browser and
+  sends it to the service; it does not return the stored token.
 - No support claim from a compile, a demo, an emulator, or a VM test alone.
+
+## Destination privacy proposal (not available)
+
+The current goal normalizes IP and TTL. It does not hide destinations. A
+separate proposal, [docs/SNI_HIDING_PLAN.md](docs/SNI_HIDING_PLAN.md), studies
+destination-name privacy. Experimental ClientHello reframing code exists but
+is disabled and unavailable as a product control. It does not hide names.
+
+Settled scope for that proposal:
+
+- Application-wide `hide` is unsupported: the byte relay cannot add ECH to
+  another application's TLS handshake. Encrypted DNS is a separate,
+  unapproved proposal and would not add ECH to application traffic.
+- `shape` is experimental and unavailable. Reframing does not hide the server
+  name, destination address, DNS, flow size, or timing.
+- `cover` is deferred. Do not build it without an endpoint the owner controls,
+  and it must not add a third-party relay or VPS.
+- `terminate`, TLS interception with a locally trusted CA, is out of scope.
+- The iOS source relay is foreground-limited in current practice. Do not claim
+  sustained background relay.
+- Every feature, if built, is opt-in and labeled. The owner is responsible for
+  carrier terms and local law.
+- Destination privacy is separate from billing and tethering detection. No
+  proposal changes what the plan bills or claims to defeat DPI, TLS inspection,
+  or traffic analysis.
+
+Ordinary applications originate their own TLS. The engine cannot make an
+existing ClientHello use ECH, and a byte relay cannot force TLS 1.3. A separate
+product-owned TLS client would need its own proposal and review; it would not
+protect other applications' connections. The non-goals above remain true.
 
 ## Constraints
 

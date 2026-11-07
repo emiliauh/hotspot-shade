@@ -6,7 +6,8 @@ device provides the connection. The target device needs internet access.
 In this mode, the target device runs a local SOCKS5 listener. The listener
 forwards every TCP CONNECT to the HotspotShade app on the source device. The
 source device resolves the domain name and opens the connection on its
-cellular path. The carrier therefore sees source device traffic.
+cellular path. The carrier sees the source device's IP address and TCP stack,
+as well as destination information and application bytes sent on that path.
 
 This mode is separate from the direct mode in `README.md`. It creates no utun
 and changes no route. It needs no root. It does not replace the direct mode.
@@ -207,8 +208,24 @@ carrier and destination
 ```
 
 The local listener accepts only loopback addresses. The source device listener
-requires the token. The target device sends a domain name to the source device
-unchanged. The target device does not call `getaddrinfo()` for a target name.
+requires the token. The iOS proxy compares the token in constant time. That is
+timing hardening; the token still crosses the hotspot link in cleartext. The
+iOS app keeps the token in the Keychain. A reinstall or Forget all on the source
+device does not revoke it. Rotation is disabled pending a reviewed recovery
+protocol; there is currently no in-app token revocation path. The staged code
+under test writes a versioned intent record before it changes the token,
+confirms the new value by reading it back, removes the observed old copy,
+and clears the intent last. Launch and eligible read retries can recover an
+interrupted rotation by comparing token digests. The dormant rotation path can
+also run recovery before an attempt and during its confirmation read. A value
+that matches neither digest, a damaged intent,
+or a changed old copy suspends pairing and changes nothing. A restored backup or
+a downgrade can reintroduce an older saved token. The app detects some conflicts,
+but cannot detect every consistent rollback. See [iOS token recovery](ios/README.md).
+If the Keychain token and a different old UserDefaults copy both exist, the app
+keeps both and uses neither. It has no in-app conflict resolution. The target
+device sends a domain name to the source device unchanged. The target device
+does not call `getaddrinfo()` for a target name.
 An app must use remote DNS, for example a `socks5h` URL or the Firefox "Proxy
 DNS" option. If an app resolves a name locally, the source device still exits
 the flow, but the target device resolves the name first. That is a DNS leak.
@@ -220,10 +237,11 @@ the carrier sees the source device TTL.
 
 ## Requirements
 
-- A target device with the `hotspotshade` binary. macOS is verified on a live
-  hotspot. Linux and Windows have a source device proxy start path but no live
-  hotspot test. Build it as `README.md` describes. On Windows, install
-  `wintun.dll` next to the program and run it as Administrator.
+- A target device with the `hotspotshade` binary. macOS has historical live
+  hotspot evidence; the current changes need fresh validation. Linux has a
+  source device proxy start path without a live hotspot test. Windows has a
+  Wintun start path, but the current build disables source device proxy token
+  use, including starts and probes. See `README.md` for platform status.
 - A source device with the HotspotShade app from `ios/`. The app is an iOS
   app built with Xcode.
 - Personal Hotspot enabled on the source device.
@@ -237,21 +255,22 @@ the carrier sees the source device TTL.
 2. Enable cellular data and Personal Hotspot.
 3. Connect the target device to the hotspot.
 4. Open HotspotShade. Keep the app open.
-5. Set the port. The app chooses a port from 20000 to 59999 by default. You
-   can select a port in Settings, Advanced.
+5. The app chooses a port from 20000 to 59999 by default. You can select a
+   port in Settings, Advanced.
 6. Tap Start. Allow local network access when iOS asks.
 7. Allow Location when iOS asks. The app uses it to stay awake.
 8. To see the token, open Settings, Advanced, and tap Show token. The token
    hides again after 30 seconds.
 
-The app shows the local addresses of the source device. Select the address on
-the hotspot network. A free Apple ID profile expires after seven days. Build
-and install the app again when the profile expires.
+Open Settings, Manual connection to see the hotspot address, proxy port, and
+SOCKS5 username. The copy action does not include the token. A free Apple ID
+profile expires after seven days. Build and install the app again when the
+profile expires.
 
 ## Target device setup
 
 Check the token first. Use the proxy port that the source device shows in
-Settings, Advanced:
+Settings, Manual connection:
 
 ```
 hotspotshade phone --phone 172.20.10.1:PROXYPORT --check
@@ -259,7 +278,10 @@ hotspotshade phone --phone 172.20.10.1:PROXYPORT --check
 
 The command asks for the token with a hidden prompt. It can also read the
 token from the `HOTSPOTSHADE_PHONE_TOKEN` environment variable or from a
-private descriptor (`--secrets-fd`). Do not put the token on the command line.
+private descriptor (`--secrets-fd`). Prefer the prompt or the descriptor. The
+command removes the environment variable from its own environment right after
+it reads it, so child commands do not inherit it. Do not put the token on the
+command line.
 The command checks authentication and exits. A nonzero exit code means that
 the check failed. The message does not print the token.
 
@@ -306,9 +328,13 @@ source device app must use the hotspot address and port shown on its screen.
 
 The mode requires root for the device and routes. The token comes from
 `--secrets-fd`, the `HOTSPOTSHADE_PHONE_TOKEN` environment variable, or a hidden
-prompt. Preserve the variable when you start `hotspotshade tun --phone` as root.
-Do not put the token in a command line or a shell history file. Stop the process
-with Ctrl-C so it can remove its routes.
+prompt. Prefer the prompt or the descriptor. The process removes the variable
+from its own environment right after it reads it, so child commands do not
+inherit it. Preserve the variable when you start `hotspotshade tun --phone` as
+root only if you use it. Do not put the token in a command line or a shell history file. Stop the process
+with Ctrl-C so it can remove its routes. The engine validates the source device
+address and route before it sends the token. See the explicit-interface case
+below for a hotspot that is not the default route.
 
 The relay allows one outstanding DNS query per UDP flow. Concurrent queries on
 the same flow can time out. The resolver and the DNS traffic between the source
@@ -376,8 +402,10 @@ them.
 Nothing turns the tunnel back on. The person turns it on again after the
 hotspot or the source device returns. The target device app and the web page show the
 message. The source device app stops its proxy after 20 seconds of observed
-absence of its bound hotspot address. Gaps and unreadable observations restart
-the interval. Its pairing listener uses a separate check. See [ios/README.md](ios/README.md)
+absence of its bound hotspot address. It stops at once when a complete check
+names a different interface at the same address or an unsupported link at the
+hotspot address. Gaps and unreadable observations restart the interval. Its
+pairing listener uses a separate check. See [ios/README.md](ios/README.md)
 for its timing.
 
 ## Recent failures
@@ -523,10 +551,11 @@ engine sends one. An unknown phase shows as `unknown`.
 
 ## Pairing
 
-The GUI gets the source device token, port, and host. Confirm the six-digit
-code on the source device. A known target device can pair again without a tap.
-The service holds the credentials in memory. The browser never receives the
-token.
+The service receives the source device token, port, and host during pairing.
+Confirm the six-digit code on the source device. A known target device can pair
+again without a tap. The service holds the credentials in memory and does not
+return the token to the browser. Manual entry is a separate fallback that sends
+the value typed in the browser to the service.
 
 The pairing listener runs while the source device app is open and the hotspot
 interface is present. It runs when the proxy is stopped. A status-only HELLO
@@ -542,7 +571,10 @@ pairing listener when the app returns to the foreground if the listener is not
 ready.
 
 The app shows the pairing prompt only while it is in the foreground. A pending
-decision gets 120 seconds when the app goes to the background.
+decision can be extended by up to 120 seconds after the first background
+notice. The target waits up to 242 seconds after REVEAL for the result, covering
+the longest source prompt window and a two-second delivery margin. The person
+can cancel while waiting.
 
 On Android, `android/app/src/main/java/com/hotspotshade/source/pairing/`
 implements the same responder and test vectors in Kotlin. The listener binds
@@ -550,9 +582,12 @@ the hotspot address and TCP port 18090 only. It runs while the activity is
 visible. The activity stops it on `onStop`, so it does not pair in the
 background and the hidden-prompt extension is not used by the app. The prompt
 has a "Real pairing request" label. A separate preview dialog stays simulated.
-A successful pairing writes the proxy token to the Android Keystore store. The
-pairing result names a saved proxy port from 20000 to 59999. Android API 26 has
-no platform X25519 or ChaCha20-Poly1305, so the app has small in-tree
+A successful pairing saves the proxy token to the Android Keystore store before
+it sends the success result and before it trusts the target key. A save failure
+sends a fixed rejection and adds no trust. The pairing result names the proxy
+port that actually bound, or an advisory free port while no proxy runs; during
+a proxy start the listener answers NOT_ACTIVE instead of probing. Android API
+26 has no platform X25519 or ChaCha20-Poly1305, so the app has small in-tree
 implementations of RFC 7748 and RFC 8439 and uses the platform HMAC-SHA256.
 The JVM tests hold the RFC vectors and the same parity vectors as the Rust and
 iOS suites. `android/README.md` has the build and emulator interop commands.
@@ -568,12 +603,16 @@ Forget also cancels a pairing that is in progress.
 When the tunnel is off, the target device sends a best-effort FORGET message
 after a HELLO with bit 1 set and probes the source device at once. It clears the
 local credentials in all cases, also when the source device is unreachable. A
-rejected FORGET counts as success: the source device no longer trusts the key.
-A failed attempt stays pending. The service retries after the next presence
+rejected FORGET does not prove that the source device removed the key. An
+unconfirmed attempt stays pending. The service retries after the next presence
 probes, for 3 attempts in total, whether or not the source device answers. The
-state is `pending` while attempts remain. It ends as `confirmed` or
-`not_delivered`, unless a new pairing clears it. A new pairing cancels a pending
-FORGET.
+state is `pending` while attempts remain. Protocol v1 ends as `not_delivered`
+because its reply cannot confirm removal, unless a new pairing clears it. A
+new pairing waits for an in-flight local FORGET operation before starting, but
+that wait does not prove the source device processed the request. A delayed
+request can still remove trust after a later pairing. Likewise, cancelling a
+pairing before Forget does not prove that the source cannot process a delayed
+approval. Protocol v1 has no remote ordering barrier for either race.
 
 The source device removes that target device key and answers with an empty
 successful RESULT. A later pairing needs confirmation.
@@ -586,14 +625,17 @@ fixed and holds no credentials.
 | `no_hotspot` | Turn on Personal Hotspot on your source device. | The default route has no gateway. |
 | `not_running` | HotspotShade is not running on your source device. | The TCP connection to port 18090 was refused. |
 | `unpaired` | Not paired. Open HotspotShade on your source device, then pair. | The app answered a status-only HELLO, and this target device has no credentials. |
-| `not_trusted` | The source device does not know this target device. Pair again. | The app answered an authenticated status request with a rejection. |
+| `not_trusted` | The source device does not know this target device. Pair again. | A peer answered the status request with a rejection. The rejection does not authenticate the source device. |
 | `not_responding` | Open HotspotShade on your source device and keep it open. | The connection opened, but no valid status answer arrived. A timeout, an unreachable path, or a local error is not proof that the app is off. |
 | `checking` | Checking the source device. | A phone tunnel runs, but the last probe is old or monitoring failed before an answer. This is not proof of a failure. |
-| `proxy_off` | Start the proxy on your source device. | The authenticated status answer reports a stopped proxy. |
-| `ready` | The source device is ready. | The authenticated status answer reports a running proxy. |
+| `proxy_off` | Start the proxy on your source device. | A protected status answer reports a stopped proxy. |
+| `ready` | The source device is ready. | A protected status answer reports a running proxy. |
 | `connected` | Connected to the source device. | The tunnel runs in source device proxy mode, and the last probe is `ready` or no probe has finished yet. |
 
-The status answer is authenticated and encrypted. A TCP connection alone does not
+The status payload is encrypted and integrity-protected for the handshake, but
+the target device does not authenticate the source device's identity. A peer
+at the gateway can complete its own handshake and produce a status answer.
+A TCP connection alone does not
 set `proxy_off`, `ready`, or `connected`. The unpaired probe sends one status-only
 HELLO. It uses the optional flags byte that protocol v1.1 already defines. It adds
 no new message or field, and the parity vectors do not change. An unknown target
@@ -630,6 +672,12 @@ GUI restarts. A paired target device gets the result with no tap. Pair again
 after you rotate the token on the source device. Trust survives a token
 rotation.
 
+The iOS app currently keeps token rotation disabled. Its source-device trust
+list uses UserDefaults, which writes asynchronously. A power loss can therefore
+leave a recently forgotten target device trusted; that device may then pair
+again without a prompt. Forgetting a target also cannot recall a token that
+the target already saved.
+
 In the target device app, the app starts automatic pairing for each launch and
 tries again every 10 seconds while the source device is reachable. Cancel stops
 automatic pairing for the current launch only. Forget is saved: the app does
@@ -647,7 +695,8 @@ The user can select a port in the source device app. The app accepts a port
 from 1024 to 65535, except 18090.
 
 The target device learns the port from the pairing result and from the STATUS
-answer on the pairing channel. Both messages are authenticated and encrypted.
+answer on the pairing channel. Both payloads are encrypted and integrity-protected,
+but neither authenticates the source device's identity to the target device.
 The target device does not learn the port from a TCP connect or from an
 unauthenticated packet. It accepts a new port only when the STATUS answer names
 the hotspot gateway and a usable port. The token never changes.
@@ -656,14 +705,22 @@ A running tunnel keeps the port that it started with. Turn the tunnel off and
 on to use a new port. The target device does not set the port on the source
 device. That feature is not implemented.
 
-A port gives no security by itself. The token and the pairing channel protect
-the proxy.
+A port gives no security by itself. The token restricts who can use the proxy,
+but the SOCKS authentication and subsequent proxy traffic are not encrypted on
+the hotspot link. Pairing does not authenticate the later proxy connection.
+A peer that impersonates the source device can capture the token and traffic.
+Only use the current proxy on a trusted hotspot network.
 
 ### Protocol v1.1
 
 The target device connects to the source device hotspot address on TCP port
 `18090`. The source device listens on its hotspot address while the app is open
-and the hotspot interface is present. The target device uses a normalized outer
+and the hotspot interface is present. It keeps the interface name beside the
+address. A complete check that names another interface at the same address is a
+link change, so the listener stops at once and does not treat the old link as
+still present. The listener binds the address, not the interface name, because
+Network.framework has no public initializer that turns a name into
+`NWInterface`. The target device uses a normalized outer
 socket with TTL 65 and pins it to the hotspot interface. The target device uses
 the discovered gateway. The browser cannot choose the host.
 
@@ -725,12 +782,18 @@ address, so the source device serves a REVEAL after the lockout ends. A known
 target device can pair during an unknown peer lockout. Invalid messages use a
 separate back-off. The trust list contains public keys.
 
-Both responders limit an unknown source address to four CHALLENGE
+The Rust, iOS, and Android responders limit an unknown source address to four CHALLENGE
 messages in 60 seconds and all unknown source addresses to eight CHALLENGE
 messages in 60 seconds. They charge both budgets before they create the
-ephemeral secret, so a refused handshake creates no session. The Rust responder
-checks the pairing credentials first. It answers NotActive and charges no
-budget while pairing is off.
+ephemeral secret, so a refused handshake creates no session. They also limit a
+HELLO that claims a trusted key to eight CHALLENGE
+messages for one source address and sixteen in total in the same window. A
+public key is public, so the claim is unproven until the REVEAL proof. They
+charge this known-claim budget before they create the ephemeral secret. A valid
+proof refunds one charge, so a real target device is not limited by its own
+presence checks. A bad proof does not refund. An independent review found that
+the previous refund algorithm could remove a different session's charge near a
+window boundary; the cross-platform correction is in progress and unreviewed.
 
 Both responders bind an approval to the connection, the prompt ID, and the
 code that the person saw. They reject a stale connection, a stale prompt ID, a
@@ -751,8 +814,19 @@ code is `500 104`. A change on one side breaks both suites.
 
 The GUI accepts `--port 0` for an ephemeral loopback port. `--port-file PATH`
 writes the selected port to a private file. `--token-fd N` reads a
-64-character lowercase hex secret. With a secret set, `/api/` requests require
-a Bearer header. Static assets remain available without it.
+64-character lowercase hex secret from a file descriptor on Unix or an
+inherited handle on Windows. With a secret set, `/api/` requests require a
+Bearer header. Static assets remain available without it.
+
+The real Windows GUI fails closed without `--token-fd` and `--parent-fd`.
+Its token-bearing target, start, and probe paths are disabled in the current
+build, pending reviewed physical adapter and gateway checks. A non-root Unix GUI may run without a
+secret. A root Unix GUI fails closed without one. The macOS app and the Linux
+helper pass the secret on a descriptor, so their behavior does not change.
+
+Each request has one absolute 5 second deadline for the header and body. A
+client that sends one byte at a time cannot hold a request slot. Shutdown closes
+open connections and waits at most 2 seconds for request workers.
 
 The `/api/` routes are:
 
@@ -780,10 +854,9 @@ the request while the tunnel runs or is starting or stopping. The response is an
 error with the message "Turn off the tunnel first." The HTTP status is 409 and
 the code is `tunnel_running`. Otherwise it sends a best-effort FORGET to the
 source device, probes at once, and always clears the local credentials. A
-rejected FORGET counts as success. A failed attempt stays pending. The service
+rejected FORGET does not prove remote removal. An unconfirmed attempt stays pending. The service
 retries after presence probes for 3 attempts in total, whether or not the source
-device answers. The attempt ends as `confirmed` or `not_delivered`, unless a new
-pairing clears it.
+device answers. Protocol v1 ends as `not_delivered`, unless a new pairing clears it.
 
 `POST /api/phone/probe` runs one source device presence probe now and returns
 the latest phone object. The service runs at most one probe in 500 ms. A second
@@ -856,8 +929,9 @@ physical default interface, or null.
 
 `paired` is true only when the service holds paired credentials. A manual-token
 tunnel without stored credentials has `paired: false` and can report
-`unpaired`. `phone.connections` is the active connection count from the last
-authenticated STATUS answer. It is null when no valid answer arrived.
+`unpaired`. `phone.connections` is the connection count from the last valid
+protected STATUS payload. It is null when no valid answer arrived. The payload
+does not establish the source device's identity.
 
 `phone.state` is the real presence probe result while a tunnel runs. The value
 is `connected` only when the tunnel runs and the probe is `ready`, or when no
@@ -875,8 +949,12 @@ target device key. It is null in the other cases.
 |---|---|---|
 | `none` | No forget ran, or a new pairing cleared it | No message |
 | `pending` | A FORGET is in flight or waits for a retry | Forgetting... |
-| `confirmed` | The source device removed the target device key, or rejected the request | Forgotten. The source device removed this target device. |
-| `not_delivered` | 3 attempts ended without a confirmed answer | The source device did not answer. This target device forgot the pairing, but the source device may still trust it. |
+| `confirmed` | Reserved for a future authenticated confirmation; the v1 protocol cannot establish this | Could not confirm that the source device removed this pairing. This target device forgot the pairing, but the source device may still trust it. |
+| `not_delivered` | 3 attempts did not confirm removal; the peer may have answered | Could not confirm that the source device removed this pairing. This target device forgot the pairing, but the source device may still trust it. |
+
+The v1 FORGET response is not authenticated. Even a valid-looking reply cannot
+prove that the source device removed the key. Remove the target device from
+the source device trust list when confirmed removal is needed.
 
 `last_stop` holds the reason and Unix time of the last completed stop. The
 reason is `user`, `hotspot_lost`, `source_device_gone`, or `error`. The object is
@@ -936,6 +1014,7 @@ counters and bounded timing reservoirs. The shape when no tunnel runs is:
     "evicted": 0
   },
   "tcp": {
+    "flows_active": 0,
     "flows_peak": 0,
     "capacity_refused": 0,
     "retransmits": 0,
@@ -966,7 +1045,8 @@ have these meanings:
 | `udp.flows` | UDP-over-TCP flow count |
 | `udp.age_drops` | Datagrams dropped because they waited too long |
 | `udp.evicted` | Idle UDP flows closed to make room for a TCP flow |
-| `tcp.flows_peak` | Largest number of open inner TCP flows |
+| `tcp.flows_active` | Live target relay TCP flows. It counts the target relay flow table only: it includes a flow whose setup is still running, excludes UDP and ICMP, and holds no count from another device. The value is a live sample, so a flow that opens or closes at the same instant can appear in the next sample. It is not a stored history |
+| `tcp.flows_peak` | Largest observed value of `tcp.flows_active`, including entries still in setup. It is a high-water mark and does not follow the active gauge down |
 | `tcp.capacity_refused` | TCP connections refused because the worker was full |
 | `tcp.retransmits` | Inner TCP retransmits |
 | `tcp.zero_window_ms` | Time that an inner TCP flow had a full receive window |
@@ -981,6 +1061,14 @@ have these meanings:
 | `established.buckets[].relay_drops` | Packets dropped at a relay input or output queue, or when packet construction failed, in that second |
 | `established.buckets[].outer_errors` | Outer TCP socket read or write errors in that second |
 | `failures.total`, `failures.dropped` | Failure record counts for the current tunnel |
+
+`tcp.flows_active` is a gauge for the target relay itself. It is not the
+authenticated source device connection count, and it does not read
+`phone.connections`, pairing state, or another device. Every worker drops its
+remaining flow entries when it stops, so the gauge returns to zero when the
+relay stops. Stop can drop entries without incrementing the closed-flow counter,
+so subtracting closed flows from total flows does not reliably recover the
+active count after a stop.
 
 The `established` timeline keeps the last 60 seconds. It starts when the relay
 starts. A bucket that is absent is before the relay started or older than the
@@ -1047,14 +1135,17 @@ offers Pair again.
 
 See "Recent failures" for `GET /api/failures`.
 
-The GUI runs as the current user. On macOS it asks for administrator approval
-when it starts the source device tunnel. A separate helper changes routes and
-owns the tunnel. The helper receives the token over a private local socket. It
-stops the service when the GUI disconnects. The helper is the `hotspotshade`
-binary that the GUI starts with administrator rights. Run it only when you
-trust that binary and the target device that runs it. The GUI binds to loopback.
-Other local processes can access its HTTP API. The administrator prompt and the
-live helper path need device testing.
+The GUI runs as the current user. On macOS the installed protected helper starts
+one root engine when the app opens, without an administrator prompt. That engine
+creates no route and no tunnel device until a person turns the tunnel on. The
+helper starts no tunnel by itself. When a person turns the tunnel on, the app
+asks Authorization Services for one administrator authorization. The helper
+checks the fixed right and writes a one-time grant into the engine's root-only
+runtime directory. The engine consumes that grant before it changes a route. A
+missing, stale, or malformed grant is a refused start. The helper stops the
+engine when the app connection closes. The GUI binds to loopback. Other local
+processes can access its HTTP API. The administrator prompt, the one-time grant,
+and the live helper path need device testing.
 
 The source device app supplies the live status for the status answer. The
 fields are the proxy state, the foreground state, the active connection count,
@@ -1081,15 +1172,18 @@ The pairing protocol provides these checks:
   device shows a code, and the user must allow the target device. The proof
   shows that the target device holds the private key of `L_s`.
 - An active man in the middle can try separate handshakes to find matching
-  six-digit codes. The commitment does not prevent that search. The Rust
-  and iOS responders charge four challenges for each source address and eight
+  six-digit codes. The commitment does not prevent that search. The Rust,
+  iOS, and Android responders charge four challenges for each source address and eight
   challenges in total in 60 seconds before they create the ephemeral secret.
   These limits reduce the search rate, but they do not remove the risk.
-- A trusted public key skips both challenge budgets. The source device does
-  not limit the total number of challenges to a known key. This exemption is
-  intentional. It keeps a paired target device from a lockout. The budgets are
-  an availability limit, not an authentication limit. A device that lacks the
-  private key still fails the proof.
+- A trusted public key is public too. A HELLO that claims one is unproven until
+  the REVEAL proof, so the Rust, iOS, and Android responders charge a separate
+  known-claim budget of eight challenges for one source address and sixteen in
+  total in 60 seconds. They refund one charge only after a valid REVEAL proof.
+  A real target device therefore keeps its presence checks, while a claim that
+  cannot prove the key is bounded. The budgets are an availability limit, not
+  an authentication limit. A device that lacks the private key still fails the
+  proof.
 - Both responders bind approval to the connection, the prompt ID, and the
   displayed code. They reject a stale connection, a stale prompt, a wrong code,
   and an expired deadline. The challenge limit
@@ -1121,12 +1215,19 @@ The Rust responder in `rust/src/source_pairing.rs` and the iOS responder in
 in `rust/src/source_pairing.rs` and the shared tests in
 `ios/tests/PairingTests.swift` cover the same cases.
 
-- Each source address gets at most four challenges in 60 seconds. All unknown
-  source addresses together get at most eight challenges in 60 seconds. Both
-  responders check the pairing credentials first. A source device with pairing
-  off answers NotActive and charges no budget. Both charge the challenge
-  budgets before they create the ephemeral key. A refused challenge sends Busy
-  and creates no session.
+- Each source address gets at most four unknown challenges in 60 seconds. All
+  unknown source addresses together get at most eight challenges in 60 seconds.
+  For a normal unknown-key pairing, both responders check the pairing
+  credentials first. If pairing is off, they answer NotActive and charge no
+  budget. A claimed known key still pays the separate known-claim budget. Both charge the
+  challenge budgets before they create the ephemeral key. A refused challenge
+  sends Busy and creates no session.
+- The Rust and iOS responders charge a claimed trusted key its own budget of
+  eight challenges for one source address and sixteen in total in 60 seconds.
+  They charge it before they create the ephemeral key. A valid REVEAL proof
+  refunds one charge, so a real target device is not limited by its presence
+  checks. A bad proof does not refund. This closes the unbounded work path that
+  a public key claim would otherwise open.
 - A REVEAL checks the pairing credentials before it charges the prompt attempt
   budget. A source device with pairing off answers NotActive and uses no
   attempt. Both responders allow three prompt attempts for each source address
@@ -1178,9 +1279,9 @@ The left column holds the fixed text from `rust/src/pairing.rs` and
 | The source device is busy with another pairing. Try again in a minute. | Another target device pairs now. Wait one minute. |
 | The source device refuses pairings for 30 seconds after repeated failures. Wait and try again. | Wait 30 seconds. |
 | The source device denied the pairing. | The person tapped Deny on the source device. Start the pairing again. |
-| Nobody answered on the source device within 60 seconds. Try again. | The prompt stayed unanswered. Start the pairing again. |
+| Nobody answered the prompt on the source device in time. Try again. | The prompt stayed unanswered or the target did not receive a result in time. Start the pairing again. |
 | The source device rejected the pairing message. | The app and the target device use different versions. Update both. |
-| The source device sent an invalid pairing message. | The answer did not authenticate. Something on the link changed it. Pair again on a link you trust. |
+| The source device sent an invalid pairing message. | The message failed a protocol or integrity check. Pair again on a link you trust. |
 | The target device identity key cannot be used. Check its file permissions. | Run `ls -l "$HOME/Library/Application Support/hotspotshade"`. The file needs mode 0600. The directory needs mode 0700. |
 | The pairing was cancelled. | The person cancelled the pairing on the target device. Start it again. |
 | A pairing is already running. | Wait for the current pairing to end. |
@@ -1477,6 +1578,14 @@ sudo hotspotshade tun --phone 172.20.10.1:PROXYPORT --iface en6
 - The token comes from `--secrets-fd`, the existing environment variable, or a
   hidden prompt on the terminal. Use the prompt. Do not put the token in the
   `sudo` command line.
+- The engine checks the source device address before it sends the token. When
+  the selected interface is the system default, the address must be that
+  route's current IPv4 gateway. When `--iface` selects another interface, the
+  kernel route to the address must use that interface, either on-link or with
+  the address as the next hop. A typo to an off-link host or to a host on
+  another interface is refused. The on-link check cannot prove that an address
+  in the hotspot subnet is the gateway, so check the address on the source
+  device screen.
 - Stop the tunnel with Ctrl-C. The cleanup removes the routes, the IPv6
   address, and the utun. Do not use `kill -9`. After the stop, check
   `netstat -rn -f inet` and `netstat -rn -f inet6` for the utun routes.
@@ -1590,8 +1699,31 @@ another tool.
   value. The code rejects such a value.
 - SOCKS5 carries the application traffic. It does not add TLS. Use HTTPS or
   another TLS protocol in each application.
-- The app must stay open. iOS can suspend it when background operation is off.
-  Screen lock can interrupt it.
+- This mode does not hide destinations. The source device opens the destination
+  connection and copies bytes. It does not parse TLS, so the target
+  application's ClientHello reaches the carrier as the application sent it.
+  The carrier may see the server name and DNS queries, unless the application
+  or another resolver independently protects them. Destination addresses,
+  flow size, and timing remain visible.
+- The target engine cannot add Encrypted Client Hello to a relayed connection.
+  Each application originates its own TLS session. The engine sees and
+  forwards bytes; it is not a party to that handshake. Changing a ClientHello
+  byte would make the destination reject the handshake. A name is chosen by the
+  TLS client that builds the ClientHello: an application, a product-owned TLS
+  client, or a TLS terminator. Phone-side termination is out of scope.
+- Proposed destination privacy controls are not available in this mode.
+  ClientHello shaping (`shape`) would not hide the server name, destination
+  address, DNS, or traffic pattern. Application-wide Encrypted Client Hello
+  (`hide`) is unsupported: the relay cannot add it to another application's TLS
+  handshake. Encrypted DNS is a separate, unapproved proposal and would not add
+  ECH to application traffic. A tunnel to an endpoint that the user owns
+  (`cover`) is deferred. This project has no third-party relay or VPS.
+- Destination-name privacy is separate from billing and carrier detection. No
+  control here is shown to change billing, throttling, or metering, and none is
+  shown to defeat multi-signal tethering detection. Follow the carrier's terms
+  and local law.
+- The app must stay open. Its background keep-awake option does not guarantee
+  continued operation; iOS can suspend it and screen lock can interrupt it.
 - The source device derives its session limit from the file descriptor limit.
   When the limit permits, it allows 256 relays plus 32 setup sessions. It
   refuses a new relay when no safe slot is available. It does not evict an open
@@ -1612,8 +1744,24 @@ another tool.
 - The source device resolves domain names. The target device must use remote
   DNS. A local resolver call is a leak. The adapter does not call
   `getaddrinfo()` on a destination name.
-- The token is stored in UserDefaults on the source device. Rotate the token
-  after exposure. Stop the proxy before you rotate it.
+- The iOS source device keeps the token in one Keychain item. The service is
+  `local.hotspotproxy.app`, the account is `proxyToken`, the item is after
+  first unlock and this device only, and it never syncs through iCloud Keychain.
+  An old UserDefaults copy moves into the Keychain on the first launch after the
+  upgrade. The disabled staged rotation code removes the observed old copy
+  only after the new token is read back. Read-back does not prove that the
+  Keychain write or UserDefaults removal survives a crash or restore. A read
+  before the first unlock fails closed: no token, proxy start, or pairing
+  listener. The app retries the read when protected data becomes available and
+  when the app becomes active. The app has no token
+  reset, and it refuses to replace or delete an invalid item it cannot identify.
+  Deleting and reinstalling the app normally keeps Keychain items, so a
+  reinstall is not a recovery. Rotation is disabled pending a reviewed recovery
+  protocol, so the app currently has no in-app revocation path. An intent
+  record supports recovery from modeled interrupted rotations; an unknown value
+  keeps pairing and the proxy off
+  and never creates a replacement. These storage rules are tested with a fake
+  Keychain only. See "Security and limits" in `ios/README.md`.
 - This mode depends on the source device app and the hotspot link. It adds a
   hop and can reduce throughput. Measure it before you depend on it.
 - This mode is not a VPN. It does not capture traffic from apps that ignore
@@ -1728,7 +1876,7 @@ result is a valid result. It shows the cost of the extra hop.
 | The tunnel turned itself off | The engine stops after 20 seconds without the hotspot link, or 90 seconds without an answer from the source device. Read `last_stop` and `last_stop_message` in `GET /api/status`. Connect the hotspot, open the source device app, then turn the tunnel on again. |
 | The tunnel is slow on Wi-Fi | A 2.4 GHz link is slower and less steady. On the source device, turn off Maximize Compatibility in the Personal Hotspot settings to allow 5 GHz, or use a cable. Move the target device closer when the signal is weak. |
 | `phone_token_rejected` at start | The source device changed its token. Open HotspotShade on the source device, then pair again. |
-| Forget keeps coming back | Forget is saved in the target device app. The app does not pair again until Pair. If the source device did not answer, the state is `not_delivered` and the source device can still trust the old key. Use Forget paired target devices on the source device, then pair again. |
+| Forget keeps coming back | Forget is saved in the target device app. The app does not pair again until Pair. A `not_delivered` state means remote removal was not confirmed and the source device can still trust the old key, even if a peer answered. Use Forget paired target devices on the source device, then pair again. |
 | Ping does not answer | Check "Let ping work" in the web page or in the target device app. Turn the tunnel off and on after a change. The tunnel must be on, the echo path needs a cellular path, and it allows 8 outstanding echoes. Traceroute and path-MTU discovery are not supported. |
 | Some connections did not work | Open "Recent failures" in the web page, or Settings, Advanced, "Recent failures" in the target device app. Select "Copy as text" or "Copy report". Read the groups with the largest count first. The `family` field separates IPv4 from IPv6. A code 1 reply can come from the source device 4 second deadline, so an `other` group can mean a slow or changing path. A code 4 reply is a real unreachable report. On the source device, Copy diagnostics shows waits and failures by family. These counts do not show the failure rate for each family. |
 | "Recent failures" is empty | The record is empty when no tunnel runs. It is also empty when every connection worked. The record is cleared when the tunnel starts or stops. |

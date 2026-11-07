@@ -98,16 +98,16 @@ private val HsShapes = Shapes(
     extraLarge = RoundedCornerShape(32.dp),
 )
 
-/** Read the system animator scale and the in-app preview switch. */
+/** Read the system animator scale. A scale of zero means reduced motion. */
 @Composable
-fun rememberReducedMotion(manualReduce: Boolean): Boolean {
+fun rememberReducedMotion(): Boolean {
     val context = LocalContext.current
     val scale = Settings.Global.getFloat(
         context.contentResolver,
         Settings.Global.ANIMATOR_DURATION_SCALE,
         1f,
     )
-    return manualReduce || scale == 0f
+    return scale == 0f
 }
 
 @Composable

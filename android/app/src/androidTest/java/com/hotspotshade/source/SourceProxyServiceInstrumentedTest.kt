@@ -14,6 +14,7 @@ import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.hotspotshade.demo.MainActivity
+import com.hotspotshade.source.pairing.MemoryPairingTrustStore
 import java.io.Closeable
 import java.io.File
 import java.net.DatagramSocket
@@ -21,6 +22,9 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.nio.file.Files
+import java.security.KeyStore
+import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
@@ -58,7 +62,13 @@ class SourceProxyServiceInstrumentedTest {
         stop.delete()
         bridge.start()
         val scenario = ActivityScenario.launch(MainActivity::class.java)
+        var ipv6Echo: TcpEchoOnHotspot? = null
         try {
+            ipv6Echo = try {
+                TcpEchoOnHotspot(InetAddress.getByAddress(ByteArray(16).also { it[15] = 1 }))
+            } catch (_: java.io.IOException) {
+                null
+            }
             SourceProxyService.start(context)
             assertTrue(
                 "The service must report a state.",
@@ -86,6 +96,7 @@ class SourceProxyServiceInstrumentedTest {
             )
 
             Log.i(TAG, "bridge=${bridge.port}")
+            Log.i(TAG, "ipv6 echo port=${ipv6Echo?.port ?: 0}")
 
             var ending = "timeout"
             val deadline = System.nanoTime() +
@@ -107,6 +118,7 @@ class SourceProxyServiceInstrumentedTest {
                 ending == "unexpected stop",
             )
         } finally {
+            ipv6Echo?.close()
             SourceProxyService.stop(context)
             assertTrue(
                 "The service must stop.",
@@ -168,16 +180,24 @@ class SourceProxyServiceInstrumentedTest {
     @Test
     fun keystoreTokenStoreRoundTrip() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
-        val file = File(context.filesDir, "source-token-instrumented.bin")
-        file.delete()
-        val store = AndroidKeystoreTokenStore(file)
+        val alias = "hs-token-roundtrip-${UUID.randomUUID()}"
+        val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        check(!keyStore.containsAlias(alias)) { "The disposable test alias already exists." }
+        val directory = Files.createTempDirectory(context.cacheDir.toPath(), "hs-token-roundtrip-").toFile()
+        val file = File(directory, "source-token.bin")
+        val store = AndroidKeystoreTokenStore(file, codec = KeystoreTokenFileCodec(keyAlias = alias))
         try {
             store.save(TOKEN)
             assertEquals(TOKEN, store.load())
-            store.clear()
-            assertNull(store.load())
+            org.junit.Assert.assertThrows(TokenDeleteException::class.java) { store.clear() }
+            assertEquals(TOKEN, store.load())
         } finally {
-            store.clear()
+            try {
+                keyStore.deleteEntry(alias)
+                check(!keyStore.containsAlias(alias)) { "The disposable test key was not removed." }
+            } finally {
+                check(directory.deleteRecursively()) { "The disposable test directory was not removed." }
+            }
         }
     }
 
@@ -213,6 +233,10 @@ class SourceProxyServiceInstrumentedTest {
                     waitUntil(5_000) { SourceProxyRuntime.observation().connections == 1 },
                 )
                 assertEquals(1L, SourceProxyRuntime.observation().totalConnections)
+                val payload = "emulator relay check".toByteArray(Charsets.US_ASCII)
+                client.getOutputStream().write(payload)
+                client.getOutputStream().flush()
+                org.junit.Assert.assertArrayEquals(payload, readExactly(client.getInputStream(), payload.size))
             } finally {
                 client.close()
             }
@@ -245,7 +269,7 @@ class SourceProxyServiceInstrumentedTest {
             Context.MODE_PRIVATE,
         )
         preferences.edit().clear().commit()
-        val store = SharedPreferencesPairingTrustStore(preferences)
+        val store = FilePairingTrustStore(File(context.cacheDir, "trust-instrumented"), preferences)
         val first = ByteArray(32) { 0x11 }
         val second = ByteArray(32) { 0x22 }
         try {
@@ -267,24 +291,30 @@ class SourceProxyServiceInstrumentedTest {
     @Test
     fun pairingAdminRotatesTheRealTokenFile() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
-        val file = File(context.filesDir, "source-token-rotate-instrumented.bin")
-        file.delete()
-        val store = AndroidKeystoreTokenStore(file)
+        val alias = "hs-token-rotation-${UUID.randomUUID()}"
+        val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        check(!keyStore.containsAlias(alias)) { "The disposable test alias already exists." }
+        val directory = Files.createTempDirectory(context.cacheDir.toPath(), "hs-token-rotation-").toFile()
+        val file = File(directory, "source-token.bin")
+        val store = AndroidKeystoreTokenStore(file, codec = KeystoreTokenFileCodec(keyAlias = alias))
         val admin = PairingAdmin(
-            trust = SharedPreferencesPairingTrustStore(
-                context.getSharedPreferences("hotspotshade-source-test", Context.MODE_PRIVATE),
-            ),
+            trust = MemoryPairingTrustStore(),
             tokenStore = store,
             tokenFactory = { "rotated-instrumented-token" },
             isProxyActive = { false },
+            guard = SourceTokenGuard(),
         )
         try {
             store.save(TOKEN)
             assertEquals(TokenRotateResult.ROTATED, admin.rotateToken())
             assertEquals("rotated-instrumented-token", store.load())
         } finally {
-            store.clear()
-            file.delete()
+            try {
+                keyStore.deleteEntry(alias)
+                check(!keyStore.containsAlias(alias)) { "The disposable test key was not removed." }
+            } finally {
+                check(directory.deleteRecursively()) { "The disposable test directory was not removed." }
+            }
         }
     }
 
@@ -360,8 +390,8 @@ class SourceProxyServiceInstrumentedTest {
         return bytes
     }
 
-    private class TcpEchoOnHotspot : Closeable {
-        private val listener = ServerSocket(0, 4)
+    private class TcpEchoOnHotspot(address: InetAddress? = null) : Closeable {
+        private val listener = ServerSocket(0, 4, address)
         private val workers = Executors.newCachedThreadPool { runnable ->
             Thread(runnable, "source-test-echo").apply { isDaemon = true }
         }
@@ -412,7 +442,7 @@ class SourceProxyServiceInstrumentedTest {
     }
 
     private fun testEnvironment(selection: TestSelection): SourceProxyEnvironment {
-        val finder = FixedHotspotFinder(HOTSPOT)
+        val finder = TestOnlyHotspotFinder(TestOnlyHotspot.EMULATOR_ADDRESS)
         return SourceProxyEnvironment(
             tokenStore = TokenStore { TOKEN },
             hotspotFinder = finder,
@@ -477,12 +507,6 @@ class SourceProxyServiceInstrumentedTest {
             Thread.sleep(50)
         }
         return condition()
-    }
-
-    private class FixedHotspotFinder(
-        private val address: InetAddress,
-    ) : HotspotAddressFinder {
-        override fun findHotspotAddress(): InetAddress = address
     }
 
     private class DefaultNetworkBinding(
@@ -641,7 +665,7 @@ class SourceProxyServiceInstrumentedTest {
         const val SERVE_TIMEOUT_MILLIS = 180_000L
         const val RUNNING_NOTIFICATION_TEXT =
             "The source proxy is running. Target devices can connect through the hotspot."
-        val HOTSPOT: InetAddress = InetAddress.getByAddress(byteArrayOf(10, 0, 2, 15))
+        val HOTSPOT: InetAddress = TestOnlyHotspot.EMULATOR_ADDRESS
         val LOOPBACK: InetAddress = InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))
     }
 }

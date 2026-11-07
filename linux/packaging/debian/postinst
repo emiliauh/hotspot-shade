@@ -1,0 +1,13 @@
+#!/bin/sh
+# HotspotShade postinst. Creates the root-only state directory and repairs the
+# modes of the files the root helper checks. It never starts the helper or an
+# engine.
+set -e
+install -d -o root -g root -m 0700 /var/lib/hotspotshade
+chmod 0755 /opt/hotspotshade/HotspotShade
+chmod 0755 /opt/hotspotshade/resources/engine/hotspotshade
+chmod 0755 /usr/lib/hotspotshade/hotspotshade-helper
+if [ -f /opt/hotspotshade/chrome-sandbox ]; then
+  chmod 4755 /opt/hotspotshade/chrome-sandbox
+fi
+exit 0

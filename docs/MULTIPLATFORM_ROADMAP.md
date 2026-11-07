@@ -24,13 +24,109 @@ each desktop still works without a source app.
 
 ## Current evidence
 
+The target app must open its full interface without administrator privileges.
+Pairing, settings, and status are ordinary user actions. Request elevation only
+for operations that need it, such as installing a protected helper or starting
+the tunnel.
+
+The macOS app starts the bundled engine when it opens, as the signed-in user.
+The dashboard, pairing, status, Activity, Settings, diagnostics, and Recent
+failures use that engine. Starting it creates no route and no tunnel device, and
+no administrator prompt appears. A root engine exists only for a tunnel start:
+the app asks the protected helper, the helper verifies the fixed right, and it
+starts a root engine that consumes a one-time grant before it changes a route.
+The user engine passes the same pairing identity and credentials to the root
+engine on a private inherited descriptor, so pairing state is not split. The
+macOS app has no demo mode: an engine that answers with test data is an error. A
+2026-11-06 signed candidate opened as the user with no helper or root engine and
+no administrator prompt. The user-engine launch and the prompt timing have
+hermetic Swift and Rust tests. The first live Turn on stopped before the
+authorization prompt and is being fixed, so a live tunnel start and route
+cleanup remain unverified.
+
+The earlier `not_authorized` failure was traced to the installed start right's
+zero timeout. macOS accepted the user's administrator approval, then rejected
+the helper's check milliseconds later because the credential had expired. The
+canonical plist now requests a 30 second window, and the helper, installer
+policy, service journal, and installer shell check accept the bounded positive
+range of 1 to 60 seconds while still requiring an administrator prompt, a
+non-shared right, and `allow-root=false`. The installed 2026-11-06 candidate
+has that 30 second right. The change has hermetic Swift and shell tests only. It
+must be verified with the real helper before claiming a fix. This evidence does
+not demonstrate tunnel or route behavior.
+
 | Platform and role | Current state | Production gap |
 |---|---|---|
-| macOS target | Rust tunnel and SwiftUI app exist. An earlier build was tested on a live hotspot. | Revalidate the current changes, releases, failure recovery, and every supported source pairing. |
-| iOS source | Swift app, proxy, and pairing exist. Current changes build and pass logic tests. | Revalidate the current build on a device and in cross-platform live tests. Background operation is subject to iOS limits. |
-| Android source | Compose UI wired to the real source proxy and pairing listener, with real Start and Stop, real state, real connection counts, real Forget one and Forget all, real token rotation, a notification permission flow, and a separate labeled preview mode. A source proxy foreground service, a pairing responder and listener (port 18090) on the shared protocol, in-tree X25519 and ChaCha20-Poly1305, Keystore token storage, and a saved proxy port exist. The source proxy serves TCP and UDP, IPv6 CONNECT and UDP destinations, and the private ICMP echo commands `0x81` and `0x82` through an unprivileged ICMP datagram socket. It applies the phase-aware session capacity from the iOS app, and the relay cap follows the open-file limit. On 2026-11-05 the real Rust target client completed two pairings, a 64 KiB TCP echo, an ICMP echo, and an IPv6 destination through the emulator loopback, the VM build and 217 JVM tests passed, lint reported 0 errors, and the APKs built. | No live hotspot test, no real phone or carrier test, and no background pairing. The pairing listener is foreground only. The IPv6 case used the emulator loopback; the emulator has no cellular IPv6 route. |
-| Windows target | WinUI 2 simulated preview and a Rust source device proxy tunnel start path. The command-line `gui` and `tun` commands start the tunnel with a Wintun DLL supplied at run time, the Windows socket helpers, and the native route boundary. Hermetic start, stop, cleanup, and missing-DLL tests pass on a macOS host and type-check for x86_64 and i686 Windows. | No live Windows hotspot test. No WinUI engine connection or protected service boundary. Direct mode, pairing in the command-line GUI, and a signed installer are missing. |
-| Linux target | Electron target app with a labeled demo backend, a protected engine boundary to the real Rust `gui` service, a separate Settings window, a tray item, desktop notifications, XDG launch at login, system light, dark, and high contrast themes, and an in-tree axe-style accessibility check. A packaged `.deb` holds the app, the engine, a pkexec helper, and a polkit action. A disposable VM passed the 127 Node tests, the sandboxed smoke test, the Settings window test, the accessibility check, the real engine demo smoke test, the real app entry point test, the helper test with a fake engine, the package build and install, and the packaged app in engine demo mode. The Rust direct-mode and source-proxy tunnel starts use a dedicated routing table. A disposable VM passed direct IPv4 flows with TTL 65, a verified IPv6 block, an explicit IPv6 forward start, source-proxy TCP and IPv6 flows, a 20-second link-loss stop, SIGTERM cleanup, and a SIGKILL run. The run left no link, rule, route, or TUN device. | No live hotspot test. No polkit prompt on a real desktop session. The tray item and notifications are untested on GNOME, KDE, and tiling window managers. Direct mode is not wired to the app. A crash still leaves policy rules. |
+| macOS target | Rust tunnel and SwiftUI app exist. A 2026-11-06 signed candidate was installed and opened as the user with no administrator prompt. | A live tunnel start and route cleanup are not verified. The first live Turn on failed before the authorization prompt and is being fixed. Revalidate releases, failure recovery, and every supported source pairing. |
+| iOS source | Swift app, proxy, and pairing exist. On 2026-11-06 the iOS Simulator app run and the proxy flow passed: a Debug app on the iPhone 18 Pro iOS 27.2 Simulator with the loopback overrides paired with the real Rust client and carried TCP, domain TCP, and UDP traffic with 0 TTL audit failures. A host flow harness also exercises the real Swift proxy with the real Rust client over loopback. The signed Release candidate was installed on a physical iPhone on 2026-11-06, and its proxy started on a real hotspot. | Token rotation remains disabled: interrupted-write durability and recovery need a reviewed solution, and Forget does not revoke a token already held by a target. The first live Mac Turn on failed before the authorization prompt and is being fixed. No carrier or tunnel flow has run yet. Revalidate cross-platform live tests. Background operation is subject to iOS limits. |
+| Android source | Compose UI wired to the real source proxy and pairing listener, with real Start and Stop, real state, real connection counts, real Forget one and Forget all, real token rotation, a notification permission flow, and no demo or preview mode. A source proxy foreground service, a pairing responder and listener (port 18090) on the shared protocol, in-tree X25519 and ChaCha20-Poly1305, Keystore token storage, and a saved proxy port exist. The source proxy serves TCP and UDP, IPv6 CONNECT and UDP destinations, and the private ICMP echo commands `0x81` and `0x82` through an unprivileged ICMP datagram socket. It applies the phase-aware session capacity from the iOS app, and the relay cap follows the open-file limit. On 2026-11-05 the real Rust target client completed two pairings, a 64 KiB TCP echo, an ICMP echo, and an IPv6 destination through the emulator loopback, the VM build passed and lint reported 0 errors, the APKs built, and a later macOS host run of that snapshot passed 473 JVM tests. On Android 16 or later the hotspot finder also reads the public tethering callback as positive evidence, falls back to the name rules when the reading is unavailable, and waits when the first reading is pending. | No live hotspot test, no real phone or carrier test, and no background pairing. The API 36 tethering callback has JVM tests with a fake registration only; real OEM behavior is unverified. The pairing listener is foreground only. The IPv6 case used the emulator loopback; the emulator has no cellular IPv6 route. |
+| Windows target | WinUI 2 app wired to the real engine through a full-trust broker and a NativeAOT elevated starter, and a Rust Wintun source-proxy start path. The app has no demo mode or simulated data. Source-device token use is enabled behind a gate: before each use and about every 2 seconds during a run, the engine checks that the source device is the default gateway of the physical Ethernet or Wi-Fi adapter that the tunnel pins to. The Windows engine has pairing, pair cancel, forget, probe, and pairing handoff on the shared API. The real `gui` command requires a per-launch bearer secret and parent-liveness handles. Portable fake start, stop, cleanup, gate, and pairing tests run on macOS, and the C# Core and ServiceHost checks pass; Windows-only handle tests type-check for x86_64 and i686. | Nothing has been built or run on Windows yet. No live Windows hotspot or tunnel test. No signed installer. The gate narrows misconfiguration and stale-identity risk but does not authenticate the source device. Proxy v1 sends a reusable token in cleartext, and a source-authenticated protocol or an explicit v1 decision remains open. Direct mode is not offered. The Wintun DLL is not bundled. |
+| Linux target | Electron target app with a development demo backend that a packaged build does not offer, a protected engine boundary to the real Rust `gui` service, a separate Settings window, a tray item, desktop notifications, XDG launch at login, system light, dark, and high contrast themes, and an in-tree axe-style accessibility check. A packaged `.deb` holds the app, the engine, a pkexec helper, and a polkit action. A disposable VM passed the 127 Node tests, the sandboxed smoke test, the Settings window test, the accessibility check, the real engine demo smoke test, the real app entry point test, the helper test with a fake engine, and the package build and install. The app opens an unprivileged user engine as the signed-in user at launch and asks for pkexec only at Turn on. The Rust direct-mode and source-proxy tunnel starts use a dedicated routing table. An earlier source snapshot passed disposable-VM tests for direct IPv4 flows with TTL 65, a verified IPv6 block, an explicit IPv6 forward start, source-proxy TCP and IPv6 flows, a 20-second link-loss stop, SIGTERM cleanup, and a SIGKILL run. The run left no link, rule, route, or TUN device. | No live hotspot test. No polkit prompt on a real desktop session. The tray item and notifications are untested on GNOME, KDE, and tiling window managers. The app has a Direct control that requests a direct-mode start through the same helper, but a real app-started direct tunnel is not verified. A crash can leave policy rules and the block route. A later start attempts recovery only when its claim and observed objects satisfy the ownership checks; ambiguous evidence keeps the claim and blocks the start. The current uncommitted cleanup changes need fresh review and VM evidence. |
+
+The desktop security review found additional blockers in the reviewed tree:
+
+- The macOS app no longer elevates its user-writable bundled engine. Real mode
+  runs that engine as the signed-in user for the dashboard, pairing, settings,
+  and diagnostics, so opening the app starts no root helper and no root engine.
+  A tunnel start uses a root-owned, Developer ID and hardened-runtime protected
+  XPC helper. The user engine passes the same pairing identity and credentials
+  to the root engine through a private inherited descriptor. The non-root Rust
+  GUI start returns `protected_helper_required` for a route-changing start, and
+  the legacy `--privileged-helper` command fails closed. The 2026-11-06
+  candidate was installed as root and opened as the user with no helper or root
+  engine. The helper launch for a tunnel, signed XPC peer check, root engine
+  spawn with the credential descriptor, and live route cleanup remain untested:
+  the first live Turn on stopped before the authorization prompt and is being
+  fixed. The app has no demo mode. See `macos/Helper/README.md` for the exact
+  blockers.
+- The local GUI limits request reads and response writes to bounded deadlines,
+  but an unauthenticated local process can repeatedly occupy all 32 connection
+  slots. The deadline limits each hold; it does not guarantee availability.
+  The backend now sets a closing flag before shutdown and checks it under the
+  phase lock in the start and pairing paths, so a late request cannot start a
+  tunnel after the final stop. The response-write deadline is a separate fix.
+- The Windows engine enables source-device token use only behind the token
+  gate. Before each use and about every 2 seconds during a run, it checks that
+  the source device is the default gateway of the physical adapter that the
+  tunnel pins to, and the first refusal stops the tunnel. The elevated engine
+  still requires `--token-fd`, and the elevated command-line GUI accepts only
+  the current private default gateway. The bearer check, host check,
+  inherited-handle read, parent-pipe stop, gate, and pairing have hermetic tests
+  and cross-check on x86_64 and i686 Windows. Nothing has run on Windows. The
+  WinUI app reaches the engine through the broker and elevated starter; the
+  browser GUI still has no launcher that supplies the secret.
+- The Linux app now starts an unprivileged user engine at open and asks for
+  pkexec only at Turn on. The non-demo GUI reaches the engine's tunnel start
+  path through the helper. The helper separates authorization from engine
+  startup, exits without starting an engine when the app has stopped waiting,
+  holds a root-only lock and engine state record, refuses a second start while a
+  helper or engine is alive, and reports abnormal engine exits and stop timeouts
+  as failures. Its tests cover
+  private directory creation, reaped children, SIGTERM shutdown, lock
+  contention, stale state, abnormal exit codes, and a root container lifecycle.
+  An independent review still found an interface-index revalidation gap. Fix
+  and retest that, plus a live polkit and desktop run, before claiming a working
+  privileged app-to-tunnel path.
+- A TCP regression test run reported that the full Rust library suite trapped
+  in `privileged::tests::macos_ad_hoc_caller_is_rejected`, although that test
+  passed alone. A macOS crash report places the trap in Core Foundation while
+  Security.framework scans the peer-attribute dictionary. The helper code now
+  uses retaining dictionary callbacks. A subsequent full macOS Rust test run
+  passed, including that test: 645 library tests passed and one was ignored,
+  plus the integration suites. Review the peer-signature boundary independently
+  and repeat the check on the release revision.
+
+The iOS app-level Simulator flow that was blocked on 2026-11-05 now passes. On
+2026-11-06 a Debug app ran in the iPhone 18 Pro iOS 27.2 Simulator with the
+loopback overrides, the real Rust client paired after the matching code was
+approved, and proxy traffic passed. The signed Release candidate was then
+installed on a physical iPhone, and its proxy started on a real hotspot. The
+first live Mac Turn on failed before the authorization prompt and is being
+fixed. No carrier or tunnel flow has run yet.
+
+These are review findings, not claims about later changes. Recheck the exact
+release revision and record the fixes and verification below before closing
+them.
 
 ### End-to-end release matrix
 
@@ -98,24 +194,24 @@ screen only simulates it.
 
 ## Linux target app parity
 
-The Linux app matches the macOS target features where the Linux desktop
-allows. The items below are implementation state and test evidence. They do not
-replace the release matrix.
+The Linux app has interface and engine-integration foundations for the macOS
+target features. Demo and fake-engine results do not prove a working real
+tunnel or feature parity. The items below do not replace the release matrix.
 
 | Feature | Linux state | Evidence | Difference from macOS |
 |---|---|---|---|
-| Main window, Dashboard, Activity, pairing | Implemented. | Node model tests, sandboxed smoke test, engine demo smoke test. | None. |
+| Main window, Dashboard, Activity, pairing | Interface and engine operations implemented. | Node model tests, sandboxed smoke test, engine demo smoke test. | Real end-to-end app operation still needs verification. |
 | Settings window | Implemented as one second BrowserWindow with General, Pairing, and Advanced. | `test:settings-window`, accessibility check. | It is a normal window, not a macOS settings sheet. |
-| Let ping work | Implemented in Settings and sent on Start. | Model, IPC, and engine demo tests. | None. |
+| Let ping work | Implemented in Settings and sent on Start. | Model, IPC, and engine demo tests. | Real app-to-tunnel behavior still needs verification. |
 | Launch at login | Implemented in a packaged app with one XDG autostart file. The toggle reads the real file. | Settings and autostart tests. | `SMAppService` on macOS, `.desktop` on Linux. |
 | Notifications | Automatic stop reasons, pairing results, and engine loss. The setting controls them. | Policy, sink, and monitor tests. | The tray and notification service are not tested on a real GNOME or KDE session. |
 | Tray or menu bar item | Start, Stop, Open, and Quit. | Menu and tray tests. | StatusNotifierItem when a host exists. A plain no-tray fallback otherwise. |
 | Light, dark, high contrast | System, light, dark, and a high contrast token layer. | Accessibility check, CSS source test. | High contrast follows `prefers-contrast` and `forced-colors`. |
 | Keyboard and screen reader | Skip link, landmarks, names, focus rings, tab and arrow keys, target size, live regions. | In-tree axe-style check over 9 states and 8 focus stops. | This is not a full axe-core or screen-reader run. |
-| Engine boundary | Fixed loopback operations, secret on descriptor 3, liveness on 4, parent-loss stop. | Node boundary and process tests, real engine demo smoke test. | None. |
-| Privileged start | Packaged app calls pkexec with the fixed helper and no other argument. The helper starts the fixed engine. | Fake helper transport test, real helper with a fake engine, package install. | The macOS helper protocol is different. The Linux helper runs the whole engine as root. |
+| Engine boundary | The app opens an unprivileged user engine at launch. Fixed loopback operations, secret on descriptor 3, liveness on 4, parent-loss stop. | Node boundary and process tests, real engine demo smoke test, Linux real-engine backend test on macOS. | Privileged shutdown and cleanup have open review findings. |
+| Privileged start | At Turn on the app calls pkexec with the fixed helper and no other argument. The helper starts the fixed root engine and passes the pairing handoff on descriptor 2. | Fake helper transport test, real helper with a fake engine, package install. | The macOS helper protocol is different. The Linux helper runs the whole engine as root. |
 | Package | One unsigned `.deb` with app, engine, helper, polkit action, desktop entry, and icon. | VM package build and install. | No signed package or update feed. |
-| Live tunnel | Engine start path exists. The app uses source device proxy mode. | Rust VM tunnel tests. | No live hotspot or source device test. Direct mode is not in the app. |
+| Live tunnel | Engine start path exists. The app offers Source device proxy and Direct modes and sends both through the helper at Turn on. | Rust CLI VM tunnel tests; Linux real-engine backend test on macOS. | No verified app-to-tunnel start on Linux and no live hotspot test. |
 
 ## Work plan
 
@@ -163,17 +259,54 @@ replace the release matrix.
   `onAvailable`, a live cellular IPv6 and ICMP test, real background behavior,
   a live cellular-path test, a real phone hotspot test, a rendered real prompt
   on a hotspot, and a background pairing lifecycle.
+- [ ] Harden Android hotspot discovery. Done so far: on Android 16 (API 36) or
+  later the app registers the public
+  `TetheringManager.registerTetheringEventCallback` callback once per process
+  with only `ACCESS_NETWORK_STATE`.
+  `TetheringInterface.getInterface()` names the current tethered interfaces.
+  `TetheringInterface.getType()` ranks them and filters out virtual, WiGig, and
+  unknown types. The finder treats a complete reading as positive evidence: an
+  empty set suppresses the name rules, a non-empty set admits only the named
+  interfaces, and a named interface that a reported network also holds fails
+  closed. A null, failed, or partial reading is unavailable, never empty, and
+  falls back to the name rules. A registered callback that has not delivered
+  its first reading is pending for a bounded wait, not immediately
+  unavailable, and the finder waits without using the name rules. After 3
+  seconds the reading is unavailable, and the watch policy counts a stuck
+  pending probe as uncertain after 4 consecutive probes, so a callback that
+  never fires cannot blind the watch.
+  The callback stays registered for the process and is shared by the pairing
+  listener and the proxy under one process lease. A service stop does not
+  unregister it, and a failed registration is retried. A test reset closes it,
+  and a stale event after close is ignored. The watch debounces a named set
+  that no longer contains the bound interface. A start that sees the pending
+  state waits on one controller task queue with the evidence bound, off the
+  caller thread and without the controller lock; a pending probe never binds an
+  interface, a second start is refused, and a late result after a stop binds
+  nothing. See `docs/ANDROID_HOTSPOT_START_PENDING.md`. Open: the callback has
+  JVM tests with a fake registration only.
+  Test it on real hotspots from several vendors. Android 15 and earlier have
+  no public API that names the tethering interface, so the name rules and the
+  `ConnectivityManager` observation stay an inference there. A vendor ROM can
+  report the access point as a network, hide the Wi-Fi client, or use a name
+  that the finder does not recognize. Bluetooth tethering is not detected on
+  Android 15 and earlier because `bt-pan*` is ambiguous. Binding a private
+  address does not prove that the interface is tethering.
 - [ ] Implement Windows relay, physical-interface pinning and audit, Wintun
   device and address lifecycle, IPv4 and IPv6 policies, route ownership,
   service boundary, automatic stop, and cleanup. Verify native APIs on Windows.
   Done so far: the source device proxy start path opens an explicit Wintun DLL,
   runs the portable relay on raw IP frames, pins outer sockets with TTL 65,
   installs the two IPv4 `/1` routes and the IPv6 `2000::/3` route with LUID and
-  GUID ownership proof, and removes them on every exit path. Hermetic tests use
-  a fake device and a fake route controller. Open: a live Windows hotspot test,
-  read-only route verification against live Windows APIs, full hotspot-loss
-  auto-stop, direct mode, a protected service boundary for the WinUI app, and
-  Windows device tests.
+  GUID ownership proof, and removes them on every exit path. The token gate
+  checks the physical adapter and default gateway before each token use and
+  about every 2 seconds during a run. The engine has pairing, cancel, forget,
+  probe, and pairing handoff. The WinUI 2 app reaches the real engine through a
+  full-trust broker and an elevated starter that runs only at Turn on. Hermetic
+  tests use a fake device and a fake route controller. Open: the first build and
+  run on Windows, a live Windows hotspot test, read-only route verification
+  against live Windows APIs, full hotspot-loss auto-stop, direct mode, a signed
+  installer, and Windows device tests.
 - [ ] Implement Linux relay integration, TUN and address lifecycle, interface
   binding and audit, DNS, owned routes, IPv6 block and forwarding, automatic
   stop, and cleanup. Done: direct mode and source device proxy mode start in the
@@ -183,13 +316,14 @@ replace the release matrix.
   the table dump and one fake FIB lookup per probe. The worker stops after 20
   seconds without the physical link. A disposable VM passed direct IPv4 flows
   with TTL 65, the block and forward starts, source-proxy TCP and IPv6 flows,
-  SIGTERM cleanup, and a SIGKILL run. The Electron app is wired to the real
-  engine, starts a packaged engine through a pkexec helper, and has a tray,
-  notifications, XDG launch at login, a separate Settings window, high contrast
-  themes, a package script, and an in-tree accessibility check. Open: a live
-  hotspot test, a polkit prompt on a real desktop, the tray and notification
-  paths on GNOME, KDE, and tiling window managers, direct mode in the app, and a
-  periodic route re-check after a privileged process changes table 700.
+  SIGTERM cleanup, and a SIGKILL run. The Electron app opens an unprivileged
+  user engine at launch. It starts a root engine through a pkexec helper only at
+  Turn on, and it has a tray, notifications, XDG launch at login, a separate
+  Settings window, high contrast themes, a package script, and an in-tree
+  accessibility check. Open: a live hotspot test, a polkit prompt on a real
+  desktop, the tray and notification paths on GNOME, KDE, and tiling window
+  managers, a real app-started direct tunnel, and a periodic route re-check
+  after a privileged process changes table 700.
 - [ ] Record genuine OS limits and obtain product direction for alternatives
   when a required source or target feature cannot be implemented as specified.
 - [ ] Close shared-control gaps: authenticated private transport, bounded
@@ -199,7 +333,8 @@ replace the release matrix.
 ### 3. Complete app and interaction parity
 
 - [ ] Connect each native UI to the real engine through a protected boundary.
-  Keep demos labeled and prevent demo data from appearing as real status.
+  Keep any development demo backend labeled and out of packaged apps, and
+  prevent test data from appearing as real status.
 - [ ] Translate the macOS target experience to WinUI 2 on Windows and Electron
   on Linux. Match features and behavior while using native controls and OS
   conventions. Resolve current layout defects at wide and narrow sizes.
@@ -208,8 +343,10 @@ replace the release matrix.
   Done: the Dashboard Start and Stop control starts and stops the real
   foreground service, the real state and connection counts show, the real
   Forget one, Forget all, and token rotation actions change the stores, the
-  notification permission flow is in place, and the preview mode is separate
-  and labeled. Open: a real phone and hotspot run, and background pairing.
+  notification permission flow is in place, and the app has no demo or preview
+  mode. The old preview-only recent-activity sheet and editable port are hidden
+  because they have no real implementation. Open: a real phone and hotspot run,
+  and background pairing.
 - [ ] Exercise all app states, errors, navigation, notifications, screen readers,
   keyboard and touch access, text scaling, theme, and reduced motion. Measure
   Electron memory and responsiveness on representative Linux desktops.
@@ -261,8 +398,62 @@ Production is complete only when all agreed roles and combinations work, the
 parity and safety gates pass, the maintainer approves required device tests and the
 release, and the documented behavior matches the tested artifacts.
 
-### Emulator evidence (development only)
+### Continuous integration evidence
 
+- 2026-11-05: all ten required jobs passed for commit `1a37ed7` in
+  [GitHub Actions run 42025303930](https://github.com/emiliauh/hotspot-shade/actions/runs/42025303930).
+  The release job was skipped because the run was not for a release tag. This
+  is hermetic build and test evidence for that commit only. It does not cover
+  later uncommitted changes, physical hotspots, real carriers, or a production
+  release. The desktop webview job used a shown window to check theme and
+  responsive layout after a hidden-window rendering failure on the runner.
+
+### Development evidence (emulators, VMs, and host harnesses)
+
+- 2026-11-06: the macOS signed candidate in
+  `build/mac-rc-20261106-delivery` was installed as root and opened as the
+  user. The app and its engine ran as the user with no helper, no root engine,
+  no administrator prompt, and no demo UI. The installed start right had a 30
+  second timeout. No tunnel start ran. The first live Turn on stopped before
+  the authorization prompt and left no route, blackhole, or root engine; the
+  fix is in progress.
+- 2026-11-06: iOS development evidence. A Debug app ran in the iPhone 18 Pro
+  iOS 27.2 Simulator with the loopback overrides. The real Rust client paired
+  after the matching code was approved and passed TCP, domain TCP, UDP, wrong
+  token, and refused destination checks with 0 TTL audit failures. The signed
+  Release 0.1.0 (1) candidate was installed on a physical iPhone, and its proxy
+  started on a real hotspot. No carrier or tunnel flow has run.
+- 2026-11-06: Linux host evidence. `cd linux && npm test` passed 337 of 341
+  tests with 0 failures and 4 skipped on macOS. The app now opens an
+  unprivileged user engine at launch and asks for pkexec only at Turn on. It has
+  not run on Linux.
+- 2026-11-06: Windows host evidence. The engine has pairing, cancel, forget,
+  probe, handoff, and the physical adapter and default gateway token gate. The
+  WinUI app reaches the real engine through the broker and the elevated starter.
+  Rust reported 1551 passes, and the Core and ServiceHost checks passed 244 and
+  281 checks on macOS. Nothing has been built or run on Windows.
+- 2026-11-06: Android removed preview mode along with the preview-only
+  recent-activity sheet and editable port. The JVM suite passed 899 tests and
+  lint reported 0 errors. Not tested on a real phone or hotspot.
+- 2026-11-05: the macOS Swift package ran 238 tests with a freshly built
+  demo engine supplied, with zero failures and zero skips. This exercises the
+  hidden demo test seam and helper mocks; it does not prove a signed helper,
+  privileged installation, or live tunnel operation.
+- 2026-11-05: a Windows Server 2025 host ran the Rust tests and Clippy on a
+  patch applied to commit `1a37ed738519af849bc0880755b3ba92bd9f92e1`.
+  The compressed patch SHA-256 was
+  `3e692cc40d2d5108b9c52977630f58028307ad2d0a084992abf2f20b4381ead5`.
+  Tests reported 624 passed, zero failed, and four ignored. Clippy passed with
+  warnings denied. This covers that snapshot only; later source changes and a
+  live Wintun tunnel were not tested by that run.
+- 2026-11-05: an isolated Linux container ran 34 GUI unit tests, including
+  slow request-body and unread-response deadlines. All passed. The container
+  used loopback only and did not create a tunnel or change host routes.
+- 2026-11-05: the later GUI deadline snapshot failed one native Windows test:
+  Windows loopback accepted the full 16 MiB test write even though the peer
+  did not read, so the test did not force the intended socket timeout. The
+  slow-body deadline test and Clippy passed. A deterministic Windows
+  backpressure test is still required before this snapshot can pass CI.
 - 2026-11-04: the iOS source app (Debug simulator build, no signing) installed
   and launched on the iPhone 17 simulator (iOS 27.2). The Dashboard, Off
   state, waiting-for-target text, and tab bar rendered. The simulator has no
@@ -280,6 +471,22 @@ release, and the documented behavior matches the tested artifacts.
   not tested. The interface list matched the baseline after cleanup. The
   mimicked interface cannot be used while a real phone holds `172.20.10.0/28`.
   This is development evidence, not a release-matrix result.
+- 2026-11-05: iOS source proxy host flow harness. The Debug iOS Simulator app
+  built. A Debug-only loopback pair (`lo0` / `127.0.0.1`) and
+  `debug.mockCellularPath` let the same proxy sources use the host path for a
+  loopback test destination. `scripts/ios_source_proxy_flow_test.sh` compiled
+  the real `ProxyServer` on the host. The real Rust target client paired,
+  completed a 64 KiB TCP echo, rejected a wrong token, and received a refusal
+  for a closed loopback port. The audit counted 5 outer sockets and 0 TTL
+  failures. With four silent pairing sockets held, the listener admitted the
+  real pairing check by evicting an idle socket; a silent socket closed after
+  10.2 to 10.7 seconds. The pairing listener no longer closes a live prompt at
+  130 seconds: after a complete frame the responder deadline governs, including
+  the 120 second inactive extension. The token check is constant-time. The
+  Simulator UI run was blocked because another device session owned the
+  simulator (`DEVICE_IN_USE`); the override compiled but the Simulator app
+  network path, carrier, and hotspot were not exercised in this run. This is
+  development evidence, not a release-matrix result.
 - 2026-11-05: a disposable Linux VM
   ran `./gradlew testDebugUnitTest lintDebug assembleDebug
   assembleDebugAndroidTest`: 173 JVM tests passed, lint reported 0 errors and
@@ -324,17 +531,45 @@ release, and the documented behavior matches the tested artifacts.
   The runner still crashed at teardown after the result. The emulator has no
   cellular IPv6 route, so the IPv6 case used the loopback. This is development
   evidence, not a release-matrix result.
+- 2026-11-05: the Android hotspot finder gained the Android 16 (API 36)
+  tethering evidence source. `TetheringManager.registerTetheringEventCallback`
+  names the tethered interfaces with only `ACCESS_NETWORK_STATE`. A complete
+  reading is positive evidence: an empty set is authoritative, a non-empty set
+  admits only the named interfaces, and a named interface that a reported
+  network also holds fails closed. The platform type ranks and filters the
+  names. Virtual, WiGig, and unknown types are rejected. A registered callback
+  that has not delivered its first reading is pending, never unavailable. A
+  null, failed, or partial reading is unavailable, never empty, and falls back
+  to the name rules. The callback is process scoped, stays registered across a
+  service stop, and a stale event after close is ignored. The watch treats a
+  set that no longer names the bound interface as an uncertain probe. A macOS
+  host run of the current tree passed
+  473 JVM tests with 0 failures on JDK 17 and Android SDK 36. The tests use a
+  fake registration and fake interfaces. They do not load `TetheringManager`,
+  run on a device, create a hotspot, or prove OEM behavior. No route,
+  interface, or device changed in this run. This is development evidence, not a
+  release-matrix result.
 
-### Windows host test (open limit)
+### Windows host test (not run on Windows)
 
 The Windows source device proxy start path compiles for
 `x86_64-pc-windows-msvc` and `i686-pc-windows-msvc` (check and clippy). The
-hermetic start, stop, cleanup, and missing-DLL tests pass on the macOS host.
-They have not run on a Windows host. The current tree still needs a Windows host
-run. A live Windows tunnel test still needs a decision about route changes on
-that host, because a captured default route cuts the remote test link. Until
-then, the commands in `scripts/windows_relay_test.md` are untested on Windows,
-and no live Windows hotspot test exists.
+hermetic start, stop, cleanup, gate, pairing, and missing-DLL tests pass on the
+macOS host. They have not run on a Windows host. The current tree still needs a
+Windows host run. A live Windows tunnel test also needs a decision about route
+changes on that host, because a captured default route cuts the remote test
+link. Until then, the commands in `scripts/windows_relay_test.md` are untested
+on Windows, and no live Windows hotspot test exists.
+
+The token gate keeps source-device token use behind the physical adapter and
+default gateway check. Before each use it retains and rechecks the physical
+adapter identity and checks the route to the source address. Adapter and
+gateway checks narrow misconfiguration and stale-identity risks but do not
+authenticate the source device. Proxy v1 sends a reusable token in cleartext. A
+source-authenticated protocol or an explicit v1 threat-model and compatibility
+decision remains open. The authenticated transport design is unapproved.
+Neither a Windows compile nor a VM result establishes physical hotspot or
+carrier behavior.
 
 
 ## Linux routing review findings
@@ -369,12 +604,20 @@ Open:
 
 Evidence: on 2026-11-05 a disposable Linux VM
 passed `cargo test --locked` (733 library tests and every integration test), the
-ignored `linux_tunnel_vm` suite (10 tests, serial), clippy, and formatting. The
+ignored `linux_tunnel_vm` suite (10 reported passes, including two no-op helper
+entry points and eight tunnel scenarios, serial), clippy, and formatting. The
 tunnel suite covered a direct IPv4 flow with TTL 65 and a pinned outer socket, a
 verified IPv6 block, an explicit IPv6 forward start, a 20-second link-loss stop,
 source-proxy TCP and IPv6 flows, SIGTERM cleanup, and a SIGKILL run. The same VM
 left no `hs-tun`, `hs-host0`, `hs-src0`, network namespace, policy rule at
 priority 17000 or 17001, or route in table 700.
+
+The recorded run selected a hashed tunnel test executable by sorting filenames
+in a reused Cargo target directory. If more than one matching executable was
+present, this does not establish that the selected binary came from the reviewed
+source archive. Re-run the scenarios with a fresh target directory or a binary
+identified from Cargo's current build output before using them as release
+evidence. The record above does not establish that multiple binaries existed.
 
 ## Evidence log, 2026-11-05
 
@@ -382,8 +625,8 @@ priority 17000 or 17001, or route in table 700.
 - A Windows Server 2025 test host: `cargo test --locked --tests` passed 555 tests with 0 failures and 4 ignored. This includes the Windows identity store with its ancestor ACL check, the Winsock readiness tests, and the relay end-to-end test on loopback. WinUI 2 state model: 44 checks passed. A live Windows tunnel test needs a decision on route changes on the test host, because a captured default route cuts the remote test link.
 - 2026-11-05: Windows source device proxy start path implemented. `service.rs` starts Wintun from an explicit `wintun.dll` path, runs the portable relay on raw IP frames, and installs the IPv4 `/1` routes and the IPv6 `2000::/3` route through `windows_native_routes.rs` with LUID and GUID ownership proof. `cargo check` and `clippy -D warnings` pass for `x86_64-pc-windows-msvc` and `i686-pc-windows-msvc` from a macOS host. A host `cargo test` passes 598 unit tests and the integration tests, including 7 hermetic Windows start tests with a fake device and a fake route controller. Native Windows tests and a live hotspot test are still open. The DLL is not bundled.
 - Windows identity fix: the volume root keeps removal and permission checks but no longer rejects create-file and attribute rights, because the root cannot be removed, renamed, or redirected. Lower ancestors keep the strict set.
-- Android: pairing responder, hotspot-only listener on port 18090, token storage, real Start and Stop, Forget, and Rotate. The source proxy serves TCP and UDP, IPv6 CONNECT and UDP destinations, the private ICMP echo commands, and the phase-aware capacity from the iOS app. 217 JVM tests pass. Rust interop with the real target client passed a 64 KiB TCP echo, an ICMP echo, and an IPv6 destination on the emulator. Not tested on a real phone or hotspot.
+- Android: pairing responder, hotspot-only listener on port 18090, token storage, real Start and Stop, Forget, and Rotate. The source proxy serves TCP and UDP, IPv6 CONNECT and UDP destinations, the private ICMP echo commands, and the phase-aware capacity from the iOS app. The hotspot finder reads the Android 16 tethering callback as positive evidence and falls back to the name rules when the reading is unavailable; it waits when the first reading is pending with the controller bound. A 553-test JVM run passed on the pairing-repair snapshot; later follow-ups need a new run. Rust interop with the real target client passed a 64 KiB TCP echo, an ICMP echo, and an IPv6 destination on an earlier emulator snapshot. The tethering callback is not device-tested. Not tested on a real phone or hotspot.
 - 2026-11-05: Linux target app parity. A disposable VM (Ubuntu 24.04 x86_64, Node 26.13.0, Electron 45.2.3) ran `npm test` (127 tests, 0 failed), `xvfb-run -a npm run test:smoke`, `npm run test:settings-window`, and `npm run test:a11y` (9 states and 8 keyboard focus stops, 0 violations). The real engine demo smoke test passed 40 checks. The real app entry point test passed 10 checks and left no engine child or temporary directory. `ARCH=x64 npm run package:deb` wrote an unsigned `.deb`; `dpkg -i` installed it after the VM added `xdg-utils` and `pkexec`; the packaged app started its engine in demo mode. The packaged app default path called pkexec and showed the plain authorization error in the headless session. The real pkexec helper ran as root with the test account id against a fake engine at the packaged path, returned one port, served `GET /api/status` with HTTP 200 and the descriptor secret, refused one argument, and exited 0 when stdin closed. The VM measured 585.4 MiB RSS and 273.5 MiB PSS at idle, and 623.5 MiB RSS and 295.2 MiB PSS in the active demo state. The polkit prompt, tray item, notifications, and launch at login were not tested on a real desktop session. No route or TUN device changed.
-- Linux direct mode: `service.rs` and `platform_linux.rs` now start direct mode with no source device. The start gate verifies the IPv4 `/1` routes and the IPv6 policy. Block mode installs and verifies the `2000::/3` blackhole in table 700. The worker stops after 20 seconds without the physical link. In a disposable Linux VM, `cargo test --locked` passed 733 library tests and all integration tests, the serial ignored suite passed 10 tunnel tests, and clippy and formatting passed. The new tests covered a direct IPv4 flow behind a veth/netns echo server, the block and forward starts, and the link-loss stop. Cleanup left no link, namespace, rule, route, or TUN device. A live hotspot test is still open.
+- Linux direct mode: `service.rs` and `platform_linux.rs` now start direct mode with no source device. The start gate verifies the IPv4 `/1` routes and the IPv6 policy. Block mode installs and verifies the `2000::/3` blackhole in table 700. The worker stops after 20 seconds without the physical link. In a disposable Linux VM, `cargo test --locked` passed 733 library tests and all integration tests; the serial ignored suite reported 10 passes, including two no-op helper entry points and eight tunnel scenarios; and clippy and formatting passed. The new tests covered a direct IPv4 flow behind a veth/netns echo server, the block and forward starts, and the link-loss stop. Cleanup left no link, namespace, rule, route, or TUN device. A live hotspot test is still open.
 - Windows tunnel start path (source device proxy mode) is implemented behind trait seams with a mock Wintun device and fake route controller. Windows keepalive (SIO_KEEPALIVE_VALS, fixed 10 probes) is in. Native Windows run at commit 94fbee1: library 551 passed, 0 failed, all other targets ok, 4 ignored. A native run found a real FFI bug (CreateWellKnownSid missing its size argument, access violation); fixed. No Wintun adapter or route has been created. A live Windows tunnel test still needs a decision on route changes on the test host.
 - macOS unsigned app build (scripts/build_mac_app.sh) succeeded after these changes.

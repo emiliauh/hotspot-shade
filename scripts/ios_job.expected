@@ -1,0 +1,20 @@
+    name: iOS tests, simulator build, unsigned IPA
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Logic tests (fake links and clocks, no sockets)
+        run: scripts/swift_tests.sh
+      - name: Simulator build
+        run: >
+          xcodebuild -project ios/HotspotProxy.xcodeproj -scheme HotspotProxy
+          -configuration Debug -sdk iphonesimulator
+          -destination 'generic/platform=iOS Simulator'
+          CODE_SIGNING_ALLOWED=NO build
+      - name: Build unsigned IPA
+        run: scripts/build_ipa.sh build/HotspotShade-iOS-unsigned.ipa
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: HotspotShade-iOS-unsigned-ipa
+          path: build/HotspotShade-iOS-unsigned.ipa
+          retention-days: 14

@@ -9,11 +9,14 @@ use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream, UdpSocket};
+#[cfg(test)]
+use std::net::UdpSocket;
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use zeroize::{Zeroize, Zeroizing};
 
 const QUEUE: usize = 4096;
 // Keep a bounded number of slots for TCP close and reset packets.
@@ -182,6 +185,10 @@ pub struct RelayStats {
     pub bytes_out: u64,
     pub tcp_flows: u64,
     pub tcp_flows_closed: u64,
+    /// Live target relay TCP flow table entries. This counts current flows of
+    /// this relay only: it holds a flow while its setup is still running,
+    /// excludes UDP and ICMP, and holds no count from another device.
+    pub tcp_flows_active: u64,
     pub udp_flows_closed: u64,
     pub udp_datagrams_in: u64,
     pub udp_datagrams_out: u64,
@@ -241,8 +248,35 @@ pub struct RelayStats {
     pub tcp_window_limited_us: u64,
     pub tcp_upload_buffer_peak_bytes: u64,
     pub tcp_download_buffer_peak_bytes: u64,
+    /// Destination-privacy counters. Every value is zero while only the `off`
+    /// mode is supported.
+    pub destination_privacy: DestinationPrivacyStats,
     pub input_queues: Vec<QueueStats>,
     pub output_queue: QueueStats,
+}
+
+/// Destination-privacy counters.
+///
+/// The keys are the stable contract shared with
+/// `diagnostics::zero_destination_privacy_counters()`. A counter is an event
+/// count only: it never holds a name, an address, a certificate, or an ECH
+/// config. No code path increments one today, because no mode other than `off`
+/// exists. The wiring for a mode increments these counters and nothing else.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct DestinationPrivacyStats {
+    pub flows: u64,
+    pub shaped_flows: u64,
+    pub shaped_errors: u64,
+    pub ech_attempts: u64,
+    pub ech_ok: u64,
+    pub ech_grease: u64,
+    pub ech_rejected: u64,
+    pub ech_fallback: u64,
+    pub doh_lookups: u64,
+    pub doh_ok: u64,
+    pub doh_failed: u64,
+    pub cover_flows: u64,
+    pub cover_errors: u64,
 }
 
 /// Queue occupancy and longest observed dequeue delay, in microseconds.
@@ -390,6 +424,19 @@ struct Counters {
     dns_ms: diagnostics::Reservoir,
     udp_flows: AtomicU64,
     udp_age_drops: AtomicU64,
+    privacy_flows: AtomicU64,
+    privacy_shaped_flows: AtomicU64,
+    privacy_shaped_errors: AtomicU64,
+    privacy_ech_attempts: AtomicU64,
+    privacy_ech_ok: AtomicU64,
+    privacy_ech_grease: AtomicU64,
+    privacy_ech_rejected: AtomicU64,
+    privacy_ech_fallback: AtomicU64,
+    privacy_doh_lookups: AtomicU64,
+    privacy_doh_ok: AtomicU64,
+    privacy_doh_failed: AtomicU64,
+    privacy_cover_flows: AtomicU64,
+    privacy_cover_errors: AtomicU64,
     timeline: diagnostics::EventTimeline,
 }
 fn inc(v: &AtomicU64) {
@@ -730,11 +777,8 @@ impl Relay {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "the source device interface must match the hotspot, and source device proxy mode does not accept a DNS upstream"));
             }
         }
-        if config.dns_upstream.map(|a| a.port() == 0).unwrap_or(false) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "DNS upstream port must be nonzero",
-            ));
+        if let Some(upstream) = config.dns_upstream {
+            crate::dns::validate_upstream(upstream)?;
         }
         let counters = Arc::new(Counters::default());
         let audit = Arc::new(normalization::Audit::default());
@@ -970,6 +1014,7 @@ impl Relay {
             bytes_out: value(&c.bytes_out),
             tcp_flows: value(&c.tcp_flows),
             tcp_flows_closed: value(&c.tcp_flows_closed),
+            tcp_flows_active: value_usize(&c.tcp_flows_active),
             udp_flows_closed: value(&c.udp_flows_closed),
             udp_datagrams_in: value(&c.udp_datagrams_in),
             udp_datagrams_out: value(&c.udp_datagrams_out),
@@ -1023,6 +1068,21 @@ impl Relay {
             tcp_window_limited_us: value(&c.tcp_window_limited_us),
             tcp_upload_buffer_peak_bytes: value(&c.tcp_upload_buffer_peak_bytes),
             tcp_download_buffer_peak_bytes: value(&c.tcp_download_buffer_peak_bytes),
+            destination_privacy: DestinationPrivacyStats {
+                flows: value(&c.privacy_flows),
+                shaped_flows: value(&c.privacy_shaped_flows),
+                shaped_errors: value(&c.privacy_shaped_errors),
+                ech_attempts: value(&c.privacy_ech_attempts),
+                ech_ok: value(&c.privacy_ech_ok),
+                ech_grease: value(&c.privacy_ech_grease),
+                ech_rejected: value(&c.privacy_ech_rejected),
+                ech_fallback: value(&c.privacy_ech_fallback),
+                doh_lookups: value(&c.privacy_doh_lookups),
+                doh_ok: value(&c.privacy_doh_ok),
+                doh_failed: value(&c.privacy_doh_failed),
+                cover_flows: value(&c.privacy_cover_flows),
+                cover_errors: value(&c.privacy_cover_errors),
+            },
             input_queues: self.input_metrics.iter().map(|m| m.snapshot()).collect(),
             output_queue: self.output.metrics.snapshot(),
         }
@@ -1040,6 +1100,26 @@ impl Relay {
             })
             .collect::<Vec<_>>();
         let output = self.output.metrics.snapshot();
+        // The mode is a service setting, so the shared section provides the
+        // mode name and the relay supplies only its counters. Every counter is
+        // zero until a mode other than `off` exists.
+        let privacy = self.stats().destination_privacy;
+        let mut destination_privacy = diagnostics::destination_privacy();
+        destination_privacy["counters"] = json!({
+            "flows": privacy.flows,
+            "shaped_flows": privacy.shaped_flows,
+            "shaped_errors": privacy.shaped_errors,
+            "ech_attempts": privacy.ech_attempts,
+            "ech_ok": privacy.ech_ok,
+            "ech_grease": privacy.ech_grease,
+            "ech_rejected": privacy.ech_rejected,
+            "ech_fallback": privacy.ech_fallback,
+            "doh_lookups": privacy.doh_lookups,
+            "doh_ok": privacy.doh_ok,
+            "doh_failed": privacy.doh_failed,
+            "cover_flows": privacy.cover_flows,
+            "cover_errors": privacy.cover_errors,
+        });
         let established = c
             .timeline
             .snapshot(Instant::now())
@@ -1081,12 +1161,14 @@ impl Relay {
                 "evicted": value(&c.udp_flows_evicted),
             },
             "tcp": {
+                "flows_active": value_usize(&c.tcp_flows_active),
                 "flows_peak": value_usize(&c.tcp_flows_peak),
                 "retransmits": value(&c.tcp_retransmits),
                 "resets_lost": value(&c.tcp_resets_lost),
                 "zero_window_ms": value(&c.tcp_window_limited_us) / 1000,
                 "capacity_refused": value(&c.tcp_capacity_refused),
             },
+            "destination_privacy": destination_privacy,
             "established": {
                 "bucket_s": diagnostics::ESTABLISHED_BUCKET_SECONDS,
                 "window_s": diagnostics::ESTABLISHED_WINDOW,
@@ -1134,7 +1216,7 @@ struct Setup {
     stage: SetupStage,
     deadline: Instant,
     phone: bool,
-    auth: Vec<u8>,
+    auth: Zeroizing<Vec<u8>>,
     request: Vec<u8>,
     read: Vec<u8>,
     sent: usize,
@@ -1188,7 +1270,7 @@ impl Setup {
             stage: SetupStage::Connect,
             deadline: Instant::now() + CONNECT_TIMEOUT,
             phone: false,
-            auth: Vec::new(),
+            auth: Zeroizing::new(Vec::new()),
             request: Vec::new(),
             read: Vec::new(),
             sent: 0,
@@ -1219,13 +1301,13 @@ impl Setup {
                 "invalid phone credentials, target, or timeout",
             ));
         }
-        let mut auth = Vec::with_capacity(3 + user.len() + pass.len());
+        let mut auth = Zeroizing::new(Vec::with_capacity(3 + user.len() + pass.len()));
         auth.extend_from_slice(&[1, user.len() as u8]);
         auth.extend_from_slice(user);
         auth.push(pass.len() as u8);
         auth.extend_from_slice(pass);
         let mut request = vec![5, command, 0];
-        match target {
+        match crate::dns::canonical_ip(target) {
             IpAddr::V4(ip) => {
                 request.push(1);
                 request.extend_from_slice(&ip.octets());
@@ -1335,6 +1417,9 @@ impl Setup {
                             return Ok(false)
                         }
                         Err(e) => return Err(e),
+                    }
+                    if self.stage == SetupStage::SendAuth {
+                        self.auth.zeroize();
                     }
                     self.sent = 0;
                     self.read.clear();
@@ -1463,12 +1548,112 @@ struct TcpEntry {
     /// True after the flow reached the established state. The timeline counts
     /// only established teardowns. Setup failures keep their own counters.
     was_established: bool,
+    /// Keeps the live flow gauge equal to the number of `TcpEntry` values.
+    /// The guard is declared last, so it lowers the gauge after the entry and
+    /// its outer socket are gone. The leading underscore marks the field as
+    /// held only for its `Drop` effect; no code reads it.
+    _gauge: TcpFlowGauge,
 }
+/// One live target relay TCP flow, counted from creation until drop. A normal
+/// teardown, a failed setup that already reached the flow table, a worker stop,
+/// and an unwind all drop the entry, so the gauge cannot leak a stale count or
+/// subtract the same flow twice.
+struct TcpFlowGauge {
+    counters: Arc<Counters>,
+}
+impl TcpFlowGauge {
+    fn new(counters: &Arc<Counters>) -> Self {
+        let active = counters.tcp_flows_active.fetch_add(1, Ordering::AcqRel) + 1;
+        counters.tcp_flows_peak.fetch_max(active, Ordering::AcqRel);
+        Self {
+            counters: Arc::clone(counters),
+        }
+    }
+}
+impl Drop for TcpFlowGauge {
+    fn drop(&mut self) {
+        self.counters
+            .tcp_flows_active
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+/// Close the outer socket. An abortive teardown resets it, so a destination
+/// that reads until end of stream cannot take a truncated upload for a
+/// complete one. A graceful close, or one whose upload direction already ended
+/// with a FIN, keeps the normal close.
+fn close_outer(entry: &TcpEntry) {
+    if entry.engine.outer_abortive_close() {
+        reset_outer_socket(&entry.stream);
+    }
+}
+/// Set `SO_LINGER` to zero so that close sends a reset. The call is best
+/// effort: a failure leaves the normal FIN close in place.
+#[cfg(unix)]
+fn reset_outer_socket(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    // SAFETY: the descriptor belongs to `stream`, and the option value is a
+    // `libc::linger` with the size that the call reports.
+    unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            (&linger as *const libc::linger).cast(),
+            std::mem::size_of_val(&linger) as libc::socklen_t,
+        );
+    }
+}
+/// Set `SO_LINGER` to zero so that close sends a reset. Windows treats a zero
+/// linger as an abortive close, the same as the POSIX behavior.
+#[cfg(windows)]
+fn reset_outer_socket(stream: &TcpStream) {
+    use std::os::windows::io::{AsRawSocket, RawSocket};
+    const SOL_SOCKET: i32 = 0xffff;
+    const SO_LINGER: i32 = 0x0080;
+    /// The Winsock `linger` structure. Both fields are 16 bits.
+    #[repr(C)]
+    struct Linger {
+        onoff: u16,
+        linger: u16,
+    }
+    #[link(name = "ws2_32")]
+    extern "system" {
+        #[allow(clashing_extern_declarations)]
+        fn setsockopt(
+            socket: RawSocket,
+            level: i32,
+            option: i32,
+            value: *const u8,
+            length: i32,
+        ) -> i32;
+    }
+    let linger = Linger {
+        onoff: 1,
+        linger: 0,
+    };
+    // SAFETY: the socket belongs to `stream`, and the option value points to
+    // a `Linger` with the size that the call reports.
+    unsafe {
+        setsockopt(
+            stream.as_raw_socket(),
+            SOL_SOCKET,
+            SO_LINGER,
+            (&linger as *const Linger).cast(),
+            std::mem::size_of_val(&linger) as i32,
+        );
+    }
+}
+#[cfg(not(any(unix, windows)))]
+fn reset_outer_socket(_stream: &TcpStream) {}
 // The flow table stores this enum for every UDP flow. Boxing the setup state
 // would add an allocation and a pointer chase for every setup packet.
 #[allow(clippy::large_enum_variant)]
 enum UdpSocketKind {
-    Direct(UdpSocket),
+    Direct(normalization::NormalizedUdpSocket),
     Phone {
         stream: TcpStream,
         incoming: Vec<u8>,
@@ -1812,7 +1997,7 @@ impl Worker {
             }
             for entry in self.udp.values() {
                 let (handle, events) = match &entry.socket {
-                    UdpSocketKind::Direct(s) => (relay_poll::handle(s), Interest::READABLE),
+                    UdpSocketKind::Direct(s) => (s.raw_handle(), Interest::READABLE),
                     UdpSocketKind::Phone {
                         stream,
                         outgoing,
@@ -1987,8 +2172,11 @@ impl Worker {
             self.closed_tcp.remove(&key);
             return;
         }
-        if seg.flags & (packet::SYN | packet::RST | packet::FIN | packet::ACK)
-            != (packet::FIN | packet::ACK)
+        // A retransmitted FIN can repeat the original PSH, ECE, CWR, or URG
+        // flags. Only SYN and RST make it a different segment. The ACK flag
+        // and the final sequence number identify the duplicate FIN.
+        if seg.flags & (packet::FIN | packet::ACK) != (packet::FIN | packet::ACK)
+            || seg.flags & (packet::SYN | packet::RST) != 0
             || seg.seq.wrapping_add(seg.data.len() as u32).wrapping_add(1) != closed.ack
         {
             return;
@@ -2070,8 +2258,16 @@ impl Worker {
                 Some(s) => s,
                 None => return,
             };
+            // A bare SYN on an occupied 4-tuple gets a challenge ACK from the
+            // endpoint, not a replacement. The tunnel can carry forwarded as
+            // well as local traffic, so a forged SYN must not close a live
+            // flow without a sequence number. A local client in SYN-SENT
+            // answers the challenge with a reset at the next expected byte,
+            // and its SYN retransmit then creates a new flow.
             if !self.tcp.contains_key(&key) {
-                if seg.flags & packet::SYN == 0 || seg.flags & packet::ACK != 0 {
+                if seg.flags & packet::SYN == 0
+                    || seg.flags & (packet::ACK | packet::RST | packet::FIN) != 0
+                {
                     self.acknowledge_closed_fin(key, &seg, Instant::now());
                     return;
                 }
@@ -2094,7 +2290,7 @@ impl Worker {
                             .map(|stream| (stream, setup))
                     }),
                     None => direct_tcp_start(
-                        SocketAddr::new(key.dst, key.dport),
+                        SocketAddr::new(crate::dns::canonical_ip(key.dst), key.dport),
                         self.config.iface,
                         &self.audit,
                     )
@@ -2121,14 +2317,6 @@ impl Worker {
                             engine.start();
                         }
                         inc(&self.counters.tcp_flows);
-                        let active = self
-                            .counters
-                            .tcp_flows_active
-                            .fetch_add(1, Ordering::AcqRel)
-                            + 1;
-                        self.counters
-                            .tcp_flows_peak
-                            .fetch_max(active, Ordering::AcqRel);
                         self.emit(key, &mut engine, Some(&stream));
                         self.tcp.insert(
                             key,
@@ -2137,6 +2325,7 @@ impl Worker {
                                 stream,
                                 setup: Some(setup),
                                 was_established: false,
+                                _gauge: TcpFlowGauge::new(&self.counters),
                             },
                         );
                     }
@@ -2170,12 +2359,12 @@ impl Worker {
                 if entry.engine.state != tcp::State::Closed {
                     self.tcp.insert(key, entry);
                 } else {
+                    close_outer(&entry);
                     self.remember_tcp_close(key, &entry.engine, now);
                     self.note_tcp_teardown(&entry, now);
                     inc(&self.counters.tcp_flows_closed);
-                    self.counters
-                        .tcp_flows_active
-                        .fetch_sub(1, Ordering::AcqRel);
+                    // `entry` drops at the end of this block and its gauge
+                    // lowers the live flow count exactly once.
                 }
             }
         } else if key.proto == packet::PROTO_UDP {
@@ -2481,8 +2670,9 @@ impl Worker {
                     .dns_upstream
                     .unwrap_or(SocketAddr::new(key.dst, key.dport))
             } else {
-                SocketAddr::new(key.dst, key.dport)
+                SocketAddr::new(crate::dns::canonical_ip(key.dst), key.dport)
             };
+            let dest = SocketAddr::new(crate::dns::canonical_ip(dest.ip()), dest.port());
             let sock = normalization::udp_socket(dest.ip(), self.config.iface, &self.audit)?;
             sock.connect(dest)?;
             sock.set_nonblocking(true)?;
@@ -2739,6 +2929,12 @@ impl Worker {
     }
     fn pump(&mut self) {
         let now = Instant::now();
+        // A close record answers a retransmitted FIN for a bounded time. Drop
+        // the expired records even when no new flow closes, so the table does
+        // not hold tuple state for an idle worker.
+        self.closed_tcp.retain(|_, entry| {
+            now.saturating_duration_since(entry.closed_at) < CLOSED_TCP_LIFETIME
+        });
         self.retry_resets(now);
         self.pump_icmp_sessions(now);
         for mut entry in std::mem::take(&mut self.icmp) {
@@ -2951,12 +3147,12 @@ impl Worker {
             if entry.engine.state != tcp::State::Closed {
                 self.tcp.insert(key, entry);
             } else {
+                close_outer(&entry);
                 self.remember_tcp_close(key, &entry.engine, now);
                 self.note_tcp_teardown(&entry, now);
                 inc(&self.counters.tcp_flows_closed);
-                self.counters
-                    .tcp_flows_active
-                    .fetch_sub(1, Ordering::AcqRel);
+                // `entry` drops at the end of this block and its gauge lowers
+                // the live flow count exactly once.
             }
         }
         // Record one observation for the whole worker. The old per-packet
@@ -3212,6 +3408,26 @@ fn random_isn() -> io::Result<u32> {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[test]
+    fn phone_setup_clears_authentication_after_send() {
+        let (mut client, mut peer) = tcp_pair();
+        let phone = phone::PhoneProxy {
+            address: "127.0.0.1:9".parse().unwrap(),
+            username: "u".into(),
+            token: "pw".into(),
+            iface: None,
+            timeout: Duration::from_secs(5),
+        };
+        let mut setup = Setup::phone(&phone, Ipv4Addr::LOCALHOST.into(), 443, 1).unwrap();
+        setup.stage = SetupStage::SendAuth;
+        assert!(!setup.advance(&mut client).unwrap());
+        let mut frame = [0u8; 6];
+        peer.read_exact(&mut frame).unwrap();
+        assert_eq!(frame, [1, 1, b'u', 2, b'p', b'w']);
+        assert!(setup.auth.is_empty());
+        assert!(matches!(setup.stage, SetupStage::ReadAuth));
+    }
 
     /// The local access-denied values that map to `PermissionDenied`.
     #[cfg(unix)]
@@ -3767,6 +3983,48 @@ mod tests {
         );
     }
     #[test]
+    fn destination_privacy_diagnostics_are_zero_and_name_no_host() {
+        // No interface, no source device, and no flow: this test only reads
+        // the counter shape. It creates no route and opens no destination
+        // socket.
+        let mut relay = Relay::start(RelayConfig {
+            allow_unpinned: true,
+            workers: 1,
+            ..RelayConfig::default()
+        })
+        .unwrap();
+        let stats = relay.stats().destination_privacy;
+        let counters = [
+            stats.flows,
+            stats.shaped_flows,
+            stats.shaped_errors,
+            stats.ech_attempts,
+            stats.ech_ok,
+            stats.ech_grease,
+            stats.ech_rejected,
+            stats.ech_fallback,
+            stats.doh_lookups,
+            stats.doh_ok,
+            stats.doh_failed,
+            stats.cover_flows,
+            stats.cover_errors,
+        ];
+        assert_eq!(counters, [0u64; 13]);
+        // The relay reports the shared section with its own counters, so the
+        // mode name and the counter keys cannot drift from `empty()`.
+        let diag = relay.diagnostics();
+        let section = &diag["destination_privacy"];
+        assert_eq!(section, &diagnostics::destination_privacy());
+        assert_eq!(section["mode"], "off");
+        let counters = section["counters"].as_object().unwrap();
+        assert_eq!(counters.len(), 13);
+        assert!(counters.values().all(|count| count.as_u64() == Some(0)));
+        let text = section.to_string();
+        assert!(!text.contains("token"));
+        assert!(!text.contains("127.0.0.1"));
+        relay.stop();
+    }
+    #[test]
     fn inner_connect_deadline_keeps_the_timeout_without_claiming_a_destination_timeout() {
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3808,6 +4066,7 @@ mod tests {
                 stream,
                 setup: Some(setup),
                 was_established: false,
+                _gauge: TcpFlowGauge::new(&counters),
             },
         );
         worker.pump();
@@ -4022,7 +4281,146 @@ mod tests {
         let seg = packet::parse_tcp(ip.payload).unwrap();
         assert_eq!(seg.flags, packet::RST | packet::ACK);
         assert!(relay.recv_timeout(Duration::from_millis(100)).is_err());
+        // A setup that never opened an outer socket holds no live flow, so the
+        // gauge stays at zero and the peak stays at zero too.
+        let stats = relay.stats();
+        assert_eq!(stats.tcp_flows, 0);
+        assert_eq!(stats.tcp_flows_active, 0);
+        let diagnostics = relay.diagnostics();
+        assert_eq!(diagnostics["tcp"]["flows_active"], 0);
+        assert_eq!(diagnostics["tcp"]["flows_peak"], 0);
         relay.stop();
+    }
+
+    /// Dispatch one inner TCP segment from the fixed inner client.
+    fn inner_tcp(relay: &Relay, sport: u16, dport: u16, seq: u32, ack: u32, flags: u8) {
+        relay
+            .dispatch(
+                packet::build_tcp(&packet::TcpBuild {
+                    src: Ipv4Addr::new(198, 18, 0, 2),
+                    dst: Ipv4Addr::LOCALHOST,
+                    sport,
+                    dport,
+                    seq,
+                    ack,
+                    flags,
+                    window: 65535,
+                    payload: &[],
+                    options: &[],
+                    ttl: 64,
+                    ident: 0,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    /// Wait for the relay stats to satisfy `ready`, and fail at a deadline.
+    fn wait_for_stats(relay: &Relay, ready: impl Fn(&RelayStats) -> bool) -> RelayStats {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let stats = relay.stats();
+            if ready(&stats) {
+                return stats;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "relay stats did not reach the expected state: active {}, closed {}",
+                stats.tcp_flows_active,
+                stats.tcp_flows_closed
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn target_tcp_flow_gauge_tracks_live_flows_and_decrements_on_close() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let mut held = Vec::new();
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().unwrap();
+                held.push(stream);
+            }
+            // Hold the outer sockets open until the test has closed the flows.
+            let _ = stop_rx.recv_timeout(Duration::from_secs(20));
+            drop(held);
+        });
+        let mut relay = Relay::start(RelayConfig {
+            allow_unpinned: true,
+            workers: 1,
+            ..RelayConfig::default()
+        })
+        .unwrap();
+        assert_eq!(relay.stats().tcp_flows_active, 0);
+        let mut flows = Vec::new();
+        for sport in [6101u16, 6102, 6103] {
+            inner_tcp(&relay, sport, port, 100, 0, packet::SYN);
+            let raw = relay.recv_timeout(Duration::from_secs(3)).unwrap();
+            let ip = packet::parse_ip(&raw).unwrap();
+            let seg = packet::parse_tcp(ip.payload).unwrap();
+            assert_eq!(seg.flags, packet::SYN | packet::ACK);
+            assert_eq!(seg.dport, sport);
+            assert_eq!(seg.ack, 101);
+            inner_tcp(
+                &relay,
+                sport,
+                port,
+                101,
+                seg.seq.wrapping_add(1),
+                packet::ACK,
+            );
+            flows.push((sport, seg.seq));
+        }
+        let stats = wait_for_stats(&relay, |s| s.tcp_flows_active == 3);
+        assert_eq!(stats.tcp_flows_active, 3);
+        assert_eq!(stats.tcp_flows, 3);
+        assert_eq!(stats.tcp_flows_closed, 0);
+        let diagnostics = relay.diagnostics();
+        assert_eq!(diagnostics["tcp"]["flows_active"], 3);
+        assert_eq!(diagnostics["tcp"]["flows_peak"], 3);
+        // One client reset lowers the live count by one. The peak keeps the
+        // high-water mark and does not follow the live count down.
+        let (sport, server_seq) = flows[0];
+        inner_tcp(
+            &relay,
+            sport,
+            port,
+            101,
+            server_seq.wrapping_add(1),
+            packet::RST | packet::ACK,
+        );
+        let stats = wait_for_stats(&relay, |s| s.tcp_flows_active == 2);
+        assert_eq!(stats.tcp_flows_active, 2);
+        assert_eq!(stats.tcp_flows_closed, 1);
+        let diagnostics = relay.diagnostics();
+        assert_eq!(diagnostics["tcp"]["flows_active"], 2);
+        assert_eq!(diagnostics["tcp"]["flows_peak"], 3);
+        // The remaining flows bring the gauge back to zero.
+        for &(sport, server_seq) in &flows[1..] {
+            inner_tcp(
+                &relay,
+                sport,
+                port,
+                101,
+                server_seq.wrapping_add(1),
+                packet::RST | packet::ACK,
+            );
+        }
+        let stats = wait_for_stats(&relay, |s| s.tcp_flows_active == 0);
+        assert_eq!(stats.tcp_flows_active, 0);
+        assert_eq!(stats.tcp_flows_closed, 3);
+        assert_eq!(relay.diagnostics()["tcp"]["flows_active"], 0);
+        // A stop drops every remaining entry. The gauge must not keep a stale
+        // live count after the workers are gone.
+        relay.stop();
+        assert_eq!(relay.stats().tcp_flows_active, 0);
+        let _ = stop_tx.send(());
+        server.join().unwrap();
     }
 
     #[test]
@@ -4073,16 +4471,36 @@ mod tests {
             assert_eq!(
                 seg.flags,
                 packet::RST | packet::ACK,
-                "reply code {code} must reset"
+                "reply code {code} must reset without a SYN-ACK"
             );
             assert_eq!(seg.data, b"");
             assert!(
                 elapsed < Duration::from_millis(50),
                 "reset took {elapsed:?} for reply code {code}"
             );
-            let stats = relay.stats();
-            assert_eq!(stats.tcp_setup_errors, 1);
-            assert_eq!(stats.tcp_flows_closed, 1);
+            // The worker counts the setup error before it queues the reset.
+            // It removes the flow from its table after the output signal, so
+            // this thread can observe the reset first. Wait for the close.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while relay.stats().tcp_flows_closed == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let stats = wait_for_stats(&relay, |s| s.tcp_flows_active == 0);
+            assert_eq!(stats.tcp_setup_errors, 1, "reply code {code}");
+            assert_eq!(stats.tcp_flows_closed, 1, "reply code {code}");
+            // The entry existed while the source device connect was pending.
+            // The failed setup drops it, so no live flow remains. The live
+            // count can trail the close counter by one short step, because the
+            // entry drops after the close is counted.
+            assert_eq!(stats.tcp_flows_active, 0, "reply code {code}");
+            assert_eq!(stats.tcp_setup_timed_out, 0, "reply code {code}");
+            match code {
+                5 => assert_eq!(stats.tcp_setup_refused, 1, "reply code {code}"),
+                3 | 4 => {
+                    assert_eq!(stats.tcp_setup_phone_unreachable, 1, "reply code {code}")
+                }
+                _ => unreachable!(),
+            }
             assert_eq!(stats.ttl_bad, 0);
             relay.stop();
             mock.join().unwrap();
@@ -4185,9 +4603,13 @@ mod tests {
             .unwrap();
         ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(relay.recv_timeout(Duration::from_millis(200)).is_err());
+        assert_eq!(relay.stats().tcp_flows_active, 1);
         let start = Instant::now();
         relay.stop();
         assert!(start.elapsed() < Duration::from_millis(500));
+        // The pending flow lived in the worker table. Stopping the worker drops
+        // the entry, and the gauge guard lowers the live count with it.
+        assert_eq!(relay.stats().tcp_flows_active, 0);
         mock.join().unwrap();
     }
 
@@ -4350,7 +4772,15 @@ mod tests {
             seen[index] = true;
         }
         assert!(seen.iter().all(|v| *v));
-        let stats = relay.stats();
+        // A reply can reach the consumer before the worker publishes its count.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let stats = loop {
+            let stats = relay.stats();
+            if stats.icmp_replies >= 2 || Instant::now() >= deadline {
+                break stats;
+            }
+            thread::yield_now();
+        };
         assert_eq!(
             (
                 stats.icmp_requests,
@@ -4438,7 +4868,15 @@ mod tests {
             reply,
             packet::build_echo_reply(dst, src, 0x1234, 7, b"probe").unwrap()
         );
-        let stats = on.stats();
+        // A reply can reach the consumer before the worker publishes its count.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let stats = loop {
+            let stats = on.stats();
+            if stats.icmp_replies >= 1 || Instant::now() >= deadline {
+                break stats;
+            }
+            thread::yield_now();
+        };
         assert_eq!(
             (
                 stats.icmp_requests,
@@ -5273,7 +5711,6 @@ mod tests {
         stream.set_nonblocking(true).unwrap();
         let (_peer, _) = listener.accept().unwrap();
         let counters = Arc::new(Counters::default());
-        counters.tcp_flows_active.store(1, Ordering::Relaxed);
         let output = Arc::new(Output::new().unwrap());
         let audit = Arc::new(normalization::Audit::default());
         let mut worker = Worker::new(
@@ -5301,6 +5738,7 @@ mod tests {
                 stream,
                 setup: None,
                 was_established: true,
+                _gauge: TcpFlowGauge::new(&counters),
             },
         );
         let rst = packet::build_tcp(&packet::TcpBuild {
@@ -5339,7 +5777,6 @@ mod tests {
         stream.set_nonblocking(true).unwrap();
         let (_peer, _) = listener.accept().unwrap();
         let counters = Arc::new(Counters::default());
-        counters.tcp_flows_active.store(1, Ordering::Relaxed);
         let output = Arc::new(Output::new().unwrap());
         let audit = Arc::new(normalization::Audit::default());
         let mut worker = Worker::new(
@@ -5365,6 +5802,7 @@ mod tests {
                 stream,
                 setup: None,
                 was_established: true,
+                _gauge: TcpFlowGauge::new(&counters),
             },
         );
         worker.pump();
@@ -5655,6 +6093,33 @@ mod tests {
         assert!(Relay::start(RelayConfig {
             allow_unpinned: true,
             workers: 9,
+            ..RelayConfig::default()
+        })
+        .is_err());
+    }
+    #[test]
+    fn relay_rejects_invalid_dns_upstreams_before_start() {
+        for upstream in [
+            "127.0.0.1:53",
+            "[::1]:53",
+            "0.0.0.0:53",
+            "224.0.0.1:53",
+            "[::ffff:192.0.2.53]:53",
+        ] {
+            assert!(
+                Relay::start(RelayConfig {
+                    allow_unpinned: true,
+                    dns_upstream: Some(upstream.parse().unwrap()),
+                    ..RelayConfig::default()
+                })
+                .is_err(),
+                "{upstream}"
+            );
+        }
+        let scoped = std::net::SocketAddrV6::new("2001:db8::53".parse().unwrap(), 53, 1, 2);
+        assert!(Relay::start(RelayConfig {
+            allow_unpinned: true,
+            dns_upstream: Some(scoped.into()),
             ..RelayConfig::default()
         })
         .is_err());
@@ -6839,7 +7304,12 @@ mod tests {
     }
 
     fn udp_direct_entry(last: Instant) -> UdpEntry {
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let socket = normalization::udp_socket(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            &normalization::Audit::default(),
+        )
+        .unwrap();
         socket.set_nonblocking(true).unwrap();
         UdpEntry {
             socket: UdpSocketKind::Direct(socket),
@@ -6877,6 +7347,9 @@ mod tests {
         }
     }
     fn syn_to(dst: Ipv4Addr, port: u16, seq: u32) -> Vec<u8> {
+        syn_with_flags(dst, port, seq, packet::SYN)
+    }
+    fn syn_with_flags(dst: Ipv4Addr, port: u16, seq: u32, flags: u8) -> Vec<u8> {
         packet::build_tcp(&packet::TcpBuild {
             src: Ipv4Addr::new(198, 18, 0, 2),
             dst,
@@ -6884,7 +7357,7 @@ mod tests {
             dport: port,
             seq,
             ack: 0,
-            flags: packet::SYN,
+            flags,
             window: 65535,
             payload: &[],
             options: &[],
@@ -6892,6 +7365,27 @@ mod tests {
             ident: 0,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn syn_with_fin_cannot_create_or_replace_a_flow() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let counters = Arc::new(Counters::default());
+        let (mut worker, output) = test_worker(&counters);
+        let dst = Ipv4Addr::LOCALHOST;
+        worker.handle(&syn_with_flags(dst, port, 500, packet::SYN | packet::FIN));
+        assert!(worker.tcp.is_empty());
+        assert!(output.pop().is_none());
+
+        worker.handle(&syn_to(dst, port, 500));
+        assert!(output.pop().is_some());
+        assert_eq!(worker.tcp.len(), 1);
+        worker.handle(&syn_with_flags(dst, port, 9000, packet::SYN | packet::FIN));
+        assert_eq!(worker.tcp.len(), 1);
+        assert_eq!(value(&counters.tcp_flows_closed), 0);
+        assert!(output.pop().is_none());
     }
 
     fn gracefully_closed_flow(now: Instant) -> tcp::TcpFlow {
@@ -6971,9 +7465,9 @@ mod tests {
                 stream,
                 setup: None,
                 was_established: true,
+                _gauge: TcpFlowGauge::new(&counters),
             },
         );
-        counters.tcp_flows_active.store(1, Ordering::Relaxed);
         worker.handle(&fin);
         assert!(!worker.tcp.contains_key(&key));
         assert!(worker.closed_tcp.contains_key(&key));
@@ -7074,6 +7568,411 @@ mod tests {
         let key = udp_key(5000, Ipv4Addr::new(203, 0, 113, 9));
         worker.remember_tcp_close(key, &aborted, now);
         assert_eq!(worker.closed_tcp.len(), MAX_CLOSED_TCP);
+    }
+
+    #[test]
+    fn reused_tuple_recovers_through_a_challenge_ack_and_reset() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let counters = Arc::new(Counters::default());
+        let (mut worker, output) = test_worker(&counters);
+        let dst = Ipv4Addr::LOCALHOST;
+        worker.handle(&syn_to(dst, port, 500));
+        let raw = output.pop().expect("the new flow gets a SYN-ACK");
+        let ip = packet::parse_ip(&raw).unwrap();
+        let seg = packet::parse_tcp(ip.payload).unwrap();
+        assert_eq!(
+            seg.flags & (packet::SYN | packet::ACK),
+            packet::SYN | packet::ACK
+        );
+        assert_eq!(seg.ack, 501);
+        let old_cseq = 501;
+        assert_eq!(worker.tcp.len(), 1);
+        // The local client reused the 4-tuple for a new connection. A bare SYN
+        // with a different ISN is not proof of a new incarnation: the tunnel
+        // can carry forwarded traffic, so it must not close a live flow
+        // without a sequence number. RFC 5961, Section 4, answers with a
+        // challenge ACK instead.
+        worker.handle(&syn_to(dst, port, 9000));
+        let raw = output.pop().expect("the bare SYN gets a challenge ACK");
+        let ip = packet::parse_ip(&raw).unwrap();
+        let challenge = packet::parse_tcp(ip.payload).unwrap();
+        assert_eq!(challenge.flags, packet::ACK);
+        assert_eq!(challenge.ack, old_cseq);
+        assert_eq!(worker.tcp.len(), 1, "the live flow is still open");
+        assert_eq!(value(&counters.tcp_flows_closed), 0);
+        assert_eq!(counters.tcp_flows_active.load(Ordering::Relaxed), 1);
+        // A client in SYN-SENT answers the challenge ACK with a reset at the
+        // next expected byte. That retires the stale flow.
+        let rst = packet::build_tcp(&packet::TcpBuild {
+            src: Ipv4Addr::new(198, 18, 0, 2),
+            dst,
+            sport: 5555,
+            dport: port,
+            seq: old_cseq,
+            ack: challenge.seq.wrapping_add(1),
+            flags: packet::RST | packet::ACK,
+            window: 0,
+            payload: &[],
+            options: &[],
+            ttl: 64,
+            ident: 0,
+        })
+        .unwrap();
+        worker.handle(&rst);
+        assert!(worker.tcp.is_empty());
+        assert_eq!(value(&counters.tcp_flows_closed), 1);
+        assert_eq!(counters.tcp_flows_active.load(Ordering::Relaxed), 0);
+        // The SYN retransmit that follows now opens a new flow.
+        worker.handle(&syn_to(dst, port, 9000));
+        let raw = output.pop().expect("the retried SYN gets a new SYN-ACK");
+        let ip = packet::parse_ip(&raw).unwrap();
+        let seg = packet::parse_tcp(ip.payload).unwrap();
+        assert_eq!(
+            seg.flags & (packet::SYN | packet::ACK),
+            packet::SYN | packet::ACK
+        );
+        assert_eq!(seg.ack, 9001);
+        assert_eq!(worker.tcp.len(), 1);
+        assert_eq!(counters.tcp_flows_active.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_wrong_handshake_ack_resets_and_the_client_can_retry() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let counters = Arc::new(Counters::default());
+        let (mut worker, output) = test_worker(&counters);
+        let dst = Ipv4Addr::LOCALHOST;
+        worker.handle(&syn_to(dst, port, 500));
+        let raw = output.pop().expect("the flow gets a SYN-ACK");
+        let ip = packet::parse_ip(&raw).unwrap();
+        let syn_ack = packet::parse_tcp(ip.payload).unwrap();
+        assert_eq!(syn_ack.ack, 501);
+        assert_eq!(worker.tcp.len(), 1);
+        // The first ACK acknowledges the server's initial sequence number, not
+        // the SYN-ACK. RFC 9293 rejects it in SYN-RECEIVED and resets the
+        // half-open flow.
+        let bad = packet::build_tcp(&packet::TcpBuild {
+            src: Ipv4Addr::new(198, 18, 0, 2),
+            dst,
+            sport: 5555,
+            dport: port,
+            seq: 501,
+            ack: syn_ack.seq,
+            flags: packet::ACK,
+            window: 65535,
+            payload: b"early",
+            options: &[],
+            ttl: 64,
+            ident: 0,
+        })
+        .unwrap();
+        worker.handle(&bad);
+        let raw = output.pop().expect("the half-open flow gets a reset");
+        let ip = packet::parse_ip(&raw).unwrap();
+        let rst = packet::parse_tcp(ip.payload).unwrap();
+        assert_eq!(rst.flags & packet::RST, packet::RST);
+        assert!(!worker.tcp.contains_key(&flow_key(&bad).unwrap()));
+        assert_eq!(value(&counters.tcp_flows_closed), 1);
+        // The retried SYN opens a new flow instead of staying blackholed.
+        worker.handle(&syn_to(dst, port, 500));
+        let raw = output.pop().expect("the retry gets a SYN-ACK");
+        let ip = packet::parse_ip(&raw).unwrap();
+        let seg = packet::parse_tcp(ip.payload).unwrap();
+        assert_eq!(
+            seg.flags & (packet::SYN | packet::ACK),
+            packet::SYN | packet::ACK
+        );
+        assert_eq!(seg.ack, 501);
+        assert_eq!(worker.tcp.len(), 1);
+    }
+
+    #[test]
+    fn dropped_syn_ack_is_resent_on_the_syn_retransmit() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let counters = Arc::new(Counters::default());
+        let (mut worker, output) = test_worker(&counters);
+        for _ in 0..QUEUE {
+            assert!(output.push(vec![1]));
+        }
+        let syn = syn_to(Ipv4Addr::LOCALHOST, port, 500);
+        worker.handle(&syn);
+        assert_eq!(worker.tcp.len(), 1, "the flow is admitted");
+        assert_eq!(value(&counters.send_dropped), 1);
+        for _ in 0..QUEUE {
+            assert_eq!(output.pop(), Some(vec![1]));
+        }
+        // The same SYN is a handshake retransmission. The endpoint answers it
+        // again, so a dropped SYN-ACK does not blackhole the connection.
+        worker.handle(&syn);
+        let raw = output.pop().expect("the retransmitted SYN needs a SYN-ACK");
+        let ip = packet::parse_ip(&raw).unwrap();
+        let seg = packet::parse_tcp(ip.payload).unwrap();
+        assert_eq!(
+            seg.flags & (packet::SYN | packet::ACK),
+            packet::SYN | packet::ACK
+        );
+        assert_eq!(seg.ack, 501);
+        assert_eq!(worker.tcp.len(), 1);
+        assert_eq!(value(&counters.tcp_flows_closed), 0);
+    }
+
+    #[test]
+    fn closed_flow_answers_a_retransmitted_fin_with_psh_and_data() {
+        let counters = Arc::new(Counters::default());
+        let (mut worker, output) = test_worker(&counters);
+        let now = Instant::now();
+        let mut engine = tcp::TcpFlow::new(100, 200, &[], 65535, now);
+        engine.outer_connected();
+        engine.outer_end(now);
+        engine.actions();
+        engine.on_inner(
+            &packet::TcpSegment {
+                sport: 5555,
+                dport: 443,
+                seq: 101,
+                ack: 202,
+                flags: packet::ACK | packet::FIN,
+                window: 65535,
+                options: &[],
+                data: b"tail",
+            },
+            now,
+        );
+        // The relay writes the pending upload bytes to the outer socket and
+        // then shuts the write side down. The flow closes after both FINs.
+        engine.outer_written(4);
+        assert_eq!(engine.graceful_close_ack(), Some((202, 106)));
+        let key = flow_key(&syn_to(Ipv4Addr::new(203, 0, 113, 9), 443, 0)).unwrap();
+        worker.remember_tcp_close(key, &engine, now);
+        // A real retransmission repeats the PSH flag and the trailing data.
+        let fin = packet::build_tcp(&packet::TcpBuild {
+            src: Ipv4Addr::new(198, 18, 0, 2),
+            dst: Ipv4Addr::new(203, 0, 113, 9),
+            sport: 5555,
+            dport: 443,
+            seq: 101,
+            ack: 202,
+            flags: packet::FIN | packet::ACK | packet::PSH,
+            window: 65535,
+            payload: b"tail",
+            options: &[],
+            ttl: 64,
+            ident: 0,
+        })
+        .unwrap();
+        worker.handle(&fin);
+        let raw = output.pop().expect("the duplicate FIN needs an ACK");
+        let ip = packet::parse_ip(&raw).unwrap();
+        let ack = packet::parse_tcp(ip.payload).unwrap();
+        assert_eq!((ack.flags, ack.seq, ack.ack), (packet::ACK, 202, 106));
+        assert_eq!(worker.audit.snapshot(), (0, 0));
+    }
+
+    #[test]
+    fn psh_fin_retry_recovers_after_a_full_output_queue() {
+        let counters = Arc::new(Counters::default());
+        let (mut worker, output) = test_worker(&counters);
+        let now = Instant::now();
+        let key = flow_key(&fin_to(Ipv4Addr::new(203, 0, 113, 9), 101)).unwrap();
+        worker.remember_tcp_close(key, &gracefully_closed_flow(now), now);
+        for _ in 0..QUEUE + TCP_CONTROL_RESERVE {
+            assert!(output.push_tcp_control(vec![1]));
+        }
+        let raw = packet::build_tcp(&packet::TcpBuild {
+            src: Ipv4Addr::new(198, 18, 0, 2),
+            dst: Ipv4Addr::new(203, 0, 113, 9),
+            sport: 5555,
+            dport: 443,
+            seq: 101,
+            ack: 202,
+            flags: packet::FIN | packet::ACK | packet::PSH,
+            window: 65535,
+            payload: &[],
+            options: &[],
+            ttl: 64,
+            ident: 0,
+        })
+        .unwrap();
+        worker.handle(&raw);
+        assert_eq!(value(&counters.send_dropped), 1);
+        assert!(output.pop().is_some());
+        for _ in 1..QUEUE + TCP_CONTROL_RESERVE {
+            assert!(output.pop().is_some());
+        }
+        // The close record is still present, so the next retransmitted FIN
+        // gets an ACK after the queue drains.
+        worker.handle(&raw);
+        let raw = output.pop().expect("the retried FIN needs an ACK");
+        let ip = packet::parse_ip(&raw).unwrap();
+        let ack = packet::parse_tcp(ip.payload).unwrap();
+        assert_eq!((ack.flags, ack.seq, ack.ack), (packet::ACK, 202, 102));
+    }
+
+    #[test]
+    fn closed_flow_ignores_a_fin_that_is_not_the_last_segment() {
+        let counters = Arc::new(Counters::default());
+        let (mut worker, output) = test_worker(&counters);
+        let now = Instant::now();
+        let key = flow_key(&fin_to(Ipv4Addr::new(203, 0, 113, 9), 101)).unwrap();
+        worker.remember_tcp_close(key, &gracefully_closed_flow(now), now);
+        for flags in [
+            packet::FIN | packet::ACK | packet::SYN,
+            packet::FIN | packet::ACK | packet::RST,
+        ] {
+            let raw = packet::build_tcp(&packet::TcpBuild {
+                src: Ipv4Addr::new(198, 18, 0, 2),
+                dst: Ipv4Addr::new(203, 0, 113, 9),
+                sport: 5555,
+                dport: 443,
+                seq: 101,
+                ack: 202,
+                flags,
+                window: 65535,
+                payload: &[],
+                options: &[],
+                ttl: 64,
+                ident: 0,
+            })
+            .unwrap();
+            worker.handle(&raw);
+            assert!(output.pop().is_none(), "flags {flags}");
+        }
+        // A FIN before the final sequence number is not the duplicate of the
+        // closed segment.
+        worker.handle(&fin_to(Ipv4Addr::new(203, 0, 113, 9), 99));
+        assert!(output.pop().is_none());
+        assert!(worker.closed_tcp.contains_key(&key));
+    }
+
+    #[test]
+    fn close_records_expire_during_a_pump() {
+        let counters = Arc::new(Counters::default());
+        let (mut worker, _) = test_worker(&counters);
+        let now = Instant::now();
+        let engine = gracefully_closed_flow(now);
+        let mut key = udp_key(1, Ipv4Addr::new(203, 0, 113, 9));
+        key.proto = packet::PROTO_TCP;
+        worker.remember_tcp_close(
+            key,
+            &engine,
+            now - CLOSED_TCP_LIFETIME - Duration::from_secs(1),
+        );
+        assert!(worker.closed_tcp.contains_key(&key));
+        worker.pump();
+        assert!(worker.closed_tcp.is_empty());
+    }
+
+    /// The relay key used by the outer socket teardown tests below.
+    fn teardown_key() -> Key {
+        Key {
+            proto: packet::PROTO_TCP,
+            src: Ipv4Addr::new(198, 18, 0, 2).into(),
+            dst: Ipv4Addr::LOCALHOST.into(),
+            sport: 5555,
+            dport: 443,
+        }
+    }
+
+    #[test]
+    fn abortive_close_resets_the_outer_stream_with_an_unfinished_upload() {
+        let counters = Arc::new(Counters::default());
+        let (mut worker, _output) = test_worker(&counters);
+        let (client, mut server) = tcp_pair();
+        server
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let now = Instant::now();
+        let mut engine = tcp::TcpFlow::new(100, 200, &[], 65535, now);
+        engine.outer_connected();
+        engine.actions();
+        // The endpoint accepted upload bytes but the relay has not written
+        // them to the outer socket yet.
+        engine.on_inner(
+            &packet::TcpSegment {
+                sport: 5555,
+                dport: 443,
+                seq: 101,
+                ack: 201,
+                flags: packet::ACK,
+                window: 65535,
+                options: &[],
+                data: b"partial",
+            },
+            now,
+        );
+        engine.actions();
+        assert_eq!(engine.pending_bytes(), b"partial");
+        worker.tcp.insert(
+            teardown_key(),
+            TcpEntry {
+                engine,
+                stream: client,
+                setup: None,
+                was_established: true,
+                _gauge: TcpFlowGauge::new(&counters),
+            },
+        );
+        // The inner client resets. The upload is truncated, so the
+        // destination must see a reset and not a clean end of stream. The
+        // reset carries the next expected byte after the accepted data.
+        let rst = packet::build_tcp(&packet::TcpBuild {
+            src: Ipv4Addr::new(198, 18, 0, 2),
+            dst: Ipv4Addr::LOCALHOST,
+            sport: 5555,
+            dport: 443,
+            seq: 108,
+            ack: 201,
+            flags: packet::RST | packet::ACK,
+            window: 0,
+            payload: &[],
+            options: &[],
+            ttl: 64,
+            ident: 0,
+        })
+        .unwrap();
+        worker.handle(&rst);
+        assert!(worker.tcp.is_empty());
+        assert_eq!(value(&counters.tcp_flows_closed), 1);
+        let mut buf = [0u8; 16];
+        let error = server
+            .read(&mut buf)
+            .expect_err("the destination must read a reset, not a clean EOF");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+    }
+
+    #[test]
+    fn graceful_close_ends_the_outer_stream_with_a_fin() {
+        let counters = Arc::new(Counters::default());
+        let (mut worker, _output) = test_worker(&counters);
+        let (client, mut server) = tcp_pair();
+        server
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let now = Instant::now();
+        worker.tcp.insert(
+            teardown_key(),
+            TcpEntry {
+                engine: gracefully_closed_flow(now),
+                stream: client,
+                setup: None,
+                was_established: true,
+                _gauge: TcpFlowGauge::new(&counters),
+            },
+        );
+        worker.pump();
+        assert!(worker.tcp.is_empty());
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            server.read(&mut buf).unwrap(),
+            0,
+            "a graceful close keeps the normal FIN"
+        );
     }
 
     #[test]

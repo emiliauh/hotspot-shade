@@ -54,6 +54,35 @@ internal object SourceSocksCapacity {
     /** The most persistent echo sessions that the server grants. */
     const val MAXIMUM_PERSISTENT_ECHO_SESSIONS = 16
 
+    /**
+     * The concurrent selected-network name lookups of one run.
+     *
+     * A lookup binds no session and holds no relay slot. Eight is enough for a
+     * burst of new flows, and every caller still has its own connect deadline.
+     * A lookup that waits in the queue gives up at that deadline; a full queue
+     * refuses at once. The pool never creates one more thread.
+     */
+    const val MAXIMUM_RESOLVER_THREADS = 8
+
+    /**
+     * The queued name lookups of one run. The queue shares the worker bound.
+     *
+     * A queue entry holds one waiting flow, not a relay slot. The bound keeps
+     * a stuck resolver from collecting an unbounded queue of abandoned
+     * callers. A full queue refuses the lookup at once with the general
+     * failure code.
+     */
+    const val MAXIMUM_RESOLVER_QUEUE = MAXIMUM_RESOLVER_THREADS
+
+    /**
+     * The extra workers that one eviction can overlap with its replacement.
+     *
+     * An evicted relay holds its session worker and its pump worker until it
+     * closes, while the accepted replacement already needs one. Allow one
+     * evicted relay to finish without refusing the replacement.
+     */
+    const val WORKER_EVICTION_OVERLAP = 2
+
     /** One step in the life of an accepted session. */
     enum class Phase {
         /** The client is in the greeting or the authentication exchange. */
@@ -138,6 +167,43 @@ internal object SourceSocksCapacity {
         if (usable <= 0) return 0
         return minOf(MAXIMUM_SESSIONS, usable / DESCRIPTORS_PER_SESSION)
     }
+
+    /**
+     * The worker thread bound for one run.
+     *
+     * One session worker serves one accepted client. One extra worker pumps
+     * each open relay: the session worker runs one direction, and the pump
+     * worker runs the other. A setup session needs only its session worker.
+     * That makes one session plus one relay worker the smallest bound that
+     * still serves every documented session and relay slot. The overlap
+     * allowance covers one session that an eviction is still closing.
+     *
+     * A server uses this as a hard ceiling. It never creates a worker beyond
+     * the ceiling. A relay request with no pump worker is refused with the
+     * general failure code.
+     */
+    fun workerLimit(
+        sessions: Int = MAXIMUM_SESSIONS,
+        relays: Int = MAXIMUM_RELAYS,
+    ): Int {
+        val boundedSessions = maxOf(0, sessions)
+        val boundedRelays = maxOf(0, relays)
+        if (boundedSessions == 0 && boundedRelays == 0) return 0
+        return boundedSessions + boundedRelays + WORKER_EVICTION_OVERLAP
+    }
+
+    /**
+     * The resolver workers and queue entries for one session cap.
+     *
+     * A lookup belongs to one session, so a smaller session cap needs fewer
+     * resolver workers. The queue gets the same bound as the workers.
+     */
+    fun resolverThreads(sessions: Int = MAXIMUM_SESSIONS): Int =
+        minOf(MAXIMUM_RESOLVER_THREADS, maxOf(0, sessions))
+
+    /** The queued lookups for one session cap. */
+    fun resolverQueue(sessions: Int = MAXIMUM_SESSIONS): Int =
+        minOf(MAXIMUM_RESOLVER_QUEUE, resolverThreads(sessions))
 
     /**
      * Split one total limit.

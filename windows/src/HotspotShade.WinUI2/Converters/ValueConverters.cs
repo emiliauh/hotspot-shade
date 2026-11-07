@@ -56,4 +56,18 @@ namespace HotspotShade.WinUI2.Converters
             throw new NotSupportedException();
         }
     }
+
+    // Invert a boolean, for example to disable a button while a list loads.
+    public sealed class InvertBoolConverter : IValueConverter
+    {
+        public object Convert(object value, Type targetType, object parameter, string language)
+        {
+            return !(value is bool && (bool)value);
+        }
+
+        public object ConvertBack(object value, Type targetType, object parameter, string language)
+        {
+            throw new NotSupportedException();
+        }
+    }
 }

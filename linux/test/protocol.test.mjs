@@ -15,14 +15,30 @@ test('arguments that take no payload reject every value', () => {
   assert.throws(() => protocol.noArgs('status'), protocol.ProtocolError);
 });
 
-test('the start payload has one boolean and no extra keys', () => {
-  assert.deepEqual(protocol.startOptions({ ping: true }), { ping: true });
-  assert.deepEqual(protocol.startOptions({ ping: false }), { ping: false });
-  assert.throws(() => protocol.startOptions({ ping: 'true' }), protocol.ProtocolError);
-  assert.throws(() => protocol.startOptions({ ping: true, iface: 'wlan0' }), protocol.ProtocolError);
+test('the start payload names one fixed mode and one boolean', () => {
+  assert.deepEqual(protocol.startOptions({ mode: 'phone', ping: true }), { mode: 'phone', ping: true });
+  assert.deepEqual(protocol.startOptions({ mode: 'phone', ping: false }), { mode: 'phone', ping: false });
+  assert.deepEqual(protocol.startOptions({ mode: 'direct', ping: true }), { mode: 'direct', ping: false });
+  assert.deepEqual(protocol.startOptions({ mode: 'direct', ping: false }), { mode: 'direct', ping: false });
+  assert.throws(() => protocol.startOptions({ mode: 'phone', ping: 'true' }), protocol.ProtocolError);
+  assert.throws(() => protocol.startOptions({ mode: 'phone', ping: true, iface: 'wlan0' }), protocol.ProtocolError);
+  assert.throws(() => protocol.startOptions({ mode: 'phone', ping: true, host: '192.0.2.1' }), protocol.ProtocolError);
+  assert.throws(() => protocol.startOptions({ mode: 'tun', ping: true }), protocol.ProtocolError);
+  assert.throws(() => protocol.startOptions({ mode: 'direct' }), protocol.ProtocolError);
+  assert.throws(() => protocol.startOptions({ ping: true }), protocol.ProtocolError);
+  assert.throws(() => protocol.startOptions({ mode: 'phone' }), protocol.ProtocolError);
   assert.throws(() => protocol.startOptions({}), protocol.ProtocolError);
   assert.throws(() => protocol.startOptions(null), protocol.ProtocolError);
   assert.throws(() => protocol.startOptions([]), protocol.ProtocolError);
+});
+
+test('setting updates accept booleans and one fixed tunnel mode', () => {
+  assert.deepEqual(protocol.settingUpdate({ name: 'ping', value: true }), { name: 'ping', value: true });
+  assert.deepEqual(protocol.settingUpdate({ name: 'tunnelMode', value: 'phone' }), { name: 'tunnelMode', value: 'phone' });
+  assert.deepEqual(protocol.settingUpdate({ name: 'tunnelMode', value: 'direct' }), { name: 'tunnelMode', value: 'direct' });
+  assert.throws(() => protocol.settingUpdate({ name: 'tunnelMode', value: true }), protocol.ProtocolError);
+  assert.throws(() => protocol.settingUpdate({ name: 'tunnelMode', value: 'tun' }), protocol.ProtocolError);
+  assert.throws(() => protocol.settingUpdate({ name: 'tunnelMode', value: 'direct', iface: 'wlan0' }), protocol.ProtocolError);
 });
 
 test('the activity sequence is a bounded integer', () => {

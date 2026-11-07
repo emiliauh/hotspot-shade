@@ -20,6 +20,9 @@ fail() { echo "FAIL: $1"; echo "--- GUI log"; cat "$LOG"; exit 1; }
 
 curl -fsS "$BASE/" -o /dev/null -D - | tr -d '\r' >"$LOG.h" || fail "GET / failed"
 grep -qi '^content-security-policy:' "$LOG.h" || fail "no Content-Security-Policy header"
+PAGE="$(curl -fsS "$BASE/")" || fail "GET / page failed"
+[[ "$PAGE" == *'Direct mode and source device proxy token use are disabled in this build.'* ]] || fail "Windows platform note is missing or stale"
+[[ "$PAGE" == *'SOCKS5 mode is not available on Windows.'* ]] || fail "Windows SOCKS5 availability is missing or stale"
 curl -fsS "$BASE/favicon.svg" -o /dev/null -D - | tr -d '\r' >"$LOG.h" || fail "GET /favicon.svg failed"
 grep -qi '^content-type: image/svg+xml' "$LOG.h" || fail "favicon has the wrong content type"
 STATUS="$(curl -fsS "$BASE/api/status")" || fail "GET /api/status failed"

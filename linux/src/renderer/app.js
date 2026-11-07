@@ -39,12 +39,14 @@
     failureSince: null,
     freshness: 'fresh',
     ping: storedPing(),
+    startMode: 'phone',
     settings: {
       notifications: true,
       notificationsSupported: true,
       launchAtLogin: false,
       launchAtLoginAvailable: false,
-      ping: true
+      ping: true,
+      tunnelMode: 'phone'
     },
     themePreference: storedTheme(),
     logs: [],
@@ -57,6 +59,7 @@
     failuresLoaded: false,
     failuresLoading: false,
     failureReport: '',
+    privacyKey: null,
     statusInFlight: false,
     statusQueued: false,
     statusPromise: null,
@@ -131,9 +134,11 @@
       notificationsSupported: settings.notificationsSupported === true,
       launchAtLogin: settings.launchAtLogin === true,
       launchAtLoginAvailable: settings.launchAtLoginAvailable === true,
-      ping: settings.ping === true
+      ping: settings.ping === true,
+      tunnelMode: settings.tunnelMode === 'direct' ? 'direct' : 'phone'
     };
     state.ping = state.settings.ping;
+    state.startMode = state.settings.tunnelMode;
   }
 
   function effectiveTheme(preference) {
@@ -228,6 +233,7 @@
       'view-dashboard', 'view-activity', 'view-settings',
       'dashboardContent', 'statusDot', 'dashboardTitle', 'dashboardSubtitle',
       'dashboardChecked', 'primaryAction', 'secondaryAction', 'pairHint',
+      'modePhone', 'modeDirect', 'modeHelp',
       'sourceValue', 'sourceDetails', 'connectionValue', 'connectionDetails',
       'attentionCard', 'attentionList',
       'pairingPanel', 'pairingPanelTitle', 'pairingMessage',
@@ -241,10 +247,12 @@
       'pingToggle', 'pingHelp', 'loginToggle', 'loginHelp', 'notificationsToggle',
       'notificationsHelp', 'notificationsStatus', 'appearanceHelp',
       'settingsPairingState', 'settingsPairingMessage',
-      'settingsPair', 'settingsCancel', 'settingsForget', 'settingsTurnOffForget',
+      'settingsPair', 'settingsCancel', 'settingsForget', 'settingsTurnOffForget', 'settingsTryStop',
       'settingsPairReason', 'settingsForgetMessage',
       'failuresRefresh', 'copyFailures', 'failuresSummary', 'failuresSubtitle', 'failuresTable',
       'failuresBody', 'failuresEmpty', 'wifiAdvice',
+      'privacyCard', 'privacySubtitle', 'privacyModePill', 'privacyIntro',
+      'privacyModes', 'privacyFacts', 'privacyLimits', 'privacyStorageNote',
       'modeCard', 'modeCardTitle', 'modeCardBody', 'demoScenario', 'applyScenario', 'appVersion', 'appPlatform', 'appMode',
       'appStatus', 'appBoundary', 'appTunnel', 'copyDiagnostics', 'copyState',
       'demoLimits', 'demoLimitsNote', 'engineLimits', 'demoScenariosCard', 'toastRegion'
@@ -334,7 +342,8 @@
       state.failureSince = null;
       state.freshness = 'fresh';
       if (engineMode()) state.engineConnected = true;
-      if (data.running !== true && state.busy !== 'forget') state.forgetBlocked = false;
+      if (data.running === false && data.state !== 'unknown' &&
+          data.cleanup_blocked !== true && state.busy !== 'forget') state.forgetBlocked = false;
       adoptPairState();
       if (state.error && state.retryAction === 'checkNow') {
         state.error = null;
@@ -412,7 +421,7 @@
       function check() {
         refreshStatus().then(function () {
           var status = object(state.status);
-          if (predicate(status)) {
+          if (state.hasStatus && state.failureSince === null && predicate(status)) {
             resolve(true);
             return;
           }
@@ -502,28 +511,61 @@
     toast(title || 'The action did not finish', state.error);
   }
 
+  function chooseStartMode(mode) {
+    if (state.busy || !bridgeReady()) return Promise.resolve(false);
+    var status = object(state.status);
+    if (status.running === true) return Promise.resolve(false);
+    var next = model.normalizeStartMode(mode);
+    if (next === state.startMode) return Promise.resolve(true);
+    var previous = state.startMode;
+    state.startMode = next;
+    render();
+    return updateSetting('tunnelMode', next).then(function () {
+      toast(
+        next === 'direct' ? 'Direct mode selected' : 'Source device proxy selected',
+        next === 'direct'
+          ? 'No source device app is used. IPv6 is blocked by default. The packaged app starts the root engine.'
+          : 'The tunnel uses the HotspotShade app on the source device. IPv6 is forwarded through the source device.'
+      );
+      return true;
+    }).catch(function (error) {
+      state.startMode = previous;
+      render();
+      toast('The tunnel mode did not change', errorMessage(error));
+      return false;
+    });
+  }
+
   function startTunnel(quiet) {
     if (state.busy || !bridgeReady()) return Promise.resolve(false);
     beginAction('start');
-    return call('start', { ping: state.ping }).then(function () {
-      return waitForStatus(function (status) { return status.running === true; }, ACTION_WAIT_MS);
+    return call('start', { mode: state.startMode, ping: state.ping }).then(function () {
+      return waitForStatus(function (status) {
+        return model.tunnelStateConfirmed(status, true);
+      }, ACTION_WAIT_MS);
     }).then(function (finished) {
       state.busy = null;
-      if (!finished) {
+      if (!finished || state.failureSince !== null || !model.tunnelStateConfirmed(state.status, true)) {
         state.error = wording('The start did not finish. Check the status.', 'The simulated start did not finish. Check the status.');
         state.retryAction = 'start';
         render();
         return false;
       }
-      return refreshStatus().then(function () {
-        if (!quiet) toast(
-          wording('Tunnel started', 'Simulated tunnel started'),
-          wording('The engine reports the tunnel is on.', 'The demo session is simulated. No route, TUN device, or outer socket was created.')
-        );
-        return true;
-      });
+      render();
+      var direct = object(state.status).mode === 'tun';
+      if (!quiet) toast(
+        direct ? wording('Direct tunnel started', 'Simulated direct tunnel started') : wording('Tunnel started', 'Simulated tunnel started'),
+        direct
+          ? wording('The engine reports direct mode. No source device app is used. Live route behavior is not verified.', 'The demo direct session is simulated. No route, TUN device, or outer socket was created.')
+          : wording('The engine reports the tunnel is on.', 'The demo session is simulated. No route, TUN device, or outer socket was created.')
+      );
+      return true;
     }).catch(function (error) {
-      failAction('start', error, wording('The start did not finish', 'The simulated start did not finish'));
+      state.busy = null;
+      state.error = model.startFailureText(errorCode(error), errorMessage(error));
+      state.retryAction = 'start';
+      render();
+      toast(wording('The start did not finish', 'The simulated start did not finish'), state.error);
       return false;
     });
   }
@@ -532,22 +574,23 @@
     if (state.busy || !bridgeReady()) return Promise.resolve(false);
     beginAction('stop');
     return call('stop').then(function () {
-      return waitForStatus(function (status) { return status.running === false; }, ACTION_WAIT_MS);
+      return waitForStatus(function (status) {
+        return model.tunnelStateConfirmed(status, false);
+      }, ACTION_WAIT_MS);
     }).then(function (finished) {
       state.busy = null;
-      if (!finished) {
+      if (!finished || state.failureSince !== null || !model.tunnelStateConfirmed(state.status, false)) {
         state.error = wording('The stop did not finish. Check the status.', 'The simulated stop did not finish. Check the status.');
         state.retryAction = 'stop';
         render();
         return false;
       }
-      return refreshStatus().then(function () {
-        if (!quiet) toast(
-          wording('Tunnel stopped', 'Simulated tunnel stopped'),
-          wording('The engine reports the tunnel is off.', 'No route or device changed.')
-        );
-        return true;
-      });
+      render();
+      if (!quiet) toast(
+        wording('Tunnel stopped', 'Simulated tunnel stopped'),
+        wording('The engine reports the tunnel is off.', 'No route or device changed.')
+      );
+      return true;
     }).catch(function (error) {
       failAction('stop', error, wording('The stop did not finish', 'The simulated stop did not finish'));
       return false;
@@ -658,7 +701,7 @@
       }
       return refreshStatus().then(function () {
         toast(
-          'Source device forgotten',
+          'Pairing removed locally',
           wording('The pairing is removed from this target device.', 'The simulated pairing is removed from this target device.')
         );
         return true;
@@ -688,10 +731,28 @@
 
   function checkNow() {
     if (state.busy || !bridgeReady()) return Promise.resolve(false);
+    var previous = object(state.status);
+    var statusOnly = previous.state === 'unknown' || previous.cleanup_blocked === true ||
+      typeof previous.running !== 'boolean' || previous.mode === 'tun' ||
+      (previous.running === false && state.startMode === 'direct');
     beginAction('check');
-    return call('probe').then(function () {
+    return (statusOnly ? Promise.resolve() : call('probe')).then(function () {
       state.busy = null;
       return refreshStatus().then(function () {
+        if (state.failureSince !== null || !state.hasStatus) {
+          toast('The check did not finish', 'The engine status could not be read.');
+          return false;
+        }
+        var current = object(state.status);
+        if (current.state === 'unknown' || current.cleanup_blocked === true ||
+            typeof current.running !== 'boolean') {
+          toast('Status unavailable', 'The engine still cannot confirm the tunnel status.');
+          return false;
+        }
+        if (statusOnly) {
+          toast('Status updated', 'The current engine status is shown.');
+          return true;
+        }
         toast(
           'Check finished',
           wording('The source device status is updated.', 'The simulated source device answer is updated.')
@@ -960,8 +1021,8 @@
       dom.modeCardBody.textContent = !engine
         ? 'This app uses the in-memory demo backend. It has no tunnel, no route change, no TUN device, no listener, and no external request. Demo data only.'
         : simulated
-          ? 'This app uses the local engine service in demo mode. The engine holds the tunnel state. No tunnel, route, or TUN device is created.'
-          : 'This app uses the local engine service. The engine holds the tunnel state and the pairing credentials. This page receives status values only.';
+          ? 'This app uses the local engine service in demo mode. The engine holds the simulated tunnel state. No tunnel, route, or TUN device is created.'
+          : 'This app uses the local engine service. It can start source device proxy mode or direct mode. The engine holds the tunnel state and the pairing credentials. This page receives status values only.';
     }
     if (dom.demoScenariosCard) dom.demoScenariosCard.hidden = engine;
     if (dom.demoLimits) dom.demoLimits.hidden = engine;
@@ -994,9 +1055,15 @@
         : 'Failed connection setups on this target device. The demo record stays in memory.';
     }
     if (dom.pingHelp) {
-      dom.pingHelp.textContent = engine
-        ? 'Uses the echo relay. Applies the next time you turn the tunnel on.'
-        : 'Uses the simulated echo relay. Applies the next time you turn the tunnel on.';
+      var currentStatus = object(state.status);
+      var directMode = currentStatus.running === true
+        ? currentStatus.mode === 'tun'
+        : state.startMode === 'direct';
+      dom.pingHelp.textContent = directMode
+        ? 'Ping applies only to source device proxy mode. Direct mode blocks IPv6 and does not use the echo relay.'
+        : engine
+          ? 'Uses the echo relay. Applies the next time you turn the tunnel on.'
+          : 'Uses the simulated echo relay. Applies the next time you turn the tunnel on.';
     }
   }
 
@@ -1008,8 +1075,10 @@
       freshness: currentFreshness(),
       busy: state.busy,
       error: state.error || (state.bridgeState === 'failed' ? state.bridgeError : null),
+      retryAction: state.retryAction,
       forgetBlocked: state.forgetBlocked,
       notificationsUnavailable: state.bridgeState === 'ready' && state.settings.notificationsSupported !== true,
+      startMode: state.startMode,
       nowSeconds: nowSeconds()
     });
     renderDashboard(derived);
@@ -1068,6 +1137,8 @@
     dom.pairHint.hidden = !hint;
     if (hint) setText(dom.pairHint, model.TEXT.pairWhenReady);
 
+    renderModeChoice(derived);
+
     setText(dom.sourceValue, derived.source.value);
     renderList(dom.sourceDetails, derived.source.details);
     setText(dom.connectionValue, derived.connection.value);
@@ -1085,13 +1156,32 @@
     dom.cancelPairing.disabled = state.busy === 'pair';
   }
 
+  function renderModeChoice(derived) {
+    if (!dom.modePhone || !dom.modeDirect) return;
+    var choice = model.modeChoice({
+      selected: state.startMode,
+      runningMode: derived.runningMode,
+      locked: derived.modeLocked || !!state.busy || !bridgeReady()
+    });
+    var phone = choice.rows[0];
+    var direct = choice.rows[1];
+    dom.modePhone.setAttribute('aria-pressed', String(phone.pressed));
+    dom.modeDirect.setAttribute('aria-pressed', String(direct.pressed));
+    dom.modePhone.disabled = phone.disabled;
+    dom.modeDirect.disabled = direct.disabled;
+    var selected = choice.selected === 'direct' ? direct : phone;
+    setText(dom.modeHelp, selected.detail);
+    dom.modePhone.title = phone.detail;
+    dom.modeDirect.title = direct.detail;
+  }
+
   function renderSettings(derived) {
     var status = object(state.status);
     var phone = object(status.phone);
     var paired = status.paired === true;
     var running = status.running === true;
     var pairing = model.pairingView(state.pair, state.busy);
-    var unavailable = derived.unavailable || !bridgeReady();
+    var unavailable = derived.unavailable || !derived.pairingKnown || !bridgeReady();
     var phoneState = text(phone.state);
     var stateText = 'Not paired';
     if (unavailable) stateText = model.TEXT.statusUnavailableLine;
@@ -1101,7 +1191,8 @@
     setText(dom.settingsPairingState, stateText);
 
     var message = '';
-    if (unavailable) message = model.TEXT.statusUnavailableLine;
+    if (unavailable) message = state.retryAction === 'stop' && state.error
+      ? model.sanitized(state.error) : model.TEXT.statusUnavailableLine;
     else if (pairing.active) message = pairing.message;
     else message = text(phone.message) || derived.subtitle;
     setText(dom.settingsPairingMessage, message);
@@ -1114,6 +1205,8 @@
     dom.settingsForget.disabled = !!state.busy;
     dom.settingsTurnOffForget.hidden = !running || unavailable;
     dom.settingsTurnOffForget.disabled = !!state.busy;
+    dom.settingsTryStop.hidden = !(derived.secondary && derived.secondary.id === 'turnOff') || !bridgeReady();
+    dom.settingsTryStop.disabled = !!state.busy || pairing.active;
 
     var reason = '';
     if (pairing.active) reason = '';
@@ -1153,6 +1246,8 @@
 
     dom.demoScenario.disabled = !bridgeReady() || !!state.busy || engineMode();
     dom.applyScenario.disabled = !bridgeReady() || !!state.busy || engineMode();
+
+    renderPrivacy();
   }
 
   function renderActivity() {
@@ -1267,6 +1362,77 @@
     });
   }
 
+  /* The destination-privacy card is read-only. It reports fixed facts about
+   * this app and engine build, so it renders once per backend mode. The values
+   * name a build capability, not a live mode: this card cannot tell whether a
+   * tunnel is running. The page never sends a privacy mode and never saves
+   * one. */
+  function renderPrivacy() {
+    if (!dom.privacyModes || !dom.privacyFacts) return;
+    var key = (engineMode() ? 'engine' : 'demo') + (simulatedData() ? ':simulated' : ':live');
+    if (state.privacyKey === key) return;
+    state.privacyKey = key;
+
+    var view = model.privacyView({ demo: simulatedData(), engine: engineMode() });
+    setText(dom.privacySubtitle, view.subtitle);
+    setText(dom.privacyModePill, view.modePillText);
+    dom.privacyModePill.title = view.modeTitle;
+    setText(dom.privacyIntro, view.intro);
+
+    dom.privacyModes.textContent = '';
+    view.modes.forEach(function (row) {
+      var item = document.createElement('li');
+      item.className = 'privacy-mode';
+      var head = document.createElement('div');
+      head.className = 'privacy-mode-head';
+      var title = document.createElement('span');
+      title.className = 'privacy-mode-title';
+      title.textContent = row.title;
+      var state = document.createElement('span');
+      state.className = 'pill privacy-mode-state';
+      state.textContent = row.stateText;
+      head.appendChild(title);
+      head.appendChild(state);
+      var detail = document.createElement('p');
+      detail.className = 'privacy-mode-detail';
+      detail.textContent = row.detail;
+      item.appendChild(head);
+      item.appendChild(detail);
+      dom.privacyModes.appendChild(item);
+    });
+
+    dom.privacyFacts.textContent = '';
+    view.facts.forEach(function (fact) {
+      var item = document.createElement('li');
+      item.className = 'privacy-fact';
+      var head = document.createElement('div');
+      head.className = 'privacy-fact-head';
+      var title = document.createElement('span');
+      title.className = 'privacy-fact-title';
+      title.textContent = fact.title;
+      var value = document.createElement('span');
+      value.className = 'privacy-fact-value';
+      value.textContent = fact.value;
+      head.appendChild(title);
+      head.appendChild(value);
+      var detail = document.createElement('p');
+      detail.className = 'privacy-fact-detail';
+      detail.textContent = fact.detail;
+      item.appendChild(head);
+      item.appendChild(detail);
+      dom.privacyFacts.appendChild(item);
+    });
+
+    dom.privacyLimits.textContent = '';
+    view.limits.forEach(function (line) {
+      var item = document.createElement('li');
+      item.textContent = line;
+      dom.privacyLimits.appendChild(item);
+    });
+
+    setText(dom.privacyStorageNote, view.storageNote);
+  }
+
   function renderPlatform(derived) {
     var info = object(state.bootstrap && state.bootstrap.app);
     var status = object(state.status);
@@ -1308,7 +1474,11 @@
         ? boundary.tunnel === 'not_implemented' ? 'Not implemented' : 'Unknown'
         : simulated
           ? 'Engine demo. No tunnel.'
-          : 'Engine service');
+          : status.running === true && status.mode === 'tun'
+            ? 'Direct mode'
+            : status.running === true && status.mode === 'phone'
+              ? 'Source device proxy mode'
+              : 'Engine service');
     setText(dom.versionLabel, (text(info.version) || '0.1.0') + (!known ? '' : simulated ? ' · demo only' : ' · engine'));
   }
 
@@ -1443,6 +1613,12 @@
     dom.secondaryAction.addEventListener('click', function () {
       performAction(dom.secondaryAction.dataset.action);
     });
+    [dom.modePhone, dom.modeDirect].forEach(function (button) {
+      if (!button) return;
+      button.addEventListener('click', function () {
+        chooseStartMode(button.getAttribute('data-start-mode'));
+      });
+    });
     dom.cancelPairing.addEventListener('click', function () {
       cancelPairing();
     });
@@ -1459,6 +1635,9 @@
     });
     dom.settingsTurnOffForget.addEventListener('click', function () {
       stopAndForget();
+    });
+    dom.settingsTryStop.addEventListener('click', function () {
+      stopTunnel(false);
     });
 
     dom.themeToggle.addEventListener('click', toggleTheme);

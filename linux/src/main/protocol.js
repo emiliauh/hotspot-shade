@@ -8,11 +8,12 @@
  */
 
 const SCENARIOS = require('../backend/demo-backend').SCENARIOS;
-const { SETTING_NAMES } = require('./settings');
+const { SETTING_NAMES, TUNNEL_MODES } = require('./settings');
 
 const MAX_COPY_TEXT = 20000;
 const MAX_ACTIVITY_SINCE = 1000000000;
 const CONTROL_CHARACTERS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+const START_MODES = TUNNEL_MODES;
 
 class ProtocolError extends Error {
   constructor(message) {
@@ -43,9 +44,12 @@ function noArgs(payload) {
 }
 
 function startOptions(payload) {
-  exactKeys(payload, ['ping']);
+  exactKeys(payload, ['mode', 'ping']);
+  if (!START_MODES.includes(payload.mode)) throw new ProtocolError();
   if (typeof payload.ping !== 'boolean') throw new ProtocolError();
-  return { ping: payload.ping };
+  /* Direct mode never uses the echo relay that ping controls. Normalize it
+   * away so a direct start body stays fixed. */
+  return { mode: payload.mode, ping: payload.mode === 'phone' ? payload.ping : false };
 }
 
 function activityQuery(payload) {
@@ -72,6 +76,10 @@ function copyText(payload) {
 function settingUpdate(payload) {
   exactKeys(payload, ['name', 'value']);
   if (typeof payload.name !== 'string' || !SETTING_NAMES.includes(payload.name)) throw new ProtocolError();
+  if (payload.name === 'tunnelMode') {
+    if (!TUNNEL_MODES.includes(payload.value)) throw new ProtocolError();
+    return { name: payload.name, value: payload.value };
+  }
   if (typeof payload.value !== 'boolean') throw new ProtocolError();
   return { name: payload.name, value: payload.value };
 }
@@ -80,6 +88,8 @@ module.exports = {
   MAX_ACTIVITY_SINCE: MAX_ACTIVITY_SINCE,
   MAX_COPY_TEXT: MAX_COPY_TEXT,
   ProtocolError: ProtocolError,
+  START_MODES: START_MODES,
+  TUNNEL_MODES: TUNNEL_MODES,
   activityQuery: activityQuery,
   copyText: copyText,
   isPlainObject: isPlainObject,

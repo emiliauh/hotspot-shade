@@ -21,8 +21,22 @@ internal object Hkdf {
         return mac.doFinal(data)
     }
 
-    /** HKDF-Extract: return HMAC(salt, input). */
-    fun extract(salt: ByteArray, input: ByteArray): ByteArray = hmac(salt, input)
+    /**
+     * HKDF-Extract: return HMAC(salt, input).
+     *
+     * RFC 5869 uses a string of 32 zero bytes when the salt is empty. An
+     * empty HMAC key is not portable: some providers reject it. This method
+     * substitutes the zero salt, so the result matches the RFC.
+     */
+    fun extract(salt: ByteArray, input: ByteArray): ByteArray {
+        if (salt.isNotEmpty()) return hmac(salt, input)
+        val zeroSalt = ByteArray(HASH_BYTES)
+        return try {
+            hmac(zeroSalt, input)
+        } finally {
+            zeroSalt.fill(0)
+        }
+    }
 
     /**
      * HKDF-Expand. The output length must be 1 to 255 times 32 bytes.

@@ -112,11 +112,13 @@ class RealProxyStateTest {
             totalConnections = 9,
         )
 
-        val report = state.diagnosticsReport("on")
+        val report = state.diagnosticsReport("on", "1.2.3")
 
         assertTrue(report.contains("Open connections: 2"))
         assertTrue(report.contains("Connections since start: 9"))
         assertTrue(report.contains("Pairing listener: on"))
+        assertTrue(report.contains("Version: 1.2.3"))
+        assertFalse(report.contains("demo"))
         assertFalse(report.contains("192.168."))
         assertFalse(report.contains("token="))
         assertFalse(report.contains("key="))

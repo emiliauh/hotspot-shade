@@ -1,1 +1,1 @@
-# The demo uses no reflection and no serialization.
+# The app uses no reflection and no serialization.

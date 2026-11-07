@@ -119,9 +119,111 @@ final class FakeLinkProvider: LinkInfoProvider {
     func currentLink() -> WiFiLinkInfo? { calls += 1; return link }
 }
 
+// Hold the pairing start request open after the engine accepted it. A Cancel
+// press during this window must still reach the engine.
+final class SlowPairingBackend: BackendClient {
+    let fake: FakeBackend
+    let startPairingDelay: UInt64
+    let cancelPairingDelay: UInt64
+    init(fake: FakeBackend, startPairingDelay: UInt64, cancelPairingDelay: UInt64 = 0) {
+        self.fake = fake
+        self.startPairingDelay = startPairingDelay
+        self.cancelPairingDelay = cancelPairingDelay
+    }
+    func status(timeout: TimeInterval) async throws -> Status { try await fake.status(timeout: timeout) }
+    func logs(since: Int) async throws -> [LogLine] { try await fake.logs(since: since) }
+    func pairState() async throws -> PairState { try await fake.pairState() }
+    func startPairing() async throws {
+        try await fake.startPairing()
+        if startPairingDelay > 0 { try await Task.sleep(nanoseconds: startPairingDelay) }
+    }
+    func cancelPairing() async throws {
+        try await fake.cancelPairing()
+        if cancelPairingDelay > 0 { try await Task.sleep(nanoseconds: cancelPairingDelay) }
+    }
+    func forget() async throws -> ForgetState { try await fake.forget() }
+    func startTunnel(experimentalICMP: Bool) async throws { try await fake.startTunnel(experimentalICMP: experimentalICMP) }
+    func stopTunnel(timeout: TimeInterval) async throws { try await fake.stopTunnel(timeout: timeout) }
+    func failures() async throws -> Failures { try await fake.failures() }
+    func probe() async throws -> Phone { try await fake.probe() }
+    func diagnostics() async throws -> Diagnostics { try await fake.diagnostics() }
+}
+
+// A deterministic pairing double. A step can model a reply that was lost
+// after the engine accepted the request, a refusal that never reached the
+// engine, or a normal start. No sleeps are needed.
+final class ScriptedPairingBackend: BackendClient {
+    enum StartStep {
+        case succeed
+        case failAfterStart(Error)
+        case failBeforeStart(Error)
+    }
+    let fake: FakeBackend
+    private let lock = NSLock()
+    private var startSteps: [StartStep]
+    private var cancelErrors: [Error]
+    private var storedPairStateError: Error?
+    private var storedStartCalls = 0
+    private var storedCancelCalls = 0
+    init(fake: FakeBackend, startSteps: [StartStep] = [], pairStateError: Error? = nil, cancelErrors: [Error] = []) {
+        self.fake = fake
+        self.startSteps = startSteps
+        self.storedPairStateError = pairStateError
+        self.cancelErrors = cancelErrors
+    }
+    var startCalls: Int { lock.lock(); defer { lock.unlock() }; return storedStartCalls }
+    var cancelCalls: Int { lock.lock(); defer { lock.unlock() }; return storedCancelCalls }
+    var pairStateError: Error? {
+        get { lock.lock(); defer { lock.unlock() }; return storedPairStateError }
+        set { lock.lock(); defer { lock.unlock() }; storedPairStateError = newValue }
+    }
+    private func takeStart() -> StartStep {
+        lock.lock(); defer { lock.unlock() }
+        storedStartCalls += 1
+        return startSteps.isEmpty ? .succeed : startSteps.removeFirst()
+    }
+    private func takePairStateError() -> Error? {
+        lock.lock(); defer { lock.unlock() }
+        return storedPairStateError
+    }
+    private func recordCancel() -> Error? {
+        lock.lock(); defer { lock.unlock() }
+        storedCancelCalls += 1
+        return cancelErrors.isEmpty ? nil : cancelErrors.removeFirst()
+    }
+    func status(timeout: TimeInterval) async throws -> Status { try await fake.status(timeout: timeout) }
+    func logs(since: Int) async throws -> [LogLine] { try await fake.logs(since: since) }
+    func pairState() async throws -> PairState {
+        if let error = takePairStateError() { throw error }
+        return try await fake.pairState()
+    }
+    func startPairing() async throws {
+        switch takeStart() {
+        case .succeed:
+            try await fake.startPairing()
+        case .failAfterStart(let error):
+            // The engine accepted the request before the reply was lost.
+            try await fake.startPairing()
+            throw error
+        case .failBeforeStart(let error):
+            throw error
+        }
+    }
+    func cancelPairing() async throws {
+        if let error = recordCancel() { throw error }
+        try await fake.cancelPairing()
+    }
+    func forget() async throws -> ForgetState { try await fake.forget() }
+    func startTunnel(experimentalICMP: Bool) async throws { try await fake.startTunnel(experimentalICMP: experimentalICMP) }
+    func stopTunnel(timeout: TimeInterval) async throws { try await fake.stopTunnel(timeout: timeout) }
+    func failures() async throws -> Failures { try await fake.failures() }
+    func probe() async throws -> Phone { try await fake.probe() }
+    func diagnostics() async throws -> Diagnostics { try await fake.diagnostics() }
+}
+
 @MainActor final class W6ModelTests: XCTestCase {
-    private func makeModel(_ fake: FakeBackend, now: @escaping () -> Date = Date.init, forgetIntent: ForgetIntentStore = MemoryForgetIntent(), sink: NotificationSink = NoNotificationSink(), link: LinkInfoProvider = NoLinkInfoProvider(), pasteboard: PasteboardWriting = NoPasteboard(), opener: SettingsOpening = NoSettingsOpener()) -> AppModel {
-        AppModel(backend: fake, now: now, pingSetting: W6PingSetting(), pasteboard: pasteboard, forgetIntent: forgetIntent, notificationSink: sink, settingsOpener: opener, linkProvider: link, macOSVersion: "14.5", appVersion: "1.0 (1)")
+    private func makeModel(_ backend: BackendClient, now: @escaping () -> Date = Date.init, forgetIntent: ForgetIntentStore = MemoryForgetIntent(), sink: NotificationSink = NoNotificationSink(), link: LinkInfoProvider = NoLinkInfoProvider(), pasteboard: PasteboardWriting = NoPasteboard(), opener: SettingsOpening = NoSettingsOpener()) -> AppModel {
+        AppModel(backend: backend, now: now, pingSetting: W6PingSetting(), pasteboard: pasteboard, forgetIntent: forgetIntent, notificationSink: sink, settingsOpener: opener, linkProvider: link, macOSVersion: "14.5", appVersion: "1.0 (1)")
     }
 
     // MARK: - Decode
@@ -177,8 +279,8 @@ final class FakeLinkProvider: LinkInfoProvider {
         XCTAssertNil(ForgetMessages.text(for: .unknown))
         XCTAssertNil(ForgetMessages.text(for: .none))
         XCTAssertEqual(ForgetMessages.text(for: .pending), "Forgetting...")
-        XCTAssertEqual(ForgetMessages.text(for: .confirmed), "Forgotten. The source device removed this target device.")
-        XCTAssertEqual(ForgetMessages.text(for: .notDelivered), "The source device did not answer. This target device forgot the pairing, but the source device may still trust it.")
+        XCTAssertEqual(ForgetMessages.text(for: .confirmed), "Could not confirm that the source device removed this pairing. This target device forgot the pairing, but the source device may still trust it.")
+        XCTAssertEqual(ForgetMessages.text(for: .notDelivered), "Could not confirm that the source device removed this pairing. This target device forgot the pairing, but the source device may still trust it.")
     }
     func testDecodesDiagnosticsTolerantly() throws {
         let json = """
@@ -213,6 +315,49 @@ final class FakeLinkProvider: LinkInfoProvider {
         XCTAssertNil(broken.tcp)
         XCTAssertNil(broken.failures)
         XCTAssertThrowsError(try JSONDecoder().decode(Diagnostics.self, from: Data("[]".utf8)))
+    }
+    func testTCPActiveFlowsIsLiveAndNeverFabricated() throws {
+        // Present: the live target relay count is distinct from the peak.
+        let present = try JSONDecoder().decode(TCPDiagnostics.self, from: Data("{\"flows_peak\":12,\"flows_active\":3}".utf8))
+        XCTAssertEqual(present.flows_peak, 12)
+        XCTAssertEqual(present.flows_active, 3)
+        XCTAssertNotEqual(present.flows_active, present.flows_peak)
+
+        // Missing from an older engine stays unknown.
+        let missing = try JSONDecoder().decode(TCPDiagnostics.self, from: Data("{\"flows_peak\":12}".utf8))
+        XCTAssertNil(missing.flows_active)
+
+        // Malformed and negative values stay unknown, not zero.
+        let malformed = try JSONDecoder().decode(TCPDiagnostics.self, from: Data("{\"flows_peak\":12,\"flows_active\":\"3\"}".utf8))
+        XCTAssertNil(malformed.flows_active)
+        let negative = try JSONDecoder().decode(TCPDiagnostics.self, from: Data("{\"flows_peak\":12,\"flows_active\":-2}".utf8))
+        XCTAssertNil(negative.flows_active)
+
+        let presentText = DiagnosticsReport.text(
+            diagnostics: Diagnostics(tcp: present),
+            failures: nil,
+            context: DiagnosticsContext(now: Date(timeIntervalSince1970: 0))
+        )
+        XCTAssertTrue(presentText.contains("TCP: 12 peak flows, 3 active flows"))
+
+        for body in ["{\"tcp\":{\"flows_peak\":12}}",
+                     "{\"tcp\":{\"flows_peak\":12,\"flows_active\":\"3\"}}",
+                     "{\"tcp\":{\"flows_peak\":12,\"flows_active\":-2}}"] {
+            let value = try JSONDecoder().decode(Diagnostics.self, from: Data(body.utf8))
+            let text = DiagnosticsReport.text(diagnostics: value, failures: nil, context: DiagnosticsContext(now: Date(timeIntervalSince1970: 0)))
+            XCTAssertTrue(text.contains("TCP: 12 peak flows, unknown active flows"), text)
+            XCTAssertFalse(text.contains("0 active flows"), text)
+        }
+
+        // A negative value that arrives through the public initializer also
+        // reports unknown.
+        let invalid = DiagnosticsReport.text(
+            diagnostics: Diagnostics(tcp: TCPDiagnostics(flows_peak: 12, flows_active: -2)),
+            failures: nil,
+            context: DiagnosticsContext(now: Date(timeIntervalSince1970: 0))
+        )
+        XCTAssertTrue(invalid.contains("TCP: 12 peak flows, unknown active flows"), invalid)
+        XCTAssertFalse(invalid.contains("-2 active flows"), invalid)
     }
 
     // MARK: - HTTP
@@ -275,7 +420,7 @@ final class FakeLinkProvider: LinkInfoProvider {
     }
     func testOldEngineNewEndpointsAreUnavailable() async throws {
         // An older engine sends the old status and has no new endpoints. Use a
-        // stub, so the test does not depend on a demo binary in the build.
+        // stub, so the test does not depend on an engine binary in the build.
         let status = try StubHTTPServer(body: "{\"ok\":true,\"running\":false,\"paired\":false,\"phone\":{\"state\":\"unpaired\"}}")
         defer { status.stop() }
         let client = HTTPBackend(port: status.port, secret: "secret")
@@ -339,27 +484,27 @@ final class FakeLinkProvider: LinkInfoProvider {
     }
     func testForgetResultFollowsTheLateEngineStatus() async {
         let fake = FakeBackend()
-        fake.currentStatus = Status(paired: false, phone: Phone(state: "unpaired"))
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
         fake.currentForget = ForgetState(state: "pending")
         fake.currentProbe = Phone(state: "unpaired")
         let model = makeModel(fake, forgetIntent: MemoryForgetIntent(true))
         let result = await model.forget()
         XCTAssertEqual(result, .done(.pending))
-        fake.currentStatus = Status(paired: false, phone: Phone(state: "unpaired"), forget: ForgetState(state: "confirmed", attempts: 1))
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"), forget: ForgetState(state: "confirmed", attempts: 1))
         await model.refresh()
         XCTAssertEqual(model.forgetProgress, .confirmed)
         XCTAssertEqual(model.forgetResult, .done(.confirmed))
-        XCTAssertEqual(model.screenModel.subtitle, "Forgotten. The source device removed this target device.")
+        XCTAssertEqual(model.screenModel.subtitle, "Could not confirm that the source device removed this pairing. This target device forgot the pairing, but the source device may still trust it.")
     }
     func testForgetMessagesForEveryEngineState() async {
         let cases: [(ForgetPhase, String)] = [
             (.pending, "Forgetting..."),
-            (.confirmed, "Forgotten. The source device removed this target device."),
-            (.notDelivered, "The source device did not answer. This target device forgot the pairing, but the source device may still trust it."),
+            (.confirmed, "Could not confirm that the source device removed this pairing. This target device forgot the pairing, but the source device may still trust it."),
+            (.notDelivered, "Could not confirm that the source device removed this pairing. This target device forgot the pairing, but the source device may still trust it."),
         ]
         for (phase, text) in cases {
             let fake = FakeBackend()
-            fake.currentStatus = Status(paired: false, phone: Phone(state: "unpaired"))
+            fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
             fake.currentForget = ForgetState(state: phase.rawValue)
             fake.currentProbe = Phone(state: "unpaired")
             let model = makeModel(fake, forgetIntent: MemoryForgetIntent(true))
@@ -376,7 +521,7 @@ final class FakeLinkProvider: LinkInfoProvider {
     }
     func testForgetSetsIntentAndCancelsPairingFirst() async {
         let fake = FakeBackend(); let store = MemoryForgetIntent()
-        fake.currentStatus = Status(paired: false, phone: Phone(state: "unpaired"))
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
         fake.currentProbe = Phone(state: "unpaired")
         let model = makeModel(fake, forgetIntent: store)
         await model.beginPairing()
@@ -393,22 +538,30 @@ final class FakeLinkProvider: LinkInfoProvider {
     }
     func testCancelThenForgetQuicklyLeavesOneFinalState() async {
         let fake = FakeBackend(); let store = MemoryForgetIntent()
-        fake.currentStatus = Status(paired: false, phone: Phone(state: "unpaired"))
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
         fake.currentProbe = Phone(state: "unpaired")
         let model = makeModel(fake, forgetIntent: store)
         await model.beginPairing()
         async let cancel: Void = model.cancelPairing()
         async let forget: ForgetResult = model.forget()
         let (_, result) = await (cancel, forget)
+        if case .failed = result {
+            // A concurrent cancellation owns the engine until it settles.
+            XCTAssertFalse(fake.calls.contains("forget"))
+            let retry = await model.forget()
+            XCTAssertEqual(retry, .done(.confirmed))
+        } else {
+            XCTAssertEqual(result, .done(.confirmed))
+        }
         await model.refresh()
-        XCTAssertEqual(model.forgetResult, result)
+        XCTAssertEqual(model.forgetResult, .done(.confirmed))
         XCTAssertFalse(model.isPairing)
         XCTAssertTrue(store.forgotIntent)
         XCTAssertEqual(model.screen, .unpaired)
     }
     func testForgetIntentPersistsAndBlocksAutoPairingAfterRelaunch() async {
         let fake = FakeBackend(); let store = MemoryForgetIntent()
-        fake.currentStatus = Status(paired: false, phone: Phone(state: "unpaired"))
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
         let first = makeModel(fake, forgetIntent: store)
         await first.refresh(); first.stopPolling()
         XCTAssertEqual(fake.calls.filter { $0 == "startPairing" }.count, 1)
@@ -424,7 +577,7 @@ final class FakeLinkProvider: LinkInfoProvider {
     }
     func testCancelSuppressesOnlyTheCurrentLaunch() async {
         let fake = FakeBackend()
-        fake.currentStatus = Status(paired: false, phone: Phone(state: "unpaired"))
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
         let first = makeModel(fake)
         await first.refresh()
         await first.cancelPairing()
@@ -452,7 +605,7 @@ final class FakeLinkProvider: LinkInfoProvider {
 
     func testForgetProbesImmediately() async {
         let fake = FakeBackend()
-        fake.currentStatus = Status(paired: false, phone: Phone(state: "unpaired"))
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
         fake.currentProbe = Phone(state: "unpaired")
         let model = makeModel(fake, forgetIntent: MemoryForgetIntent(true))
         _ = await model.forget()
@@ -463,20 +616,26 @@ final class FakeLinkProvider: LinkInfoProvider {
     }
     func testPairProbesImmediately() async {
         let fake = FakeBackend()
-        fake.currentStatus = Status(paired: false, phone: Phone(state: "unpaired"))
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
         let model = makeModel(fake)
         await model.beginPairing()
         fake.currentPair = PairState(state: "confirm", code: "123 456")
-        fake.currentStatus = Status(paired: true, phone: Phone(state: "ready"))
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
         fake.currentProbe = Phone(state: "ready")
         fake.currentPair = PairState(state: "paired")
         await model.refreshPairing()
+        // The background pairing poll may win the race and be completing its
+        // own probe when the explicit refresh returns. Wait for that result.
+        for _ in 0..<100 {
+            if fake.calls.contains("probe") && model.screen == .ready { break }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
         XCTAssertTrue(fake.calls.contains("probe"))
         XCTAssertEqual(model.screen, .ready)
     }
     func testCheckNowProbesAndRefreshes() async {
         let fake = FakeBackend()
-        fake.currentStatus = Status(paired: true, phone: Phone(state: "ready"))
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
         let model = makeModel(fake)
         await model.refresh()
         let before = fake.calls.filter { $0 == "probe" }.count
@@ -485,7 +644,7 @@ final class FakeLinkProvider: LinkInfoProvider {
     }
     func testUnavailableProbeKeepsTheScreen() async {
         let fake = FakeBackend()
-        fake.currentStatus = Status(paired: true, phone: Phone(state: "ready"))
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
         let model = makeModel(fake)
         await model.refresh()
         fake.probeError = BackendError.unavailable
@@ -515,7 +674,7 @@ final class FakeLinkProvider: LinkInfoProvider {
     }
     func testTokenRejectedAtStartShowsPairAgain() async {
         let fake = FakeBackend()
-        fake.currentStatus = Status(paired: true, phone: Phone(state: "ready"))
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
         let model = makeModel(fake)
         await model.refresh()
         fake.failure = BackendError.phoneTokenRejected("The source device changed its token. Open HotspotShade on your source device, then pair again.")
@@ -530,7 +689,7 @@ final class FakeLinkProvider: LinkInfoProvider {
         var clock = Date(timeIntervalSince1970: 1_000)
         let fake = FakeBackend()
         let model = makeModel(fake, now: { clock })
-        func set(_ checked: Double) { fake.currentStatus = Status(paired: true, phone: Phone(state: "ready", checkedAt: checked)) }
+        func set(_ checked: Double) { fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready", checkedAt: checked)) }
         set(1_000); await model.refresh()
         XCTAssertEqual(model.lastCheckedText, "Checked just now")
         clock.addTimeInterval(9); set(1_000); await model.refresh()
@@ -566,15 +725,15 @@ final class FakeLinkProvider: LinkInfoProvider {
         await model.refresh()
         XCTAssertTrue(model.statusIsStale)
         XCTAssertFalse(model.statusUnavailable)
-        XCTAssertEqual(model.staleStatusText, "The engine did not answer. This status may be out of date.")
+        XCTAssertEqual(model.staleStatusText, Strings.staleStatus)
         XCTAssertEqual(model.screen, .on)
-        XCTAssertTrue(model.screenModel.attentionItems.contains("The engine did not answer. This status may be out of date."))
+        XCTAssertTrue(model.screenModel.attentionItems.contains(Strings.staleStatus))
         clock.addTimeInterval(7)
         await model.refresh()
         XCTAssertTrue(model.statusUnavailable)
         XCTAssertEqual(model.screen, .unknown)
         XCTAssertEqual(model.screenModel.title, "Status unavailable")
-        XCTAssertEqual(model.screenModel.subtitle, "The engine did not answer.")
+        XCTAssertEqual(model.screenModel.subtitle, Strings.statusUnavailableSubtitle)
         XCTAssertEqual(model.screenModel.primaryAction, .checkNow)
         XCTAssertEqual(model.screenModel.statusKind, .attention)
         XCTAssertTrue(model.screenModel.connection.lines.isEmpty)
@@ -589,7 +748,7 @@ final class FakeLinkProvider: LinkInfoProvider {
     }
     func testWindowVisibilityChangesThePollIntervalAndRefreshesAtOnce() async throws {
         let fake = FakeBackend()
-        fake.currentStatus = Status(paired: true, phone: Phone(state: "ready"))
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
         let model = makeModel(fake)
         XCTAssertEqual(model.statusPollInterval, 1)
         model.startPolling()
@@ -604,6 +763,27 @@ final class FakeLinkProvider: LinkInfoProvider {
         XCTAssertGreaterThan(fake.calls.count, before)
         XCTAssertTrue(model.windowVisible)
         model.stopPolling()
+    }
+
+    // The Activity screen has its own error text. A failed read must not
+    // change the dashboard, and the next success clears the error.
+    func testLoadLogsReportsAnErrorAndClearsIt() async {
+        let fake = FakeBackend()
+        var status = Status(running: false, paired: true, phone: Phone(state: "ready"))
+        status.logs = [LogLine(seq: 1, level: "info", msg: "One.", ts: 1)]
+        fake.currentStatus = status
+        let model = makeModel(fake)
+        await model.refresh()
+        let screen = model.screen
+        fake.failure = BackendError.timeout
+        await model.loadLogs()
+        XCTAssertNotNil(model.logsError)
+        XCTAssertFalse(model.logsError?.isEmpty ?? true)
+        XCTAssertEqual(model.screen, screen)
+        fake.failure = nil
+        await model.loadLogs()
+        XCTAssertNil(model.logsError)
+        XCTAssertFalse(model.logLines.isEmpty)
     }
 
     // MARK: - Link
@@ -718,6 +898,14 @@ final class FakeLinkProvider: LinkInfoProvider {
         output = other.evaluate(NotificationInput(error: "The tunnel failed."))
         XCTAssertEqual(output.messages.map(\.body), ["The tunnel failed."])
     }
+    // A stop error with no detail uses a full sentence, not the bare heading.
+    func testNotificationPolicyErrorFallbackBody() {
+        var policy = NotificationPolicy(now: { Date(timeIntervalSince1970: 100) })
+        let output = policy.evaluate(NotificationInput(lastStop: LastStop(reason: "error", at: 1)))
+        XCTAssertEqual(output.messages.map(\.body), [Strings.tunnelErrorBody])
+        XCTAssertEqual(Strings.tunnelErrorBody, "The tunnel stopped with an error. Open HotspotShade to see the details.")
+        XCTAssertNotEqual(output.messages.first?.body, Strings.attention)
+    }
     func testNotificationPolicyReportsAStaticErrorOnce() {
         var clock = Date(timeIntervalSince1970: 100)
         var policy = NotificationPolicy(now: { clock })
@@ -755,7 +943,7 @@ final class FakeLinkProvider: LinkInfoProvider {
     func testModelAsksForNotificationPermissionOnce() async {
         let fake = FakeBackend(); let sink = RecordingNotificationSink()
         sink.status = .notDetermined; sink.granted = .authorized
-        fake.currentStatus = Status(paired: true, phone: Phone(state: "ready"))
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
         let model = makeModel(fake, sink: sink)
         await model.refresh()
         await model.requestNotificationPermissionIfNeeded()
@@ -772,7 +960,7 @@ final class FakeLinkProvider: LinkInfoProvider {
     // and the screen must show Starting while the request waits.
     func testStartDoesNotWaitForNotificationPermission() async {
         let fake = FakeBackend(); let sink = SuspendedNotificationSink()
-        fake.currentStatus = Status(paired: true, phone: Phone(state: "ready"))
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
         let model = makeModel(fake, sink: sink)
         await model.refresh()
         let action = Task { await model.toggle() }
@@ -785,7 +973,7 @@ final class FakeLinkProvider: LinkInfoProvider {
     // button repeats the start.
     func testStartFailureStaysVisibleAndTryAgainStartsAgain() async {
         let fake = FakeBackend()
-        fake.currentStatus = Status(paired: true, phone: Phone(state: "ready"))
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
         let model = makeModel(fake)
         await model.refresh()
         fake.failure = BackendError.response("The tunnel could not start.")
@@ -811,7 +999,7 @@ final class FakeLinkProvider: LinkInfoProvider {
     }
     func testForgetClearsAStartError() async {
         let fake = FakeBackend()
-        fake.currentStatus = Status(paired: true, phone: Phone(state: "ready"))
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
         let model = makeModel(fake)
         await model.refresh()
         fake.failure = BackendError.response("The tunnel could not start.")
@@ -822,6 +1010,466 @@ final class FakeLinkProvider: LinkInfoProvider {
         XCTAssertEqual(model.screen, .unpaired)
         XCTAssertNotEqual(model.screenModel.title, Strings.attention)
     }
+
+    // MARK: - Review regressions: retry direction, pairing, forget races
+
+    // A lost start answer can leave the tunnel on. Try again must repeat the
+    // start, not read the new status and send a stop.
+    func testRetryAfterLostStartAnswerKeepsTheStartDirection() async {
+        let fake = FakeBackend()
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
+        let model = makeModel(fake)
+        await model.refresh()
+        XCTAssertEqual(model.screenModel.primaryAction, .turnOn)
+        fake.failure = BackendError.timeout
+        await model.toggle()
+        XCTAssertEqual(model.screenModel.primaryAction, .retry)
+        XCTAssertEqual(fake.calls.filter { $0 == "startTunnel" }.count, 1)
+        // The engine started, but the answer was lost.
+        fake.failure = nil
+        fake.currentStatus = Status(running: true, paired: true, phone: Phone(state: "connected"))
+        await model.perform(.retry)
+        XCTAssertEqual(fake.calls.filter { $0 == "stopTunnel" }.count, 0)
+        XCTAssertEqual(fake.calls.filter { $0 == "startTunnel" }.count, 2)
+        XCTAssertEqual(model.screen, .on)
+        XCTAssertEqual(model.screenModel.primaryAction, .turnOff)
+    }
+
+    // The mirror case: a lost stop answer that already stopped the tunnel
+    // must not become a start.
+    func testRetryAfterLostStopAnswerKeepsTheStopDirection() async {
+        let fake = FakeBackend()
+        fake.currentStatus = Status(running: true, paired: true, phone: Phone(state: "connected"))
+        let model = makeModel(fake)
+        await model.refresh()
+        XCTAssertEqual(model.screen, .on)
+        fake.failure = BackendError.timeout
+        await model.toggle()
+        XCTAssertEqual(model.screenModel.primaryAction, .retry)
+        XCTAssertEqual(fake.calls.filter { $0 == "stopTunnel" }.count, 1)
+        fake.failure = nil
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
+        await model.perform(.retry)
+        XCTAssertEqual(fake.calls.filter { $0 == "startTunnel" }.count, 0)
+        XCTAssertEqual(fake.calls.filter { $0 == "stopTunnel" }.count, 2)
+        XCTAssertEqual(model.screen, .ready)
+    }
+
+    // The toolbar refresh is a status read, not a retry. It must not hide a
+    // start error or change the Try again target.
+    func testCheckNowKeepsAStartFailure() async {
+        let fake = FakeBackend()
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
+        let model = makeModel(fake)
+        await model.refresh()
+        fake.failure = BackendError.response("The tunnel could not start.")
+        await model.toggle()
+        XCTAssertEqual(model.screenModel.primaryAction, .retry)
+        XCTAssertEqual(model.screenModel.subtitle, "The tunnel could not start.")
+        fake.failure = nil
+        await model.checkNow()
+        XCTAssertEqual(model.screenModel.primaryAction, .retry)
+        XCTAssertEqual(model.screenModel.subtitle, "The tunnel could not start.")
+        // Try again still sends the start.
+        let before = fake.calls.filter { $0 == "startTunnel" }.count
+        await model.perform(.retry)
+        XCTAssertEqual(fake.calls.filter { $0 == "startTunnel" }.count, before + 1)
+        XCTAssertNotEqual(model.screenModel.title, Strings.attention)
+    }
+
+    // A paired phase from the last pairing must not disable Pair after the
+    // source device stops trusting this target device.
+    func testStalePairedPhaseAfterTrustLossStillAllowsPair() async {
+        let fake = FakeBackend()
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
+        let model = makeModel(fake)
+        await model.refresh()
+        await model.beginPairing()
+        // Drive the pairing state by hand. Cancel the background poll so a
+        // late probe cannot overwrite the trust-loss status below.
+        model.stopPolling()
+        fake.currentPair = PairState(state: "paired")
+        await model.refreshPairing()
+        XCTAssertFalse(model.isPairing)
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "not_trusted"))
+        await model.refresh()
+        XCTAssertEqual(model.screen, .notTrusted)
+        let pair = model.screenModel.menuBar.actions.first { $0.kind == .pair }
+        XCTAssertEqual(pair?.enabled, true)
+        XCTAssertNil(pair?.reason)
+    }
+
+    // Forget clears the old pairing state, so the Pair action is usable at
+    // once. A stale paired phase used to leave the menu Pair disabled.
+    func testForgetResetsThePairedPhaseForANewPair() async {
+        let fake = FakeBackend()
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
+        fake.currentProbe = Phone(state: "unpaired")
+        let model = makeModel(fake)
+        await model.refresh()
+        await model.beginPairing()
+        // Cancel the background poll. The test drives the pairing result and
+        // then the forget itself.
+        model.stopPolling()
+        fake.currentPair = PairState(state: "paired")
+        await model.refreshPairing()
+        XCTAssertFalse(model.isPairing)
+        let result = await model.forget()
+        XCTAssertEqual(result, .done(.confirmed))
+        XCTAssertEqual(model.screen, .unpaired)
+        XCTAssertNil(model.pairing.state)
+        let pair = model.screenModel.menuBar.actions.first { $0.kind == .pair }
+        XCTAssertEqual(pair?.enabled, true)
+        XCTAssertNil(pair?.reason)
+    }
+
+    // A Cancel press while the start request is in flight must still reach
+    // the engine. The old busy guard dropped it.
+    func testCancelDuringPairingStartIsNotDropped() async {
+        let fake = FakeBackend()
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
+        let backend = SlowPairingBackend(fake: fake, startPairingDelay: 300_000_000)
+        let model = makeModel(backend)
+        let start = Task { await model.beginPairing() }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertTrue(model.isPairing)
+        await model.cancelPairing()
+        XCTAssertFalse(model.isPairing)
+        await start.value
+        XCTAssertFalse(model.isPairing)
+        XCTAssertEqual(fake.calls.filter { $0 == "startPairing" }.count, 1)
+        XCTAssertEqual(fake.calls.filter { $0 == "cancelPairing" }.count, 1)
+        let startIndex = fake.calls.firstIndex(of: "startPairing")
+        let cancelIndex = fake.calls.firstIndex(of: "cancelPairing")
+        XCTAssertNotNil(startIndex); XCTAssertNotNil(cancelIndex)
+        if let startIndex, let cancelIndex { XCTAssertLessThan(startIndex, cancelIndex) }
+        XCTAssertEqual(model.screen, .unpaired)
+    }
+
+    // The engine refuses a pairing start while an old cancel runs. A new
+    // Pair press waits for the cancel to settle instead of racing it.
+    func testNewPairWaitsForAnInFlightCancel() async {
+        let fake = FakeBackend()
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
+        let backend = SlowPairingBackend(fake: fake, startPairingDelay: 0, cancelPairingDelay: 300_000_000)
+        let model = makeModel(backend)
+        await model.beginPairing()
+        XCTAssertTrue(model.isPairing)
+        let cancel = Task { await model.cancelPairing() }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        await model.beginPairing()
+        XCTAssertEqual(fake.calls.filter { $0 == "startPairing" }.count, 1)
+        await cancel.value
+        XCTAssertFalse(model.isPairing)
+    }
+
+    // A failed pairing leaves the pairing view, so its message must move to
+    // the dashboard. It sends one notification, not one per poll.
+    func testPairingFailureStaysVisibleAndNotifiesOnce() async {
+        let fake = FakeBackend()
+        let sink = RecordingNotificationSink()
+        sink.status = .authorized
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
+        let model = makeModel(fake, sink: sink)
+        model.setFrontmost(false)
+        await model.refreshNotificationAuthorization()
+        // Read the unpaired status once, then cancel the automatic attempt and
+        // run the one under test.
+        await model.refresh()
+        await model.cancelPairing()
+        await model.beginPairing()
+        // Drive the pairing result by hand, without a background poll.
+        model.stopPolling()
+        fake.currentPair = PairState(state: "failed", error: "The pairing code does not match.")
+        await model.refreshPairing()
+        XCTAssertFalse(model.isPairing)
+        XCTAssertEqual(model.screen, .unpaired)
+        XCTAssertEqual(model.screenModel.subtitle, "The pairing code does not match.")
+        XCTAssertEqual(model.screenModel.primaryAction, .pair)
+        XCTAssertEqual(sink.messages.filter { $0.kind == .pairingAttention }.count, 1)
+        await model.refreshPairing()
+        XCTAssertEqual(sink.messages.filter { $0.kind == .pairingAttention }.count, 1)
+    }
+
+    // A lost start reply may hide a pairing that the engine accepted. The app
+    // must send a best-effort cancel, keep the start error visible, and stay
+    // ready for another Pair.
+    func testLostPairingStartReplySendsCancelAndKeepsTheError() async {
+        let fake = FakeBackend()
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
+        let backend = ScriptedPairingBackend(fake: fake, startSteps: [.failAfterStart(BackendError.timeout)])
+        let model = makeModel(backend)
+        await model.beginPairing()
+        XCTAssertEqual(backend.startCalls, 1)
+        XCTAssertEqual(backend.cancelCalls, 1)
+        XCTAssertFalse(model.isPairing)
+        XCTAssertFalse(model.pairingStartInFlight)
+        XCTAssertFalse(model.pairingCancelInFlight)
+        XCTAssertEqual(model.screen, .needsAttention("The engine did not respond in time."))
+        XCTAssertEqual(model.screenModel.primaryAction, .retry)
+        XCTAssertEqual(model.screenModel.menuBar.actions.first { $0.kind == .pair }?.enabled, true)
+    }
+
+    // If the best-effort cancel also loses its reply, the Cancel action stays
+    // available so the person can send it again. The original error remains.
+    func testFailedBestEffortCancelRetainsTheCancelAction() async {
+        let fake = FakeBackend()
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
+        let backend = ScriptedPairingBackend(fake: fake, startSteps: [.failAfterStart(BackendError.timeout)], cancelErrors: [BackendError.timeout])
+        let model = makeModel(backend)
+        await model.beginPairing()
+        XCTAssertEqual(backend.cancelCalls, 1)
+        XCTAssertTrue(model.pairingCancelRequested)
+        XCTAssertEqual(model.screen, .needsAttention("The engine did not respond in time."))
+        let cancel = model.screenModel.menuBar.actions.first { $0.kind == .cancel }
+        XCTAssertEqual(cancel?.enabled, true)
+        XCTAssertEqual(model.screenModel.menuBar.actions.first { $0.kind == .pair }?.enabled, false)
+    }
+
+    // A lost pairing poll reply must not leave the engine pairing without a
+    // cancel. The failure stays on the calm Not paired screen, and it must not
+    // pretend that a code check failed.
+    func testLostPairingPollReplySendsCancelAndKeepsTheFailure() async {
+        let fake = FakeBackend()
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
+        let sink = RecordingNotificationSink()
+        sink.status = .authorized
+        let backend = ScriptedPairingBackend(fake: fake)
+        let model = makeModel(backend, forgetIntent: MemoryForgetIntent(true), sink: sink)
+        model.setFrontmost(false)
+        await model.refreshNotificationAuthorization()
+        // Read the unpaired status without starting the automatic attempt.
+        await model.refresh()
+        await model.beginPairing()
+        model.stopPolling()
+        backend.pairStateError = BackendError.timeout
+        await model.refreshPairing()
+        XCTAssertEqual(backend.cancelCalls, 1)
+        XCTAssertFalse(model.isPairing)
+        XCTAssertEqual(model.pairingFailure, "The engine did not respond in time.")
+        XCTAssertEqual(model.screen, .unpaired)
+        XCTAssertEqual(model.screenModel.subtitle, "The engine did not respond in time.")
+        XCTAssertEqual(model.screenModel.primaryAction, .pair)
+        XCTAssertTrue(sink.messages.isEmpty, "A lost reply is not a code prompt.")
+    }
+
+    // The engine reports pair_busy when an earlier request still owns the
+    // pairing. One best-effort cancel releases it, so the next Pair can start.
+    func testPairBusyStartSendsCancelAndAllowsANewPair() async {
+        let fake = FakeBackend()
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
+        let backend = ScriptedPairingBackend(fake: fake, startSteps: [
+            .failBeforeStart(BackendError.response("A pairing is already running.")),
+            .succeed,
+        ])
+        let model = makeModel(backend)
+        await model.beginPairing()
+        XCTAssertEqual(backend.startCalls, 1)
+        XCTAssertEqual(backend.cancelCalls, 1)
+        XCTAssertEqual(model.screenModel.subtitle, "A pairing is already running.")
+        XCTAssertEqual(model.screenModel.primaryAction, .retry)
+        await model.beginPairing()
+        XCTAssertEqual(backend.startCalls, 2)
+        XCTAssertEqual(model.isPairing, true)
+        XCTAssertEqual(model.screen, .pairing)
+        model.stopPolling()
+    }
+
+    // A pairing error stays in the attention list during the one automatic
+    // retry. A second automatic failure stops the loop and leaves the text on
+    // the Not paired screen.
+    func testPairingFailureSurvivesTheAutomaticRetry() async {
+        let fake = FakeBackend()
+        var clock = Date(timeIntervalSince1970: 100)
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
+        let model = makeModel(fake, now: { clock })
+        await model.refresh()
+        model.stopPolling()
+        XCTAssertEqual(fake.calls.filter { $0 == "startPairing" }.count, 1)
+        let text = "The pairing code does not match."
+        fake.currentPair = PairState(state: "failed", error: text)
+        await model.refreshPairing()
+        XCTAssertEqual(model.pairingFailure, text)
+        clock.addTimeInterval(10)
+        await model.refresh()
+        XCTAssertEqual(fake.calls.filter { $0 == "startPairing" }.count, 2)
+        XCTAssertEqual(model.pairingFailure, text)
+        XCTAssertTrue(model.screenModel.attentionItems.contains(text))
+        // Let the retry fail. No third automatic start may hide the text.
+        model.stopPolling()
+        await model.refreshPairing()
+        clock.addTimeInterval(20)
+        await model.refresh()
+        XCTAssertEqual(fake.calls.filter { $0 == "startPairing" }.count, 2)
+        XCTAssertEqual(model.pairingFailure, text)
+        XCTAssertEqual(model.screen, .unpaired)
+        XCTAssertEqual(model.screenModel.subtitle, text)
+        XCTAssertEqual(model.screenModel.primaryAction, .pair)
+    }
+
+    // The main action names its direction. A stale status must not invert it.
+    func testExplicitTurnOnStartsEvenWhenTheStatusSaysOn() async {
+        let fake = FakeBackend()
+        fake.currentStatus = Status(running: true, paired: true, phone: Phone(state: "connected"))
+        let model = makeModel(fake)
+        await model.refresh()
+        await model.perform(.turnOn)
+        XCTAssertEqual(fake.calls.filter { $0 == "startTunnel" }.count, 1)
+        XCTAssertFalse(fake.calls.contains("stopTunnel"))
+    }
+    func testExplicitTurnOffStopsEvenWhenTheStatusSaysOff() async {
+        let fake = FakeBackend()
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
+        let model = makeModel(fake)
+        await model.refresh()
+        await model.perform(.turnOff)
+        XCTAssertEqual(fake.calls.filter { $0 == "stopTunnel" }.count, 1)
+        XCTAssertFalse(fake.calls.contains("startTunnel"))
+    }
+
+    // A Forget owns the engine. The main and menu actions must not look
+    // usable while it runs.
+    func testForgetBusyStateDisablesTheActions() async {
+        let fake = FakeBackend()
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
+        fake.operationDelay = 300_000_000
+        let model = makeModel(fake)
+        await model.refresh()
+        let forget = Task { await model.forget() }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertTrue(model.forgetInFlight)
+        XCTAssertTrue(model.forgetIsBusy)
+        XCTAssertNil(model.screenModel.secondaryAction)
+        XCTAssertNil(model.screenModel.primaryAction)
+        XCTAssertEqual(model.screenModel.subtitle, Strings.forgetPending)
+        let pair = model.screenModel.menuBar.actions.first { $0.kind == .pair }
+        XCTAssertEqual(pair?.enabled, false)
+        XCTAssertEqual(pair?.reason, AppModelActionText.waitForAction)
+        _ = await forget.value
+        XCTAssertFalse(model.forgetInFlight)
+    }
+
+    // A cancel owns the engine until its reply arrives. The Cancel row stays
+    // visible but disabled, and Pair waits.
+    func testCancelBusyStateDisablesCancelAndPair() async {
+        let fake = FakeBackend()
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
+        let backend = SlowPairingBackend(fake: fake, startPairingDelay: 0, cancelPairingDelay: 300_000_000)
+        let model = makeModel(backend)
+        await model.beginPairing()
+        let cancel = Task { await model.cancelPairing() }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertTrue(model.pairingCancelInFlight)
+        XCTAssertTrue(model.pairingCancelIsBusy)
+        let cancelRow = model.screenModel.menuBar.actions.first { $0.kind == .cancel }
+        XCTAssertEqual(cancelRow?.enabled, false)
+        XCTAssertEqual(cancelRow?.reason, AppModelActionText.cancelingPairing)
+        XCTAssertEqual(model.screenModel.menuBar.actions.first { $0.kind == .pair }?.enabled, false)
+        XCTAssertEqual(model.screenModel.subtitle, AppModelActionText.cancelingPairing)
+        await cancel.value
+        XCTAssertFalse(model.pairingCancelInFlight)
+        model.stopPolling()
+    }
+
+    // A failed Pair request must not arrive as a tunnel failure. The old
+    // policy sent "The engine did not respond in time." as a tunnel error.
+    func testPairingTransportFailureDoesNotPostATunnelNotification() async {
+        let fake = FakeBackend()
+        let sink = RecordingNotificationSink()
+        sink.status = .authorized
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
+        let backend = ScriptedPairingBackend(fake: fake, startSteps: [.failAfterStart(BackendError.timeout)])
+        let model = makeModel(backend, sink: sink)
+        model.setFrontmost(false)
+        await model.refreshNotificationAuthorization()
+        await model.beginPairing()
+        await model.refresh()
+        XCTAssertFalse(sink.messages.contains { $0.kind == .tunnelError })
+        XCTAssertFalse(sink.messages.contains { $0.kind == .pairingAttention })
+    }
+
+    // A failed pairing cancel is not a tunnel failure either. It keeps the
+    // Cancel action and does not post a tunnel-error notification.
+    func testPairingCancelTransportFailureDoesNotPostATunnelNotification() async {
+        let fake = FakeBackend()
+        let sink = RecordingNotificationSink()
+        sink.status = .authorized
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
+        let backend = ScriptedPairingBackend(fake: fake, cancelErrors: [BackendError.timeout])
+        let model = makeModel(backend, sink: sink)
+        model.setFrontmost(false)
+        await model.refreshNotificationAuthorization()
+        await model.beginPairing()
+        await model.cancelPairing()
+        XCTAssertTrue(model.pairingCancelRequested)
+        XCTAssertEqual(model.screenModel.menuBar.actions.first { $0.kind == .cancel }?.enabled, true)
+        await model.refresh()
+        XCTAssertFalse(sink.messages.contains { $0.kind == .tunnelError })
+        model.stopPolling()
+    }
+
+    // A forget must not slip between an in-flight start and the status read
+    // that decides whether the engine may be asked.
+    func testForgetIsRefusedWhileAStartIsInFlight() async {
+        let fake = FakeBackend()
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
+        fake.operationDelay = 300_000_000
+        let model = makeModel(fake)
+        await model.refresh()
+        let start = Task { await model.toggle() }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        let result = await model.forget()
+        XCTAssertEqual(result, .failed(AppModelActionText.waitForAction))
+        XCTAssertEqual(model.forgetResult, result)
+        XCTAssertEqual(model.forgetMessage, AppModelActionText.waitForAction)
+        XCTAssertFalse(fake.calls.contains("forget"))
+        await start.value
+    }
+
+    // A start must not run while a forget is in flight, even if the last
+    // visible status is old.
+    func testStartIsRefusedWhileForgetIsInFlight() async {
+        let fake = FakeBackend()
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
+        fake.operationDelay = 300_000_000
+        let model = makeModel(fake)
+        await model.refresh()
+        let forget = Task { await model.forget() }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        await model.toggle()
+        XCTAssertFalse(fake.calls.contains("startTunnel"))
+        _ = await forget.value
+    }
+
+    // A second forget is refused by name, not reported as a running tunnel.
+    func testASecondForgetIsRefusedWhileTheFirstRuns() async {
+        let fake = FakeBackend()
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
+        fake.operationDelay = 300_000_000
+        let model = makeModel(fake)
+        await model.refresh()
+        let first = Task { await model.forget() }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        let second = await model.forget()
+        XCTAssertEqual(second, .failed(AppModelActionText.forgetAlreadyRunning))
+        XCTAssertEqual(fake.calls.filter { $0 == "forget" }.count, 1)
+        let firstResult = await first.value
+        XCTAssertEqual(firstResult, .done(.confirmed))
+    }
+
+    // Protocol v1 answers FORGET with a plaintext RESULT and no sealed part.
+    // Even the engine's final phases are not proof of remote deletion.
+    func testForgetFinalPhasesNeverClaimRemoteRemoval() throws {
+        let confirmed = try XCTUnwrap(ForgetMessages.text(for: .confirmed))
+        let notDelivered = try XCTUnwrap(ForgetMessages.text(for: .notDelivered))
+        XCTAssertEqual(confirmed, Strings.forgetConfirmed)
+        XCTAssertEqual(notDelivered, Strings.forgetNotDelivered)
+        XCTAssertTrue(confirmed.contains("Could not confirm"))
+        XCTAssertTrue(notDelivered.contains("Could not confirm"))
+        XCTAssertEqual(ForgetResult.done(.confirmed).message, confirmed)
+        XCTAssertEqual(ForgetResult.done(.notDelivered).message, notDelivered)
+    }
+
     func testModelDeniedNotificationsExposeTheSettingText() async {
         let fake = FakeBackend(); let sink = RecordingNotificationSink(); let opener = RecordingSettingsOpener()
         sink.status = .denied
@@ -836,12 +1484,12 @@ final class FakeLinkProvider: LinkInfoProvider {
     func testModelPostsAnAutoStopToTheRecordingSink() async {
         let fake = FakeBackend(); let sink = RecordingNotificationSink()
         sink.status = .authorized
-        fake.currentStatus = Status(paired: true, phone: Phone(state: "ready"))
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
         let model = makeModel(fake, sink: sink)
         await model.refreshNotificationAuthorization()
         await model.refresh()
         XCTAssertTrue(sink.messages.isEmpty)
-        fake.currentStatus = Status(paired: true, phone: Phone(state: "ready"), lastStop: LastStop(reason: "hotspot_lost", at: 10))
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"), lastStop: LastStop(reason: "hotspot_lost", at: 10))
         await model.refresh()
         XCTAssertEqual(sink.messages.map(\.body), ["The hotspot turned off, so HotspotShade turned the tunnel off."])
         XCTAssertEqual(sink.messages.first?.title, "HotspotShade")
@@ -852,12 +1500,12 @@ final class FakeLinkProvider: LinkInfoProvider {
     func testModelPostsThePlainTunnelError() async {
         let fake = FakeBackend(); let sink = RecordingNotificationSink()
         sink.status = .authorized
-        fake.currentStatus = Status(paired: true, phone: Phone(state: "ready"))
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
         let model = makeModel(fake, sink: sink)
         model.setFrontmost(false)
         await model.refreshNotificationAuthorization()
         await model.refresh()
-        fake.currentStatus = Status(paired: true, phone: Phone(state: "ready"), error: "The engine lost the connection.", lastStop: LastStop(reason: "error", at: 10))
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"), error: "The engine lost the connection.", lastStop: LastStop(reason: "error", at: 10))
         await model.refresh()
         XCTAssertEqual(sink.messages.map(\.body), ["The engine lost the connection."])
         XCTAssertEqual(sink.messages.first?.kind, .tunnelError)
@@ -865,11 +1513,11 @@ final class FakeLinkProvider: LinkInfoProvider {
     func testModelDoesNotNotifyForAUserStop() async {
         let fake = FakeBackend(); let sink = RecordingNotificationSink()
         sink.status = .authorized
-        fake.currentStatus = Status(paired: true, phone: Phone(state: "ready"))
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"))
         let model = makeModel(fake, sink: sink)
         await model.refreshNotificationAuthorization()
         await model.refresh()
-        fake.currentStatus = Status(paired: true, phone: Phone(state: "ready"), lastStop: LastStop(reason: "user", at: 10))
+        fake.currentStatus = Status(running: false, paired: true, phone: Phone(state: "ready"), lastStop: LastStop(reason: "user", at: 10))
         await model.refresh()
         XCTAssertTrue(sink.messages.isEmpty)
     }
@@ -884,12 +1532,12 @@ final class FakeLinkProvider: LinkInfoProvider {
             dns: DNSDiagnostics(lookups: 10, ok: 9, failed: 1, ms: DurationStats(count: 10, p50: 2, p95: 9, max: 20)),
             queues: QueueDiagnostics(input: [QueueSample(peak: 8, max_age_us: 1200)], output: QueueSample(peak: 9, max_age_us: 1500)),
             udp: UDPDiagnostics(flows: 3, age_drops: 0),
-            tcp: TCPDiagnostics(flows_peak: 12, retransmits: 1, zero_window_ms: 0),
+            tcp: TCPDiagnostics(flows_peak: 12, retransmits: 1, zero_window_ms: 0, flows_active: 3),
             failures: FailureTotals(total: 2, dropped: 0)
         )
     }
     private func failuresFixture() -> Failures {
-        Failures(since: 1762000000, total: 2, dropped: 0, demo: false, groups: [FailureGroup(proto: "tcp", family: "ipv4", port: 443, reason: "unreachable", phase: "request", count: 2, name: "example.com", exampleIp: "203.0.113.5", code: 4)], recent: [])
+        Failures(since: 1762000000, total: 2, dropped: 0, groups: [FailureGroup(proto: "tcp", family: "ipv4", port: 443, reason: "unreachable", phase: "request", count: 2, name: "example.com", exampleIp: "203.0.113.5", code: 4)], recent: [])
     }
     private func contextFixture() -> DiagnosticsContext {
         DiagnosticsContext(macOSVersion: "14.5", appVersion: "1.0 (1)", link: WiFiLinkInfo(band: .ghz5, channelWidthMHz: 80, rssi: -62, interfaceName: "en0"), interfaceName: "en0", icmpEnabled: true, lastStop: LastStop(reason: "source_device_gone", at: 1761990000), lastStopMessage: "The source device stopped answering.", notificationAuthorization: .authorized, now: Date(timeIntervalSince1970: 1762000000))
@@ -910,7 +1558,7 @@ final class FakeLinkProvider: LinkInfoProvider {
         DNS: 10 lookups, 9 ok, 1 failed; count 10, p50 2 ms, p95 9 ms, max 20 ms
         Queues: input peak 8, max age 1200 us; output peak 9, max age 1500 us
         UDP: 3 flows, 0 age drops
-        TCP: 12 peak flows, 1 retransmits, 0 ms zero window
+        TCP: 12 peak flows, 3 active flows, 1 retransmits, 0 ms zero window
         Failures:
         HotspotShade failures since 2025-11-01T12:26:40Z: 2 failed connections, 0 dropped.
         2x tcp ipv4 443 unreachable request example.com 203.0.113.5 code 4
@@ -956,7 +1604,7 @@ final class FakeLinkProvider: LinkInfoProvider {
 
     func testTrustedBySourceModelRow() async {
         let fake = FakeBackend()
-        fake.currentStatus = Status(paired: false, phone: Phone(state: "unpaired", trustedBySource: true))
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired", trustedBySource: true))
         let model = makeModel(fake, forgetIntent: MemoryForgetIntent(true))
         await model.refresh()
         XCTAssertEqual(model.screen, .unpaired)
@@ -1068,7 +1716,7 @@ final class FakeLinkProvider: LinkInfoProvider {
     func testModelPostsPairingAttention() async {
         let fake = FakeBackend(); let sink = RecordingNotificationSink()
         sink.status = .authorized
-        fake.currentStatus = Status(paired: false, phone: Phone(state: "unpaired"))
+        fake.currentStatus = Status(running: false, paired: false, phone: Phone(state: "unpaired"))
         let model = makeModel(fake, sink: sink)
         model.setFrontmost(false)
         await model.refreshNotificationAuthorization()
@@ -1077,14 +1725,5 @@ final class FakeLinkProvider: LinkInfoProvider {
         await model.refreshPairing()
         XCTAssertEqual(sink.messages.map(\.body), ["Check the code on your source device."])
         XCTAssertEqual(sink.messages.first?.kind, .pairingAttention)
-    }
-
-    // MARK: - Launch options
-
-    func testLaunchOptionsDemo() {
-        XCTAssertTrue(LaunchOptions(arguments: ["HotspotShade", "--demo"], environment: [:]).demo)
-        XCTAssertTrue(LaunchOptions(arguments: ["HotspotShade"], environment: ["HS_DEMO": "1"]).demo)
-        XCTAssertFalse(LaunchOptions(arguments: ["HotspotShade"], environment: ["HS_DEMO": "0"]).demo)
-        XCTAssertFalse(LaunchOptions(arguments: ["HotspotShade"], environment: [:]).demo)
     }
 }

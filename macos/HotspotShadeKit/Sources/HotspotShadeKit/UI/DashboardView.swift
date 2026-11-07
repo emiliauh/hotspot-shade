@@ -7,7 +7,6 @@ public struct DashboardView: View {
     public var linkAdvice: [String]
     public var isPairing: Bool
     public var pairingCode: String?
-    public var demo: Bool
     public var isRefreshing: Bool
     private let onAction: (ScreenModel.Action) -> Void
     private let onRefresh: () -> Void
@@ -16,12 +15,11 @@ public struct DashboardView: View {
     private let onOpenNotificationSettings: () -> Void
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
-    public init(model: ScreenModel, linkAdvice: [String] = [], isPairing: Bool = false, pairingCode: String? = nil, demo: Bool = false, isRefreshing: Bool = false, onAction: @escaping (ScreenModel.Action) -> Void, onRefresh: @escaping () -> Void = {}, onCopyCode: @escaping (String) -> Void = { _ in }, onCancelPairing: @escaping () -> Void = {}, onOpenNotificationSettings: @escaping () -> Void = {}) {
+    public init(model: ScreenModel, linkAdvice: [String] = [], isPairing: Bool = false, pairingCode: String? = nil, isRefreshing: Bool = false, onAction: @escaping (ScreenModel.Action) -> Void, onRefresh: @escaping () -> Void = {}, onCopyCode: @escaping (String) -> Void = { _ in }, onCancelPairing: @escaping () -> Void = {}, onOpenNotificationSettings: @escaping () -> Void = {}) {
         self.model = model
         self.linkAdvice = linkAdvice
         self.isPairing = isPairing
         self.pairingCode = pairingCode
-        self.demo = demo
         self.isRefreshing = isRefreshing
         self.onAction = onAction
         self.onRefresh = onRefresh
@@ -51,7 +49,10 @@ public struct DashboardView: View {
     }
 
     private var content: some View {
-        let content = DashboardContent.build(model, linkAdvice: linkAdvice, demo: demo)
+        // An unavailable status has no link evidence, so the cards must not
+        // show Wi-Fi advice from the last known link.
+        let unavailable = model.title == Strings.unknownTitle || model.title == Strings.serviceStateUnknownTitle
+        let content = DashboardContent.build(model, linkAdvice: unavailable ? [] : linkAdvice)
         return VStack(alignment: .leading, spacing: HSMetrics.space16) {
             header(content)
             GlassCardGroup(spacing: HSMetrics.space16) {
@@ -81,14 +82,9 @@ public struct DashboardView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                if content.demo {
-                    Text(Strings.simulated)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
             }
             .accessibilityElement(children: .combine)
-            .accessibilityLabel(AccessibilityText.status(kind: StatusAppearance.kind(title: content.title, kind: content.statusKind), title: content.title, subtitle: content.subtitle))
+            .accessibilityLabel(AccessibilityText.status(kind: StatusAppearance.kind(title: content.title, kind: content.statusKind), title: content.title, subtitle: content.subtitle, checkedText: content.checkedText))
 
             HStack(spacing: HSMetrics.space12) {
                 if let action = content.primaryAction {
@@ -99,6 +95,15 @@ public struct DashboardView: View {
                         onAction(action)
                     }
                 }
+            }
+            // A tunnel start asks for one administrator authorization. Say so
+            // before the person presses, including after a failed start whose
+            // retry starts the tunnel again.
+            if content.primaryAction == .turnOn || (content.primaryAction == .retry && model.retryStartsTunnel) {
+                Text(UIStrings.adminAuthorization)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if content.title == Strings.notPaired && content.primaryAction == .pair && content.attention.isEmpty {
                 Text(UIStrings.pairWhenReady)

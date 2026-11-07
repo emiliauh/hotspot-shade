@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>HotspotShade.WinUI2.ServiceHost.Tests</RootNamespace>
+    <AssemblyName>HotspotShade.WinUI2.ServiceHost.Tests</AssemblyName>
+    <LangVersion>7.3</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Deterministic>true</Deterministic>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\HotspotShade.WinUI2.ServiceHost\HotspotShade.WinUI2.ServiceHost.csproj" />
+    <ProjectReference Include="..\..\src\HotspotShade.WinUI2.Service\HotspotShade.WinUI2.Service.csproj" />
+  </ItemGroup>
+</Project>

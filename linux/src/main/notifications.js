@@ -2,10 +2,10 @@
 
 /* Desktop notifications for the Linux target app.
  *
- * The policy is pure. It notifies for an automatic stop and for a pairing
- * result. A user stop never sends a message. A state that existed before the
- * app started is not a new event. Each message kind is limited to one message
- * in a 60 second window.
+ * The policy is pure. It notifies for an automatic stop, a pairing result, and
+ * a tray action failure. A user stop never sends a message. A state that
+ * existed before the app started is not a new event. Each message kind is
+ * limited to one message in a 60 second window.
  *
  * The app setting and the desktop support are checked on every evaluation, so
  * a change applies at once. The messages hold no address, host, token, or key.
@@ -23,6 +23,11 @@ const AUTO_STOP_REASONS = Object.freeze({
 const PAIRING_SUCCESS = 'Paired with your source device.';
 const PAIRING_FAILURE = 'The pairing did not finish. Check the code on your source device.';
 const TUNNEL_ERROR = 'The tunnel stopped because of an error.';
+
+const ACTION_FAILURE = Object.freeze({
+  start: 'The tunnel did not start. Open HotspotShade to read the status.',
+  stop: 'The tunnel did not stop. Open HotspotShade to read the status.'
+});
 
 function sanitize(value, limit) {
   if (typeof value !== 'string') return '';
@@ -59,26 +64,41 @@ function isActivePairing(state) {
   return state === 'connecting' || state === 'confirm' || state === 'starting';
 }
 
-function createNotificationPolicy(options) {
+function createRateLimiter(options) {
   const settings = options && typeof options === 'object' ? options : {};
   const now = typeof settings.now === 'function' ? settings.now : Date.now;
   const debounceMs = Number.isInteger(settings.debounceMs) && settings.debounceMs >= 0
     ? settings.debounceMs
     : DEBOUNCE_MS;
-
   const lastFired = new Map();
-  let primed = false;
-  let seenStop = '';
-  let seenPairing = '';
 
-  function canFire(kind) {
+  function ready(kind) {
     const last = lastFired.get(kind);
     if (last === undefined) return true;
     return now() - last >= debounceMs;
   }
 
-  function fire(kind, body, messages) {
+  function take(kind) {
+    if (!ready(kind)) return false;
     lastFired.set(kind, now());
+    return true;
+  }
+
+  return Object.freeze({
+    ready: ready,
+    take: take
+  });
+}
+
+function createNotificationPolicy(options) {
+  const settings = options && typeof options === 'object' ? options : {};
+  const limiter = createRateLimiter(settings);
+  let primed = false;
+  let seenStop = '';
+  let seenPairing = '';
+
+  function fire(kind, body, messages) {
+    if (!limiter.take(kind)) return;
     messages.push({ kind: kind, title: TITLE, body: body });
   }
 
@@ -107,13 +127,9 @@ function createNotificationPolicy(options) {
       if (enabled && reason !== '' && reason !== 'user') {
         if (AUTO_STOP_REASONS[reason]) {
           /* An automatic stop is important even when the window is focused. */
-          if (canFire('auto-stop')) {
-            fire('auto-stop', engineMessage || AUTO_STOP_REASONS[reason], messages);
-          }
+          fire('auto-stop', engineMessage || AUTO_STOP_REASONS[reason], messages);
         } else if (reason === 'error' && !focused) {
-          if (canFire('tunnel-error')) {
-            fire('tunnel-error', engineMessage || TUNNEL_ERROR, messages);
-          }
+          fire('tunnel-error', engineMessage || TUNNEL_ERROR, messages);
         }
       }
     }
@@ -123,10 +139,10 @@ function createNotificationPolicy(options) {
       seenPairing = currentPairing;
       if (enabled && isActivePairing(previous)) {
         if (currentPairing === 'paired') {
-          if (canFire('pairing')) fire('pairing', PAIRING_SUCCESS, messages);
+          fire('pairing', PAIRING_SUCCESS, messages);
         } else if (currentPairing === 'failed') {
           const error = sanitize(pair.error);
-          if (canFire('pairing')) fire('pairing', error || PAIRING_FAILURE, messages);
+          fire('pairing', error || PAIRING_FAILURE, messages);
         }
       }
     } else if (!pair) {
@@ -146,6 +162,72 @@ function createNotificationPolicy(options) {
       };
     }
   });
+}
+
+/* A tray action failure uses the same 60 second per-kind limit as the status
+ * messages, but its text is fixed. A backend error message is never shown,
+ * because it could hold a path or a host. Start and stop failures are separate
+ * kinds, so one failure does not hide the other. */
+function createActionFailurePolicy(options) {
+  const limiter = createRateLimiter(options);
+
+  function evaluate(input) {
+    const data = input && typeof input === 'object' ? input : {};
+    if (data.enabled !== true || data.supported !== true) return { message: null };
+    const action = data.action === 'start' ? 'start' : (data.action === 'stop' ? 'stop' : '');
+    if (!action) return { message: null };
+    const kind = 'action-' + action;
+    if (!limiter.take(kind)) return { message: null };
+    return {
+      message: {
+        kind: kind,
+        title: TITLE,
+        body: ACTION_FAILURE[action]
+      }
+    };
+  }
+
+  return Object.freeze({ evaluate: evaluate });
+}
+
+/* One place applies the notification setting, the desktop support, and the
+ * configuration gate. Demo and invalid-engine modes pass no allowed
+ * notifications, so their tray failures stay silent. */
+function createActionFailureNotifier(options) {
+  const settings = options && typeof options === 'object' ? options : {};
+  const sink = settings.sink;
+  const settingsStore = settings.settingsStore;
+  const allowNotifications = settings.allowNotifications === true;
+  const policy = settings.policy && typeof settings.policy.evaluate === 'function'
+    ? settings.policy
+    : createActionFailurePolicy();
+
+  function notify(action) {
+    if (action !== 'start' && action !== 'stop') return false;
+    if (!allowNotifications) return false;
+    if (!sink || sink.supported !== true) return false;
+    if (!settingsStore || typeof settingsStore.snapshot !== 'function') return false;
+    let current;
+    try {
+      current = settingsStore.snapshot();
+    } catch (error) {
+      return false;
+    }
+    if (!current || current.notifications !== true) return false;
+    const output = policy.evaluate({
+      enabled: true,
+      supported: true,
+      action: action
+    });
+    if (!output || !output.message) return false;
+    try {
+      return sink.post(output.message) === true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  return Object.freeze({ notify: notify });
 }
 
 /* The system sink. One delivered message per kind is kept. A newer message
@@ -211,14 +293,18 @@ function createElectronNotificationSink(options) {
 }
 
 module.exports = {
+  ACTION_FAILURE: ACTION_FAILURE,
   AUTO_STOP_REASONS: AUTO_STOP_REASONS,
   DEBOUNCE_MS: DEBOUNCE_MS,
   PAIRING_FAILURE: PAIRING_FAILURE,
   PAIRING_SUCCESS: PAIRING_SUCCESS,
   TITLE: TITLE,
   TUNNEL_ERROR: TUNNEL_ERROR,
+  createActionFailureNotifier: createActionFailureNotifier,
+  createActionFailurePolicy: createActionFailurePolicy,
   createElectronNotificationSink: createElectronNotificationSink,
   createNotificationPolicy: createNotificationPolicy,
+  createRateLimiter: createRateLimiter,
   sanitize: sanitize,
   stopKey: stopKey
 };

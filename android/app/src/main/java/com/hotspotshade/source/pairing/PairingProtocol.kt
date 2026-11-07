@@ -245,17 +245,21 @@ internal object PairingProtocol {
     fun encodeCredentials(credentials: PairingCredentials): ByteArray {
         val token = credentials.token.toByteArray(Charsets.US_ASCII)
         val host = credentials.host.hostAddress?.toByteArray(Charsets.US_ASCII) ?: ByteArray(0)
-        if (token.isEmpty() || token.size > 255 || host.isEmpty() || host.size > 255) {
-            throw PairingException(PairingError.PROTOCOL)
+        try {
+            if (token.isEmpty() || token.size > 255 || host.isEmpty() || host.size > 255) {
+                throw PairingException(PairingError.PROTOCOL)
+            }
+            val output = ByteArray(4 + token.size + host.size)
+            output[0] = ((credentials.port ushr 8) and 0xFF).toByte()
+            output[1] = (credentials.port and 0xFF).toByte()
+            output[2] = token.size.toByte()
+            token.copyInto(output, 3)
+            output[3 + token.size] = host.size.toByte()
+            host.copyInto(output, 4 + token.size)
+            return output
+        } finally {
+            token.fill(0)
         }
-        val output = ByteArray(4 + token.size + host.size)
-        output[0] = ((credentials.port ushr 8) and 0xFF).toByte()
-        output[1] = (credentials.port and 0xFF).toByte()
-        output[2] = token.size.toByte()
-        token.copyInto(output, 3)
-        output[3 + token.size] = host.size.toByte()
-        host.copyInto(output, 4 + token.size)
-        return output
     }
 
     /** Parse the RESULT plaintext with strict lengths. */

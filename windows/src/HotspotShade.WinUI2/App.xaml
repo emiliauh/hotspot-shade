@@ -55,6 +55,7 @@
             <converters:BoolToVisibilityConverter x:Key="BoolToVisibility" />
             <converters:EnumNameToVisibilityConverter x:Key="EnumNameToVisibility" />
             <converters:StringToVisibilityConverter x:Key="StringToVisibility" />
+            <converters:InvertBoolConverter x:Key="InvertBool" />
 
             <Style x:Key="CardStyle" TargetType="Border">
                 <Setter Property="Background" Value="{ThemeResource CardBackgroundBrush}" />

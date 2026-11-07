@@ -127,6 +127,10 @@ struct PairingDisplayTests {
         check(starting.kind == .starting, "starting kind")
         check(starting.title == "Starting", "starting title")
         check(starting.message == PairingDisplay.notPairedText, "starting message")
+        let waiting = DashboardStatus.make(snapshotState: "Starting", startFailure: nil,
+                                           snapshotError: ListenerDisplayText.waiting, pairing: idle)
+        check(waiting.message == "The proxy listener is waiting for the hotspot.",
+              "listener waiting message")
 
         let on = DashboardStatus.make(snapshotState: "Listening", startFailure: nil,
                                       snapshotError: nil, pairing: one)

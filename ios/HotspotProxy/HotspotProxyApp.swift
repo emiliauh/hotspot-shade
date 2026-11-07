@@ -1,9 +1,9 @@
 import SwiftUI
 import UIKit
-import Security
 import Darwin
 import CoreLocation
 import UserNotifications
+import UniformTypeIdentifiers
 
 @main
 struct HotspotProxyApp: App {
@@ -25,6 +25,7 @@ struct ActivityEntry: Identifiable, Equatable {
 /// The copy action that shows a short confirmation.
 enum CopyTarget: Equatable {
     case token
+    case connection
     case diagnostics
 }
 
@@ -33,7 +34,18 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
     /// The proxy port. The phone picks it and tells the target device when they pair.
     @Published var port = String(ProxyPort.storedOrNew())
     @Published var portIsCustom = UserDefaults.standard.bool(forKey: "proxyPortCustom")
-    @Published var token: String
+    @Published private(set) var token = ""
+    /// The last token storage failure. It holds no token. A missing token
+    /// blocks a proxy start until a later load succeeds. Token rotation is
+    /// disabled pending review, so it cannot repair this state.
+    @Published private(set) var tokenStorageFailure: String?
+    /// True when the keychain holds a token the app can use. Rotation needs
+    /// this. A new token must not replace an item the app could not read.
+    @Published private(set) var tokenStorageReady = false
+    /// A conflict keeps both copies and suspends pairing.
+    @Published private(set) var tokenConflict = false
+    /// Recovery is unavailable while storage cannot conditionally change items.
+    @Published private(set) var tokenRecovery: TokenRecoveryKind = .none
     @Published var addresses = "Unavailable"
     /// Keep-alive is on by default. The choice is saved.
     @Published var backgroundLocation = UserDefaults.standard.object(forKey: "keepAwake") as? Bool ?? true
@@ -62,8 +74,11 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
     @Published private(set) var notificationStatus: NotificationPermission.Status = .notDetermined
     private var tokenRevealUntil: Date?
     private var tokenRevealTimer: Timer?
+    private var tokenPasteboardOwnership = TokenPasteboardOwnership()
     private var copyTimer: Timer?
     private var wakeTimer: Timer?
+    /// Refresh the display when a pairing result line reaches 60 seconds.
+    private var pairingNoticeTimer: Timer?
     /// The last awake time. It stays in memory and is saved at most once a minute.
     private var wakeTick = Date()
     private var lastWakePersist = Date.distantPast
@@ -78,15 +93,24 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
     /// True after any fix, also across launches. It detects an Allow Once permission.
     private var hadFixEver = UserDefaults.standard.bool(forKey: "hadLocationFix")
     private var proxyRequested = false
+    /// The server failure revision that was visible when the current start was
+    /// requested. A queued snapshot at or below it is from an older run.
+    private var startFailureRevision = 0
     private var sceneIsActive = true
     private var notificationRequestStarted = false
-    private var hotspotAddress: String?
+    private var hotspotIdentity: HotspotInterface.Identity?
+    /// The plain state of the last hotspot observation. Start uses it when no
+    /// supported identity is available, so an unsupported or unreadable link
+    /// does not show the "turn on the hotspot" text.
+    private(set) var hotspotState: HotspotStartMessage.Observation = .absent
     private var hotspotTimer: DispatchSourceTimer?
     private var lossDetector: HotspotLossDetector?
     private let trust: ObservableTrustStore
     private let server: ProxyServer
     private let stopLog: StopLog
-    private let tokenKey = "proxyToken"
+    /// The token state machine. The `@Published` token fields above mirror it
+    /// through `tokenStateDidChange`.
+    private let tokens: TokenLifecycle
     private let notificationAskedKey = "notificationAsked"
     /// The last trust revision that the app recorded as activity.
     private var trustRevision = 0
@@ -98,27 +122,42 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         trust = store
         server = ProxyServer(trust: store)
         stopLog = StopLog(store: UserDefaultsStopRecordStore())
-        if let stored = UserDefaults.standard.string(forKey: "proxyToken"), !stored.isEmpty {
-            token = stored
-        } else {
-            let newToken = Self.newToken()
-            token = newToken
-            UserDefaults.standard.set(newToken, forKey: "proxyToken")
-        }
+        tokens = TokenLifecycle(store: SecureTokenStore(), pairing: server)
         super.init()
+        tokens.attach(host: self)
         locationManager.delegate = self
         locationManager.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
         locationManager.distanceFilter = kCLDistanceFilterNone
         locationManager.activityType = .other
         locationManager.pausesLocationUpdatesAutomatically = false
         locationManager.showsBackgroundLocationIndicator = true
-        server.onChange = { [weak self] snapshot in
+        server.onChange = { [weak self] incomingSnapshot in
             guard let self = self else { return }
             let previous = self.snapshot.state
             let previousPairingFailures = self.snapshot.pairingFailureCount
+            let previousPairingReady = self.snapshot.pairingReady
             let previousCapacityWarning = self.snapshot.capacityWarning
+            var snapshot = incomingSnapshot
+            // A start queues a pairing update before the server runs the start.
+            // That update can publish the previous run's Stopped or Failed
+            // state. Keep the requested start visible so the hotspot watch and
+            // location do not stop before the server reports Starting. A newer
+            // failure is not stale and ends the request below.
+            if self.proxyRequested
+                && ProxyStartPolicy.isStaleForPendingStart(
+                    state: snapshot.state,
+                    snapshotFailureRevision: snapshot.failureRevision,
+                    requestFailureRevision: self.startFailureRevision) {
+                snapshot.state = "Starting"
+            }
             self.snapshot = snapshot
             self.displayNow = Date()
+            // The pairing listener reads the live link. When it becomes ready,
+            // use that observation to refresh the Manual connection address
+            // without a new poll. The hotspot watch keeps it current while the
+            // proxy runs.
+            if snapshot.pairingReady && !previousPairingReady { self.refreshAddresses() }
+            self.schedulePairingNoticeExpiry(snapshot.pairingNotice)
             if snapshot.state == "Starting" || snapshot.state == "Listening",
                let warning = snapshot.capacityWarning, warning != previousCapacityWarning {
                 self.recordActivity(warning)
@@ -168,7 +207,14 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
             UserDefaults.standard.set(false, forKey: "wasListening")
         }
         lastStopLine = stopLog.current().map { $0.line() }
-        syncPairingCredentials()
+        tokens.launch()
+        // The keychain item is readable after the first unlock. A launch before
+        // the first unlock fails closed, and this notification is the one safe
+        // signal to try the read again.
+        NotificationCenter.default.addObserver(self,
+                                               selector: #selector(protectedDataBecameAvailable),
+                                               name: UIApplication.protectedDataDidBecomeAvailableNotification,
+                                               object: nil)
         refreshAddresses()
         refreshLocationServices()
         updateLocation()
@@ -177,22 +223,55 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         server.publishCurrentState()
     }
 
-    private static func newToken() -> String {
-        var bytes = [UInt8](repeating: 0, count: 16)
-        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
-            fatalError("Cannot generate a secure proxy token.")
-        }
-        return bytes.map { String(format: "%02x", $0) }.joined()
+    /// True while the proxy runs or a start is pending. Rotation is refused in
+    /// both cases, so the running proxy and the pairing channel keep one token.
+    var proxyActive: Bool {
+        TokenRotationPolicy.proxyActive(proxyRequested: proxyRequested, state: snapshot.state)
     }
 
-    private func syncPairingCredentials() {
-        let saved = UserDefaults.standard.string(forKey: ProxyPort.storageKey).flatMap(ProxyPort.parse) ?? ProxyPort.storedOrNew()
-        server.configurePairing(port: saved, token: token)
+    /// The non-secret values that another device needs to use the proxy
+    /// directly. Pairing is optional. The source token is not part of this
+    /// value and stays in Settings behind the timed reveal.
+    var manualConnection: ManualConnection {
+        ManualConnection(address: hotspotIdentity?.address,
+                         port: ProxyPort.parse(port),
+                         running: snapshot.state == "Listening",
+                         starting: snapshot.state == "Starting")
     }
+
+    /// Rotation needs a usable token and a readable store, and it is gated on
+    /// an independent review. The button and the action read the same rule,
+    /// which lives in `TokenLifecycle`.
+    var canRotateToken: Bool { tokens.canRotate }
+
+    /// False in this build. The UI must say that rotation is unavailable
+    /// pending review rather than blame the current token state.
+    var rotationReviewApproved: Bool { tokens.rotationReviewApproved }
+
+    /// True when no valid saved token remains, so recovery must create a new
+    /// credential. Settings asks for a replacement. The control stays visible
+    /// while the proxy runs, and `canReplaceInvalidToken` decides if it is
+    /// enabled.
+    var tokenNeedsReplacement: Bool { tokens.needsReplacement }
+
+    /// True when the Keychain item is invalid but the old copy is still a valid
+    /// token. Settings offers a restore. That copy may predate a rotation, so
+    /// the action can also take access away from a newer token.
+    var tokenNeedsRestore: Bool { tokens.needsRestore }
+
+    /// True when the person may replace the invalid token now.
+    var canReplaceInvalidToken: Bool { tokens.canReplaceInvalid }
+
+    /// True when the person may restore the valid old token now.
+    var canRestoreLegacyToken: Bool { tokens.canRestoreLegacy }
+
+    /// Offer pairing with the saved port and the current token, or take the
+    /// listener down when no usable token exists.
+    private func syncPairingCredentials() { tokens.syncPairing() }
 
     /// Choose the port automatically or let the user set it. Not while the proxy runs.
     func setPortAutomatic(_ automatic: Bool) {
-        guard snapshot.state != "Listening", snapshot.state != "Starting" else { return }
+        guard !proxyActive else { return }
         portIsCustom = !automatic
         UserDefaults.standard.set(portIsCustom, forKey: "proxyPortCustom")
         if automatic {
@@ -204,17 +283,36 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
 
     /// Save a custom port when the text is valid. The text can be incomplete while typing.
     func setCustomPort(_ text: String) {
-        guard snapshot.state != "Listening", snapshot.state != "Starting" else { return }
+        guard !proxyActive else { return }
         let digits = ProxyPort.sanitizedText(text)
         port = digits
         if let value = ProxyPort.parse(digits) { UserDefaults.standard.set(String(value), forKey: ProxyPort.storageKey); syncPairingCredentials() }
     }
 
+    /// `TokenLifecycle` owns every store call and every pairing start or stop.
+    /// These actions only add the screen's own follow-up: the token hides after
+    /// any change.
     func rotateToken() {
-        guard snapshot.state != "Listening", snapshot.state != "Starting" else { return }
-        token = Self.newToken()
-        UserDefaults.standard.set(token, forKey: tokenKey)
-        syncPairingCredentials()
+        // Refused while the proxy runs or a start is pending. The guard is the
+        // same rule as the button.
+        guard canRotateToken else { return }
+        tokens.rotate()
+        hideToken()
+    }
+
+    /// Replace the invalid saved token after an explicit confirmation.
+    func replaceInvalidToken() {
+        guard canReplaceInvalidToken else { return }
+        tokens.replaceInvalid()
+        hideToken()
+    }
+
+    /// Restore the valid old token into the Keychain after an explicit
+    /// confirmation. The old copy may predate a rotation, so the confirmation
+    /// names that risk.
+    func restoreLegacyToken() {
+        guard canRestoreLegacyToken else { return }
+        tokens.restoreLegacy()
         hideToken()
     }
 
@@ -247,9 +345,29 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         tokenVisible = false
     }
 
+    /// Avoid reading the pasteboard, which can trigger an iOS paste prompt.
+    private func clearOwnedTokenPasteboard() {
+        let pasteboard = UIPasteboard.general
+        if tokenPasteboardOwnership.takeIfUnchanged(currentChangeCount: pasteboard.changeCount) {
+            pasteboard.items = []
+        }
+    }
+
     func start() {
         // The user tries again. An old start failure no longer applies.
         startFailure = nil
+        // A keychain that was locked at launch may work now. Do not create a
+        // new token when a stored one is readable.
+        if token.isEmpty { tokens.retryLoadIfNeeded() }
+        // Reserve the token lifecycle boundary across the token copy and the
+        // point where the start request becomes visible. A rotation cannot slip
+        // between them.
+        guard let token = tokens.beginStart() else {
+            failStart(tokenStorageFailure ?? PlainMessage.tokenUnavailable)
+            return
+        }
+        defer { tokens.endStart() }
+        syncPairingCredentials()
         // Ask for location permission on the first Start. Keep-alive needs it.
         requestLocationPermissionIfNeeded()
         // Ask for notification permission at the first Start only.
@@ -259,8 +377,8 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
             return
         }
         refreshAddresses()
-        guard let address = hotspotAddress else {
-            failStart(PlainMessage.noHotspot)
+        guard let identity = hotspotIdentity else {
+            failStart(HotspotStartMessage.message(for: hotspotState))
             return
         }
         // The user starts again. The last stop no longer applies.
@@ -268,10 +386,15 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         lastStopLine = nil
         hadLocationThisRun = false
         locationCapReached = false
+        startFailureRevision = snapshot.failureRevision
         proxyRequested = true
+        // The previous run may have left a Failed state. Show the request at
+        // once so the hotspot watch and location start, and the server replaces
+        // this with its own Starting snapshot.
+        snapshot.state = "Starting"
         updateLocation()
-        server.start(port: value, token: token, hotspotAddress: address)
-        startHotspotWatch(boundAddress: address)
+        server.start(port: value, token: token, hotspotAddress: identity.address)
+        startHotspotWatch(boundIdentity: identity)
     }
 
     /// One exit for a Start that cannot run. The message is plain and holds no port or address.
@@ -291,10 +414,16 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         recordActivity(message)
     }
 
-    /// Show the pairing prompt only while the app is active and the user has not answered.
+    /// Show the pairing prompt only while the app is active, the listener is
+    /// ready, and the user has not answered. The listener rule matches
+    /// `PairingDisplay.state`: a code without a ready listener is stale.
     var pairingPrompt: PairingPrompt? {
-        guard sceneIsActive, let code = snapshot.pairingCode, let id = snapshot.pairingPromptID,
-              id != answeredPairingID else { return nil }
+        guard let code = snapshot.pairingCode,
+              let id = snapshot.pairingPromptID,
+              PairingPromptPolicy.isVisible(sceneActive: sceneIsActive,
+                                            listenerReady: snapshot.pairingReady,
+                                            promptID: id,
+                                            answeredID: answeredPairingID) else { return nil }
         return PairingPrompt(id: id, code: code)
     }
 
@@ -315,7 +444,15 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
     /// versions. It holds no address, host, port, token, code, or website.
     func diagnosticsText() -> String {
         var report = snapshot.diagnostics
-        report.proxyState = DisplayState.label(snapshot.state)
+        // Use the same computed state that the Dashboard shows, so a Start
+        // failure is not reported as the old snapshot state. The detail is the
+        // plain attention line. Neither holds a token or an address.
+        let summary = DiagnosticsProxySummary.make(status: dashboardDisplay.status)
+        report.proxyState = summary.state
+        report.proxyDetail = summary.detail ?? ""
+        // The source device limit is the same in every run. The report carries
+        // it so a copied report cannot claim ECH or a server name override.
+        report.capabilityLines = SourceDeviceCapabilities.iosSource.diagnosticsLines
         report.lowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
         report.thermal = Self.thermalLevel(ProcessInfo.processInfo.thermalState)
         report.locationHealth = keepAwakeMessage
@@ -325,6 +462,9 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         // so the report does not show the age at the last publish.
         report.refreshEstablishedRows(now: ProcessInfo.processInfo.systemUptime)
         var text = report.text()
+        // The token storage lines carry counts and a status code only. They
+        // never carry a token, a key, or a keychain value.
+        text += "\n" + tokens.diagnostics.text()
         #if DEBUG
         if let note = HotspotInterface.testOverrideNote() { text += "\n" + note }
         #endif
@@ -333,14 +473,36 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
 
     func copyDiagnostics() {
         UIPasteboard.general.string = diagnosticsText()
+        tokenPasteboardOwnership.forget()
         showCopied(.diagnostics, announcement: "The diagnostics report is copied.")
+    }
+
+    /// Copy the address, port, and user name for another SOCKS5 client. The
+    /// text holds no token. Writing it replaces any token copy, so the app
+    /// stops tracking the old pasteboard item.
+    func copyManualConnection() {
+        guard let text = manualConnection.copyText else { return }
+        let pasteboard = UIPasteboard.general
+        pasteboard.setItems(
+            [[UTType.utf8PlainText.identifier: text]],
+            options: [.localOnly: true,
+                      .expirationDate: Date().addingTimeInterval(TokenPasteboardOwnership.expirationSeconds)]
+        )
+        tokenPasteboardOwnership.forget()
+        showCopied(.connection, announcement: "The connection details are copied.")
     }
 
     /// Copy the token only when the person can see it. The confirmation holds
     /// no token.
     func copyToken() {
-        guard tokenVisible else { return }
-        UIPasteboard.general.string = token
+        guard tokenVisible, !token.isEmpty else { return }
+        let pasteboard = UIPasteboard.general
+        let before = pasteboard.changeCount
+        pasteboard.setItems(
+            [[UTType.utf8PlainText.identifier: token]],
+            options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(TokenPasteboardOwnership.expirationSeconds)]
+        )
+        tokenPasteboardOwnership.record(before: before, after: pasteboard.changeCount)
         showCopied(.token, announcement: "The token is copied.")
     }
 
@@ -399,6 +561,14 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         locationManager.requestWhenInUseAuthorization()
     }
 
+    /// The protected data is readable now. Retry a token load that failed
+    /// before the first unlock. The retry never replaces a stored token.
+    @objc private func protectedDataBecameAvailable() {
+        DispatchQueue.main.async { [weak self] in
+            self?.tokens.retryLoadIfNeeded()
+        }
+    }
+
     func sceneChanged(_ phase: ScenePhase) {
         // A suspended interval cannot prove that the address stayed absent.
         lossDetector?.reset()
@@ -415,6 +585,8 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
             notifyPairing()
         }
         if sceneIsActive {
+            // A keychain that was locked at launch may work now.
+            tokens.retryLoadIfNeeded()
             checkHotspot()
             refreshNotificationSettings()
             refreshLocationServices()
@@ -434,12 +606,21 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
     /// The one display state for the Dashboard and Settings. Both cards read it.
     var pairingDisplay: PairingDisplay {
         let age = snapshot.lastAuthenticatedTraffic.map { Date().timeIntervalSince($0) }
+        let notice = snapshot.pairingNotice.flatMap {
+            $0.isVisible(now: displayNow) ? $0.message : nil
+        }
         return PairingDisplay.state(trustedCount: pairedLaptops,
                                     authenticatedSessions: snapshot.authenticatedSessions,
                                     pairingCodePresent: snapshot.pairingCode != nil,
                                     listenerReady: snapshot.pairingReady,
-                                    lastTrafficAge: age)
+                                    lastTrafficAge: age,
+                                    listenerUnavailable: snapshot.pairingUnavailable,
+                                    notice: notice)
     }
+
+    /// A token problem that leaves the app with no usable token. The Dashboard
+    /// shows it as Needs attention. It holds no token.
+    var tokenAttention: String? { token.isEmpty ? tokenStorageFailure : nil }
 
     /// The one Dashboard state. The header and the usage card share one
     /// pairing display, so they cannot show different states.
@@ -448,6 +629,7 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         return DashboardDisplay(status: DashboardStatus.make(snapshotState: snapshot.state,
                                                              startFailure: startFailure,
                                                              snapshotError: snapshot.error,
+                                                             tokenFailure: tokenAttention,
                                                              pairing: pairing),
                                 pairing: pairing)
     }
@@ -657,17 +839,36 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
     }
 
     func refreshAddresses() {
-        switch HotspotInterface.observe() {
-        case .present(let address):
-            hotspotAddress = address
-            addresses = address
+        applyHotspotObservation(HotspotInterface.observeLink())
+    }
+
+    /// Apply one observation to the Manual connection state. The interface
+    /// name is kept with the address. A failed read is not a missing hotspot.
+    private func applyHotspotObservation(_ observation: HotspotInterface.LinkObservation) {
+        switch observation {
+        case .present(let identity):
+            hotspotIdentity = identity
+            hotspotState = .present
+            setAddresses(identity.address)
+        case .unsupported:
+            // The hotspot address is on a link this build cannot use. Do not
+            // keep it as a start target.
+            hotspotIdentity = nil
+            hotspotState = .unsupported
+            setAddresses("The hotspot address is on an unsupported link.")
         case .absent:
-            hotspotAddress = nil
-            addresses = "Hotspot IPv4 address not found."
+            hotspotIdentity = nil
+            hotspotState = .absent
+            setAddresses("Hotspot IPv4 address not found.")
         case .unreadable:
-            hotspotAddress = nil
-            addresses = "Cannot read network interfaces."
+            hotspotIdentity = nil
+            hotspotState = .unreadable
+            setAddresses("Cannot read network interfaces.")
         }
+    }
+
+    private func setAddresses(_ text: String) {
+        if addresses != text { addresses = text }
     }
 
     // MARK: Stop record
@@ -679,12 +880,15 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
 
     // MARK: Hotspot watch
     // While the proxy runs, look at the hotspot interface once a second. Stop the
-    // proxy when the hotspot address stays missing. The interface check does
-    // not report the state of the Personal Hotspot switch.
+    // proxy when the hotspot address stays missing, or when a complete read
+    // names a different interface at the same address or an unsupported link.
+    // The interface check does not report the state of the Personal Hotspot
+    // switch, and a matching interface name does not prove that the hotspot is
+    // still on.
 
-    private func startHotspotWatch(boundAddress: String) {
+    private func startHotspotWatch(boundIdentity: HotspotInterface.Identity) {
         stopHotspotWatch()
-        lossDetector = HotspotLossDetector(boundAddress: boundAddress)
+        lossDetector = HotspotLossDetector(boundIdentity: boundIdentity)
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now() + 1, repeating: 1)
         timer.setEventHandler { [weak self] in self?.checkHotspot() }
@@ -700,24 +904,48 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
 
     func checkHotspot() {
         guard proxyRequested, var detector = lossDetector else { return }
+        // A snapshot from before the requested start can still say Stopped or
+        // Failed. Keep watching until the server reaches Starting or reports a
+        // failure newer than the request.
+        if ProxyStartPolicy.isStaleForPendingStart(
+            state: snapshot.state,
+            snapshotFailureRevision: snapshot.failureRevision,
+            requestFailureRevision: startFailureRevision) {
+            return
+        }
         // The proxy already stopped or failed to start. Nothing to watch.
         if snapshot.state == "Failed" || snapshot.state == "Stopped" {
             stopHotspotWatch()
             return
         }
-        let lost = detector.observe(HotspotInterface.observe())
+        let observation = HotspotInterface.observeLink()
+        let decision = detector.observe(observation)
         lossDetector = detector
-        if lost { stopForLostHotspot() }
+        switch decision {
+        case .keepRunning:
+            // Keep the Manual connection address current from the same
+            // observation. An unreadable read proves no change, so leave it.
+            if observation != .unreadable { applyHotspotObservation(observation) }
+        case .lost:
+            applyHotspotObservation(.absent)
+            stopForLostHotspot(.hotspotLost)
+        case .identityChanged:
+            applyHotspotObservation(observation)
+            stopForLostHotspot(.hotspotChanged)
+        case .unsupportedLink:
+            applyHotspotObservation(observation)
+            stopForLostHotspot(.hotspotUnsupported)
+        }
     }
 
-    private func stopForLostHotspot() {
+    private func stopForLostHotspot(_ reason: StopReason) {
         proxyRequested = false
         stopLocation()
         stopHotspotWatch()
-        recordActivity(StopReason.hotspotLost.message)
-        recordStop(.hotspotLost)
-        notifyStopped(.hotspotLost)
-        server.stop(reason: StopReason.hotspotLost.message)
+        recordActivity(reason.message)
+        recordStop(reason)
+        notifyStopped(reason)
+        server.stop(reason: reason.message)
     }
 
     private func stopForLocationLost() {
@@ -748,11 +976,56 @@ final class ProxyModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         }
     }
 
+    /// Refresh the display when the pairing result line is 60 seconds old, so
+    /// it disappears even when the proxy is stopped and no other timer runs.
+    private func schedulePairingNoticeExpiry(_ notice: PairingNotice?) {
+        pairingNoticeTimer?.invalidate()
+        pairingNoticeTimer = nil
+        guard let notice, notice.isVisible(now: Date()) else { return }
+        let remaining = notice.at.addingTimeInterval(PairingNotice.visibleSeconds).timeIntervalSinceNow
+        guard remaining > 0 else { return }
+        pairingNoticeTimer = Timer.scheduledTimer(withTimeInterval: remaining, repeats: false) { [weak self] _ in
+            self?.pairingNoticeTimer = nil
+            self?.displayNow = Date()
+        }
+    }
+
     /// Save the awake time at most once a minute. A scene change saves it at once.
     private func persistWakeTick(force: Bool) {
         guard force || wakeTick.timeIntervalSince(lastWakePersist) >= 60 else { return }
         lastWakePersist = wakeTick
         UserDefaults.standard.set(wakeTick, forKey: "wakeTick")
+    }
+}
+
+/// The real pairing listener is the production sink of the token lifecycle.
+/// `ProxyServer` keeps its own guards, so it never runs without a token.
+extension ProxyServer: PairingCredentialSink {}
+
+/// The production host of the token lifecycle. It supplies the proxy state and
+/// the saved port, records activity, and copies the lifecycle state into the
+/// published fields that the views read.
+extension ProxyModel: TokenLifecycleHost {
+    var tokenProxyRequested: Bool { proxyRequested }
+    var tokenProxyState: String { snapshot.state }
+
+    var tokenPairingPort: UInt16 {
+        UserDefaults.standard.string(forKey: ProxyPort.storageKey).flatMap(ProxyPort.parse)
+            ?? ProxyPort.storedOrNew()
+    }
+
+    func tokenActivity(_ message: String) { recordActivity(message) }
+
+    func tokenStateDidChange() {
+        if token != tokens.token {
+            clearOwnedTokenPasteboard()
+            hideToken()
+        }
+        token = tokens.token
+        tokenStorageFailure = tokens.storageFailure
+        tokenStorageReady = tokens.storageReady
+        tokenConflict = tokens.conflict
+        tokenRecovery = tokens.recovery
     }
 }
 
@@ -763,6 +1036,9 @@ struct ContentView: View {
     @State private var showActivity = false
     @State private var showDetails = false
     @State private var showForgetAll = false
+    @State private var showRotateToken = false
+    @State private var showReplaceInvalidToken = false
+    @State private var showRestoreLegacyToken = false
     @FocusState private var portFieldFocused: Bool
     private var running: Bool { model.snapshot.state == "Listening" || model.snapshot.state == "Starting" }
     /// A Start failure stays visible until the user tries again or the proxy starts.
@@ -830,7 +1106,7 @@ struct ContentView: View {
         TextField("Port", text: Binding(get: { model.port }, set: { model.setCustomPort($0) }))
             .keyboardType(.numberPad)
             .multilineTextAlignment(dynamicTypeSize >= .accessibility1 ? .leading : .trailing)
-            .disabled(running)
+            .disabled(model.proxyActive)
             .focused($portFieldFocused)
             .accessibilityLabel("Proxy port")
     }
@@ -838,8 +1114,8 @@ struct ContentView: View {
     private var settings: some View {
         Form {
             Section {
-                Toggle("Keep running in the background", isOn: Binding(get: { model.backgroundLocation }, set: { model.setBackgroundLocation($0) }))
-                Text("This uses Location to stop iOS from pausing the app. The app does not save your location. Battery use is higher.")
+                Toggle("Help keep running in the background", isOn: Binding(get: { model.backgroundLocation }, set: { model.setBackgroundLocation($0) }))
+                Text("This uses Location to help keep the app active, but iOS can still pause it. The app does not save your location. Battery use is higher.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -859,15 +1135,65 @@ struct ContentView: View {
             }
             Section("Paired target devices") {
                 SettingsPairingRow(pairing: model.pairingDisplay)
+                if let notice = model.pairingDisplay.notice {
+                    SettingsStatusRow(symbol: "clock.arrow.circlepath",
+                                      tint: .secondary,
+                                      text: notice)
+                }
                 if model.pairedLaptops > 0 {
                     Button("Forget paired target devices", role: .destructive) { showForgetAll = true }
                         .accessibilityHint("Asks for confirmation.")
                 }
             }
+            Section("Manual connection") {
+                Text("Another device can use these values in a SOCKS5 client. You do not need to pair it.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                LabeledContent("SOCKS5 username", value: ManualConnection.username)
+                VStack(alignment: .leading, spacing: SourceMetrics.space4) {
+                    Text("Hotspot address")
+                    Text(model.addresses)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Hotspot address")
+                .accessibilityValue(model.addresses)
+                Button("Refresh address") { model.refreshAddresses() }
+                    .accessibilityHint("Reads the hotspot address again.")
+                LabeledContent("SOCKS5 port", value: model.manualConnection.portText)
+                Text(model.manualConnection.stateText)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Copy connection details") { model.copyManualConnection() }
+                    .disabled(!model.manualConnection.isUsable)
+                    .accessibilityHint("Copies the address, port, and user name. It does not copy the token.")
+                if model.copied == .connection {
+                    Text("The connection details are copied.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Text("The SOCKS5 password is the source token. Show it in Advanced. Use remote DNS, for example a socks5h proxy URL, so names resolve on this source device.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Section("Destination privacy") {
+                ForEach(SourceDeviceCapabilities.iosSource.rows) { capability in
+                    SettingsCapabilityRow(capability: capability)
+                }
+                Text(SourceDeviceCapabilities.settingsNote)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             Section {
                 DisclosureGroup("Advanced") {
                     Toggle("Choose the port automatically", isOn: Binding(get: { !model.portIsCustom }, set: { model.setPortAutomatic($0) }))
-                        .disabled(running)
+                        .disabled(model.proxyActive)
                     if model.portIsCustom {
                         if dynamicTypeSize >= .accessibility1 {
                             VStack(alignment: .leading, spacing: SourceMetrics.space8) {
@@ -885,50 +1211,84 @@ struct ContentView: View {
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
-                    } else {
-                        LabeledContent("Proxy port", value: model.port)
                     }
-                    Text("Your target device learns the port when it pairs, and again when it changes. You do not need to type it there.")
+                    Text("Your target device learns the port when it pairs, and again when it changes. You do not need to type it there. The Manual connection section shows the current port for another client.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                    VStack(alignment: .leading, spacing: SourceMetrics.space4) {
-                        Text("Hotspot address")
-                        Text(model.addresses)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel("Hotspot address")
-                    .accessibilityValue(model.addresses)
-                    Button("Refresh address") { model.refreshAddresses() }
-                        .accessibilityHint("Reads the hotspot address again.")
                     LabeledContent("Token") {
                         Button(model.tokenVisible ? "Hide token" : "Show token") { model.toggleTokenReveal() }
+                            .disabled(model.token.isEmpty)
                     }
-                    if model.tokenVisible {
+                    if model.tokenVisible && !model.token.isEmpty {
                         Text(model.token)
                             .font(.system(.body, design: .monospaced))
-                            .textSelection(.enabled)
                             .privacySensitive()
                             .fixedSize(horizontal: false, vertical: true)
                             .accessibilityLabel("Proxy token")
                             .accessibilityValue(model.token)
                         Button("Copy token") { model.copyToken() }
+                        Text("The copy stays on this device for up to two minutes, including after you hide the token or leave the app. Other apps on this device may read it.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                         if model.copied == .token {
                             Text("The token is copied.")
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
                         }
-                    } else {
+                    } else if !model.token.isEmpty {
                         Text("The token is hidden. Tap Show token to see it. It hides again after 30 seconds.")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    Button("Rotate token") { model.rotateToken() }.disabled(running)
-                    Text(ConfirmationText.rotateTokenNote)
+                    if let failure = model.tokenStorageFailure {
+                        Text(failure)
+                            .font(.footnote)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityLabel("Token storage problem")
+                            .accessibilityValue(failure)
+                    }
+                    if model.tokenNeedsRestore {
+                        Button("Restore saved token...") {
+                            showRestoreLegacyToken = true
+                        }
+                        .disabled(!model.canRestoreLegacyToken)
+                        if model.proxyActive {
+                            Text("Stop the proxy before you restore the token.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Text(ConfirmationText.restoreLegacyTokenNote)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else if model.tokenNeedsReplacement {
+                        Button("Replace invalid token...", role: .destructive) {
+                            showReplaceInvalidToken = true
+                        }
+                        .disabled(!model.canReplaceInvalidToken)
+                        if model.proxyActive {
+                            Text("Stop the proxy before you replace the token.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Text(ConfirmationText.replaceInvalidTokenNote)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Button("Rotate token") { showRotateToken = true }
+                        .disabled(!model.canRotateToken)
+                    Text(model.canRotateToken
+                         ? ConfirmationText.rotateTokenNote
+                         : (model.rotationReviewApproved
+                            ? "Token rotation needs a readable saved token, no saved-token conflict, and a stopped proxy."
+                            : "Token rotation is unavailable pending review. It stays disabled until the staged rotation protocol is reviewed. Do not treat it as a revocation path in this build."))
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -962,11 +1322,30 @@ struct ContentView: View {
                 }
             }
         }
+        .onAppear { model.refreshAddresses() }
         .confirmationDialog(ConfirmationText.forgetAllTitle, isPresented: $showForgetAll, titleVisibility: .visible) {
             Button("Forget All", role: .destructive) { model.forgetPairedLaptops() }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(ConfirmationText.forgetAllMessage)
+        }
+        .confirmationDialog(ConfirmationText.rotateTokenTitle, isPresented: $showRotateToken, titleVisibility: .visible) {
+            Button("Rotate Token", role: .destructive) { model.rotateToken() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(ConfirmationText.rotateTokenMessage)
+        }
+        .confirmationDialog(ConfirmationText.replaceInvalidTokenTitle, isPresented: $showReplaceInvalidToken, titleVisibility: .visible) {
+            Button("Replace Token", role: .destructive) { model.replaceInvalidToken() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(ConfirmationText.replaceInvalidTokenMessage)
+        }
+        .confirmationDialog(ConfirmationText.restoreLegacyTokenTitle, isPresented: $showRestoreLegacyToken, titleVisibility: .visible) {
+            Button("Restore Token", role: .destructive) { model.restoreLegacyToken() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(ConfirmationText.restoreLegacyTokenMessage)
         }
         .scrollDismissesKeyboard(.interactively)
         .toolbar {
@@ -1126,8 +1505,37 @@ private struct SettingsPairingRow: View {
         case .notPaired: return .secondary
         case .pairing: return .accentColor
         case .paired, .inUse: return .green
+        case .unavailable: return .orange
         }
     }
+}
+
+/// One destination-privacy row in Settings. It is a report, not a control:
+/// nothing here can be turned on in this build. The state word carries the
+/// meaning, so the symbol and the color are never the only signal.
+private struct SettingsCapabilityRow: View {
+    var capability: SourceCapability
+
+    var body: some View {
+        HStack(alignment: .top, spacing: SourceMetrics.space8) {
+            Image(systemName: capability.symbol)
+                .foregroundStyle(tint)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: SourceMetrics.space4) {
+                Text(capability.title)
+                Text(capability.state.label)
+                    .font(.footnote)
+                    .foregroundStyle(tint)
+                Text(capability.detail)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private var tint: Color { capability.state.isOn ? .green : .secondary }
 }
 
 // MARK: - Dashboard
@@ -1220,6 +1628,18 @@ private struct DashboardContent: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+            if let notice = display.pairing.notice {
+                HStack(alignment: .firstTextBaseline, spacing: SourceMetrics.space8) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+                    Text(notice)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .accessibilityElement(children: .combine)
             }
             if !connectionLines.isEmpty {
                 VStack(alignment: .leading, spacing: SourceMetrics.space4) {

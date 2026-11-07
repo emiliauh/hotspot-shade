@@ -150,7 +150,7 @@
 
           <div class="metric-grid">
             <article class="card metric-card">
-              <div class="metric-label" id="metricTcpLabel">TCP flows</div>
+              <div class="metric-label" id="metricTcpLabel">TCP flows started</div>
               <div class="metric-value" id="metricTcp">0</div>
               <div class="metric-foot" id="metricTcpSub">0 UDP flows</div>
             </article>
@@ -309,10 +309,10 @@
               </div>
               <div class="field-grid">
                 <div class="field field-wide">
-                  <label class="label" for="dnsInput">DNS servers <span class="label-optional">Optional</span></label>
+                  <label class="label" for="dnsInput">DNS servers <span class="label-optional">Optional on macOS</span></label>
                   <input class="input" id="dnsInput" type="text" placeholder="1.1.1.1, 8.8.8.8" spellcheck="false" aria-describedby="dnsError">
                   <p class="field-error" id="dnsError" hidden></p>
-                  <p class="help">Comma-separated <code>ip[:port]</code> values. Leave blank to use the system resolver.</p>
+                  <p class="help">Enter comma-separated IPv4 addresses, IPv4 addresses with ports, or IPv6 addresses with ports in brackets. On Linux, enter a resolver for the selected interface. On macOS, leave blank to discover one for that interface.</p>
                 </div>
               </div>
             </article>
@@ -510,7 +510,7 @@
             <article class="card">
               <div class="card-header"><div><h3>Threat model</h3><p class="card-desc">What this hides and what it does not.</p></div></div>
               <ul class="about-list">
-                <li><strong>Hides:</strong> the one-hop TTL gap between tethered traffic and source device traffic.</li>
+                <li><strong>TTL:</strong> aims to match source device traffic when the source device NAT decrements TTL once.</li>
                 <li><strong>Does not hide:</strong> TLS fingerprints, SNI, HTTP user agents, TCP options, DNS patterns, timing, or destination choice.</li>
                 <li><strong>Trust:</strong> the relay does not decrypt TLS. It opens outbound sockets as you.</li>
                 <li><strong>Scope:</strong> works at the socket layer. Apps that bypass it, and traffic from other devices, are not covered.</li>
@@ -521,11 +521,15 @@
               <div class="card-header"><div><h3>Platform notes</h3><p class="card-desc">Same idea, different capture layers.</p></div></div>
               <div class="platform-note">
                 <span class="pill pill-platform">macOS</span>
-                <p>Transparent mode creates a <code>utun</code> and installs two <code>/1</code> routes. Root is needed for utun creation and route changes. A clean stop removes the routes.</p>
+                <p>Transparent mode creates a <code>utun</code> and installs two <code>/1</code> routes. Root is needed for utun creation and route changes. Inspect the network state if cleanup is uncertain.</p>
               </div>
               <div class="platform-note">
                 <span class="pill pill-platform">Windows</span>
-                <p>Transparent mode uses a <code>wintun</code> adapter and Win32 routing. It needs an elevated process. SOCKS5 mode needs no elevation. Per-socket TTL behavior can differ from macOS.</p>
+                <p>The tunnel uses a <code>Wintun</code> adapter and Win32 routing and needs an elevated process. Direct mode and source device proxy token use are disabled in this build. SOCKS5 mode is not available on Windows.</p>
+              </div>
+              <div class="platform-note">
+                <span class="pill pill-platform">Linux</span>
+                <p>Transparent mode uses a TUN device and policy routes and needs root. The engine attempts cleanup on stop; incomplete checks can leave network state behind.</p>
               </div>
             </article>
 

@@ -56,23 +56,46 @@ public struct DashboardContent: Equatable {
     public var sourceDevice: Card
     public var connection: Card
     public var attention: [String]
-    public var demo: Bool
 
-    public init(statusKind: ScreenModel.StatusKind, title: String, subtitle: String, checkedText: String?, primaryAction: ScreenModel.Action?, secondaryAction: ScreenModel.Action?, sourceDevice: Card, connection: Card, attention: [String], demo: Bool) {
+    public init(statusKind: ScreenModel.StatusKind, title: String, subtitle: String, checkedText: String?, primaryAction: ScreenModel.Action?, secondaryAction: ScreenModel.Action?, sourceDevice: Card, connection: Card, attention: [String]) {
         self.statusKind = statusKind; self.title = title; self.subtitle = subtitle
         self.checkedText = checkedText; self.primaryAction = primaryAction
         self.secondaryAction = secondaryAction; self.sourceDevice = sourceDevice
-        self.connection = connection; self.attention = attention; self.demo = demo
+        self.connection = connection; self.attention = attention
     }
 
     // Build the card content. The value line and the detail lines never repeat
     // the header subtitle. The checked time stays in the header.
-    public static func build(_ model: ScreenModel, linkAdvice: [String] = [], demo: Bool = false) -> DashboardContent {
+    public static func build(_ model: ScreenModel, linkAdvice: [String] = []) -> DashboardContent {
+        // An unknown service state must not borrow the "Tunnel off" value or
+        // the "Not paired" source value. Both would be a claim that the
+        // engine cannot support.
+        if model.title == Strings.serviceStateUnknownTitle {
+            let source = Card(title: UIStrings.sourceDevice, symbol: "antenna.radiowaves.left.and.right", value: UIStrings.unknownValue, details: [UIStrings.unknownCardHint])
+            let connection = Card(title: UIStrings.connection, symbol: "network", value: UIStrings.unknownValue, details: [Strings.serviceStateUnknownHint])
+            return DashboardContent(
+                statusKind: model.statusKind,
+                title: model.title,
+                subtitle: model.subtitle,
+                checkedText: nil,
+                primaryAction: model.primaryAction,
+                secondaryAction: model.secondaryAction,
+                sourceDevice: source,
+                connection: connection,
+                attention: model.attentionItems
+            )
+        }
         let unavailable = model.sourceDevice.lines.isEmpty && model.connection.lines.isEmpty
         let value = sourceValue(model, unavailable: unavailable)
         let sourceDetails = sourceDetails(model, unavailable: unavailable)
         var connectionDetails = connectionDetails(model, linkAdvice: linkAdvice)
-        if connectionDetails.isEmpty { connectionDetails = [UIStrings.noConnectionYet] }
+        // An unavailable status has no measured connection facts. Do not fall
+        // back to "No connection yet.", which reads like a measured off state.
+        if unavailable {
+            connectionDetails = [UIStrings.checkStatusAgain]
+        } else if connectionDetails.isEmpty {
+            connectionDetails = [UIStrings.noConnectionYet]
+        }
         return DashboardContent(
             statusKind: model.statusKind,
             title: model.title,
@@ -82,8 +105,7 @@ public struct DashboardContent: Equatable {
             secondaryAction: model.secondaryAction,
             sourceDevice: Card(title: UIStrings.sourceDevice, symbol: "antenna.radiowaves.left.and.right", value: value, details: sourceDetails),
             connection: Card(title: UIStrings.connection, symbol: "network", value: connectionValue(model, unavailable: unavailable), details: connectionDetails),
-            attention: model.attentionItems,
-            demo: demo
+            attention: model.attentionItems
         )
     }
 

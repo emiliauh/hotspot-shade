@@ -1,10 +1,13 @@
 package com.hotspotshade.source
 
+import java.io.ByteArrayOutputStream
 import java.io.Closeable
 import java.io.EOFException
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.io.PipedInputStream
+import java.io.PipedOutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -18,11 +21,18 @@ import java.net.SocketTimeoutException
 import java.nio.charset.StandardCharsets
 import java.time.Duration
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.SynchronousQueue
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Assume.assumeTrue
@@ -102,6 +112,13 @@ class SourceSocksServerTest {
         echoAttemptTimeout: Duration = Duration.ofSeconds(3),
         persistentEchoLimit: Int = SourceSocksServer.MAXIMUM_PERSISTENT_ECHO_SESSIONS,
         housekeepingInterval: Duration = Duration.ofMillis(500),
+        tlsShape: Boolean = false,
+        workerThreadFactory: ThreadFactory? = null,
+        resolverLimit: Int = SourceSocksCapacity.resolverThreads(maximumRelays + setupReserve),
+        stopWaitTimeout: Duration = Duration.ofSeconds(5),
+        workerLimitOverride: Int? = null,
+        listenerFactory: (() -> ServerSocket)? = null,
+        workerExecutorFactory: ((Int, ThreadFactory) -> ThreadPoolExecutor)? = null,
     ) : Closeable {
         val binding = FakeBinding()
         private val cellular = CellularSession(CellularSockets(binding, newTcp, newUdp))
@@ -123,6 +140,13 @@ class SourceSocksServerTest {
             echoAttemptTimeout = echoAttemptTimeout,
             persistentEchoLimit = persistentEchoLimit,
             housekeepingInterval = housekeepingInterval,
+            tlsShape = tlsShape,
+            workerThreadFactory = workerThreadFactory,
+            resolverLimit = resolverLimit,
+            stopWaitTimeout = stopWaitTimeout,
+            workerLimitOverride = workerLimitOverride,
+            listenerFactory = listenerFactory,
+            workerExecutorFactory = workerExecutorFactory,
         )
 
         init {
@@ -218,6 +242,74 @@ class SourceSocksServerTest {
      * Accept one connection, read until the client half-closes, then keep the
      * socket open for a while. The relay sees one finished direction.
      */
+    /**
+     * Read every byte of one connection, split the shaped ClientHello record
+     * frames, keep the unshaped tail, and reply with one fixed line.
+     */
+    private class ClientHelloSink(private val messageLength: Int) : Closeable {
+        private val listener = ServerSocket(0, 1, LOOPBACK)
+        val port: Int get() = listener.localPort
+        private val finished = CountDownLatch(1)
+        @Volatile var payload: ByteArray? = null
+        @Volatile var tail: ByteArray? = null
+        @Volatile var records = 0
+        @Volatile var largest = 0
+        @Volatile var failure: String? = null
+
+        private val worker = Thread({
+            try {
+                listener.accept().use { socket ->
+                    val bytes = socket.getInputStream().readBytes()
+                    var offset = 0
+                    val collected = java.io.ByteArrayOutputStream()
+                    var count = 0
+                    var biggest = 0
+                    while (collected.size() < messageLength) {
+                        check(bytes.size - offset >= 5) { "a record header is present" }
+                        check((bytes[offset].toInt() and 0xFF) == 22) {
+                            "a shaped record is a handshake record"
+                        }
+                        check((bytes[offset + 1].toInt() and 0xFF) == 3) {
+                            "a shaped record keeps a TLS version"
+                        }
+                        val length = ((bytes[offset + 3].toInt() and 0xFF) shl 8) or
+                            (bytes[offset + 4].toInt() and 0xFF)
+                        check(bytes.size - offset - 5 >= length) {
+                            "a record payload is complete"
+                        }
+                        collected.write(bytes, offset + 5, length)
+                        biggest = maxOf(biggest, length)
+                        offset += 5 + length
+                        count += 1
+                    }
+                    payload = collected.toByteArray()
+                    tail = bytes.copyOfRange(offset, bytes.size)
+                    records = count
+                    largest = biggest
+                    socket.getOutputStream().write(
+                        "response".toByteArray(StandardCharsets.US_ASCII),
+                    )
+                    socket.getOutputStream().flush()
+                }
+            } catch (error: Exception) {
+                failure = error.message ?: error.javaClass.simpleName
+            } finally {
+                finished.countDown()
+                listener.close()
+            }
+        }, "test-client-hello-sink").apply {
+            isDaemon = true
+            start()
+        }
+
+        fun await(timeoutMillis: Long): Boolean =
+            finished.await(timeoutMillis, TimeUnit.MILLISECONDS)
+
+        override fun close() {
+            listener.close()
+        }
+    }
+
     private class HalfClosedEcho : Closeable {
         private val listener = ServerSocket(0, 1, LOOPBACK)
         private val release = CountDownLatch(1)
@@ -255,6 +347,293 @@ class SourceSocksServerTest {
         override fun connect(endpoint: SocketAddress?, timeout: Int) {
             lastTimeout = timeout
             throw SocketTimeoutException("connect timed out")
+        }
+    }
+
+    /**
+     * A worker factory whose thread fails to start at one index. The other
+     * threads are normal daemon threads. The accept and housekeeping threads
+     * do not come from this factory.
+     */
+    private class FailingThreadFactory(private val failAt: Int) : ThreadFactory {
+        private val count = AtomicInteger()
+
+        override fun newThread(runnable: Runnable): Thread {
+            val index = count.incrementAndGet()
+            if (index == failAt) {
+                return object : Thread(runnable, "test-worker-$index") {
+                    override fun start() {
+                        throw OutOfMemoryError("test thread start failure")
+                    }
+                }.apply { isDaemon = true }
+            }
+            return Thread(runnable, "test-worker-$index").apply { isDaemon = true }
+        }
+    }
+
+    /** A factory that fails at creation, not at Thread.start. */
+    private class ThrowingThreadFactory : ThreadFactory {
+        override fun newThread(runnable: Runnable): Thread =
+            throw OutOfMemoryError("test thread creation failure")
+    }
+
+    /**
+     * A live executor that throws [RejectedExecutionException] for a chosen
+     * number of calls, as a saturated executor does at its ceiling.
+     */
+    private class RejectingExecutor(
+        limit: Int,
+        factory: ThreadFactory,
+    ) : ThreadPoolExecutor(
+        0,
+        limit,
+        30L,
+        TimeUnit.SECONDS,
+        SynchronousQueue(),
+        factory,
+    ) {
+        private val remaining = AtomicInteger()
+
+        fun reject(count: Int) {
+            remaining.set(count)
+        }
+
+        override fun execute(command: Runnable) {
+            while (true) {
+                val current = remaining.get()
+                if (current <= 0) break
+                if (remaining.compareAndSet(current, current - 1)) {
+                    throw RejectedExecutionException("test ceiling")
+                }
+            }
+            super.execute(command)
+        }
+    }
+
+    /** A listener that accepts one real client, then fails. */
+    private class AcceptErrorServerSocket(
+        private val errorGate: CountDownLatch,
+    ) : ServerSocket() {
+        private val calls = AtomicInteger()
+
+        override fun accept(): Socket {
+            if (calls.incrementAndGet() == 1) return super.accept()
+            errorGate.await(5, TimeUnit.SECONDS)
+            throw SocketException("test accept error")
+        }
+    }
+
+    /** A listener whose close blocks until the test releases it. */
+    private class SlowCloseServerSocket(
+        private val closeStarted: CountDownLatch,
+        private val releaseClose: CountDownLatch,
+    ) : ServerSocket() {
+        override fun close() {
+            closeStarted.countDown()
+            releaseClose.await(10, TimeUnit.SECONDS)
+            super.close()
+        }
+    }
+
+    /** A listener that returns one scripted socket, then accepts real ones. */
+    private class ScriptedAcceptServerSocket(
+        private val first: Socket,
+    ) : ServerSocket() {
+        private val count = AtomicInteger()
+
+        override fun accept(): Socket =
+            if (count.getAndIncrement() == 0) first else super.accept()
+    }
+
+    /** A destination that sends until the server closes the flow. */
+    private class FirehoseServer : Closeable {
+        private val listener = ServerSocket(0, 1, LOOPBACK)
+
+        @Volatile
+        private var connection: Socket? = null
+
+        val port: Int get() = listener.localPort
+
+        private val worker = Thread({
+            try {
+                val client = listener.accept()
+                connection = client
+                val output = client.getOutputStream()
+                val chunk = ByteArray(8 * 1024)
+                while (true) {
+                    output.write(chunk)
+                    output.flush()
+                }
+            } catch (_: IOException) {
+                // The server closed the destination.
+            }
+        }, "test-firehose").apply {
+            isDaemon = true
+            start()
+        }
+
+        override fun close() {
+            try {
+                listener.close()
+            } catch (_: IOException) {
+                // Already closed.
+            }
+            try {
+                connection?.close()
+            } catch (_: IOException) {
+                // Already closed.
+            }
+        }
+    }
+
+    /**
+     * A server-side client socket with a controllable output stream.
+     *
+     * The output blocks on purpose. A close alone does not unblock it, so the
+     * test proves that the session shutdown path calls shutdownOutput before
+     * it closes the socket.
+     */
+    private class FakeClientSocket : Socket() {
+        private val inputPipe = PipedInputStream(64 * 1024)
+        private val inputWriter = PipedOutputStream(inputPipe)
+        private val output = BlockingOutputStream()
+        private val closed = AtomicBoolean()
+
+        val writeBlocked: CountDownLatch get() = output.enteredBlock
+
+        fun offer(bytes: ByteArray) {
+            inputWriter.write(bytes)
+            inputWriter.flush()
+        }
+
+        fun endInput() {
+            try {
+                inputWriter.close()
+            } catch (_: IOException) {
+                // Already closed.
+            }
+        }
+
+        fun blockWrites() {
+            output.blockWrites = true
+        }
+
+        fun forceAbort() {
+            output.abort()
+        }
+
+        fun responseBytes(): ByteArray = output.snapshot()
+
+        val outputAborted: Boolean get() = output.isAborted
+
+        override fun getInputStream(): InputStream = inputPipe
+
+        override fun getOutputStream(): OutputStream = output
+
+        override fun setSoTimeout(timeout: Int) = Unit
+
+        override fun getSoTimeout(): Int = 0
+
+        override fun setTcpNoDelay(on: Boolean) = Unit
+
+        override fun setKeepAlive(on: Boolean) = Unit
+
+        override fun shutdownOutput() {
+            output.abort()
+        }
+
+        override fun shutdownInput() {
+            try {
+                inputPipe.close()
+            } catch (_: IOException) {
+                // Already closed.
+            }
+        }
+
+        override fun close() {
+            if (!closed.compareAndSet(false, true)) return
+            try {
+                inputWriter.close()
+            } catch (_: IOException) {
+                // Already closed.
+            }
+            try {
+                inputPipe.close()
+            } catch (_: IOException) {
+                // Already closed.
+            }
+            // Do not abort the output here. The production close path must
+            // call shutdownOutput before close.
+        }
+
+        override fun isClosed(): Boolean = closed.get()
+    }
+
+    /** An output stream that blocks until it is aborted. */
+    private class BlockingOutputStream : OutputStream() {
+        private val buffer = ByteArrayOutputStream()
+        private val bufferLock = Any()
+        private val release = CountDownLatch(1)
+        val enteredBlock = CountDownLatch(1)
+
+        @Volatile
+        var blockWrites = false
+
+        @Volatile
+        private var aborted = false
+
+        val isAborted: Boolean get() = aborted
+
+        override fun write(value: Int) {
+            write(byteArrayOf(value.toByte()), 0, 1)
+        }
+
+        override fun write(bytes: ByteArray, offset: Int, length: Int) {
+            if (blockWrites && !aborted) {
+                enteredBlock.countDown()
+                while (!aborted) {
+                    try {
+                        release.await(20, TimeUnit.MILLISECONDS)
+                    } catch (_: InterruptedException) {
+                        // Keep waiting until abort.
+                    }
+                }
+            }
+            if (aborted) throw SocketException("test output aborted")
+            synchronized(bufferLock) { buffer.write(bytes, offset, length) }
+        }
+
+        override fun flush() = Unit
+
+        fun abort() {
+            aborted = true
+            release.countDown()
+        }
+
+        fun snapshot(): ByteArray = synchronized(bufferLock) { buffer.toByteArray() }
+    }
+
+    /** A resolver that ignores interruption until the test releases it. */
+    private class HoldingResolver : SourceHostResolver {
+        private val release = CountDownLatch(1)
+        private val started = AtomicInteger()
+
+        val startedCount: Int get() = started.get()
+
+        override fun resolve(host: String): List<InetAddress> {
+            started.incrementAndGet()
+            while (true) {
+                try {
+                    release.await()
+                    return listOf(LOOPBACK)
+                } catch (_: InterruptedException) {
+                    // This resolver does not cooperate with cancellation.
+                }
+            }
+        }
+
+        fun releaseAll() {
+            release.countDown()
         }
     }
 
@@ -535,6 +914,23 @@ class SourceSocksServerTest {
                     assertArrayEquals("slow".toByteArray(), readExactly(input, 4))
                 }
             }
+        }
+    }
+
+    @Test
+    fun stopClearsTheInMemoryToken() {
+        Harness().use { harness ->
+            val field = SourceSocksServer::class.java.getDeclaredField("tokenBytes")
+            field.isAccessible = true
+            val bytes = field.get(harness.server) as ByteArray
+            assertArrayEquals(TOKEN.toByteArray(StandardCharsets.UTF_8), bytes)
+
+            harness.server.stop()
+
+            assertTrue(
+                "A stopped server must clear its token copy.",
+                bytes.all { it == 0.toByte() },
+            )
         }
     }
 
@@ -961,6 +1357,62 @@ class SourceSocksServerTest {
         Harness(maximumRelays = limits.relay, setupReserve = limits.setupReserve).use { harness ->
             assertEquals(97, harness.server.relayLimit)
             assertEquals(110, harness.server.totalSessionLimit)
+            assertEquals(209, harness.server.workerLimit)
+        }
+    }
+
+    @Test
+    fun theWorkerLimitCoversEveryDocumentedSessionAndRelay() {
+        Harness().use { harness ->
+            assertEquals(288, harness.server.totalSessionLimit)
+            assertEquals(546, harness.server.workerLimit)
+        }
+    }
+
+    @Test
+    fun aSessionWorkerStartFailureStopsTheServerClosed() {
+        Harness(workerThreadFactory = FailingThreadFactory(failAt = 1)).use { harness ->
+            harness.connect().use { client ->
+                assertEndOfStream(client)
+            }
+            assertTrue(
+                "A server that cannot start a session worker must report stopped.",
+                waitFor(2_000) { !harness.server.isRunning },
+            )
+            assertEquals("worker_start", harness.server.failureReason)
+            assertTrue(
+                "A failed worker start must clear the token copy.",
+                waitFor(2_000) { harness.server.tokenCopyIsCleared() },
+            )
+            assertThrows(IOException::class.java) {
+                Socket().use {
+                    it.connect(InetSocketAddress(LOOPBACK, harness.port), 1_000)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun aRelayPumpStartFailureReportsCodeOneAndStopsTheServerClosed() {
+        TcpEcho().use { echo ->
+            Harness(workerThreadFactory = FailingThreadFactory(failAt = 2)).use { harness ->
+                harness.connect().use { client ->
+                    negotiate(client)
+                    write(client, ipv4Request(COMMAND_CONNECT, echo.port))
+                    assertEquals(
+                        "A relay must not report success when its pump cannot start.",
+                        1,
+                        readReply(client.getInputStream()),
+                    )
+                    assertEndOfStream(client)
+                }
+                assertTrue(
+                    "A server that cannot start a relay pump must report stopped.",
+                    waitFor(2_000) { !harness.server.isRunning },
+                )
+                assertEquals("worker_start", harness.server.failureReason)
+                assertTrue(waitFor(2_000) { harness.server.tokenCopyIsCleared() })
+            }
         }
     }
 
@@ -1007,6 +1459,465 @@ class SourceSocksServerTest {
                 }
             }
         }
+    }
+
+    @Test
+    fun shapeModeReframesTheFirstClientHelloAndKeepsEveryByte() {
+        val message = clientHello(300)
+        val tail = "later bytes".toByteArray(StandardCharsets.US_ASCII)
+        ClientHelloSink(message.size).use { sink ->
+            Harness(tlsShape = true).use { harness ->
+                harness.connect().use { client ->
+                    negotiate(client)
+                    write(client, ipv4Request(COMMAND_CONNECT, sink.port))
+                    assertEquals(0, readReply(client.getInputStream()))
+                    client.getOutputStream().write(record(message) + tail)
+                    client.getOutputStream().flush()
+                    client.shutdownOutput()
+                    assertArrayEquals(
+                        "response".toByteArray(StandardCharsets.US_ASCII),
+                        readExactly(client.getInputStream(), 8),
+                    )
+                    assertTrue("the destination finished", sink.await(3_000))
+                    sink.failure?.let { fail(it) }
+                    assertArrayEquals("handshake bytes are identical", message, sink.payload)
+                    assertArrayEquals("later bytes are unchanged", tail, sink.tail)
+                    assertTrue("the ClientHello spans many records", sink.records > 1)
+                    assertTrue(
+                        "no shaped record payload is larger than 8",
+                        sink.largest in 1..8,
+                    )
+                }
+            }
+        }
+    }
+
+    @Test
+    fun shapeOffKeepsTheSourceDeviceStreamByteForByte() {
+        val message = clientHello(120)
+        val tail = "tail".toByteArray(StandardCharsets.US_ASCII)
+        ClientHelloSink(message.size).use { sink ->
+            Harness(tlsShape = false).use { harness ->
+                harness.connect().use { client ->
+                    negotiate(client)
+                    write(client, ipv4Request(COMMAND_CONNECT, sink.port))
+                    assertEquals(0, readReply(client.getInputStream()))
+                    client.getOutputStream().write(record(message) + tail)
+                    client.getOutputStream().flush()
+                    client.shutdownOutput()
+                    assertArrayEquals(
+                        "response".toByteArray(StandardCharsets.US_ASCII),
+                        readExactly(client.getInputStream(), 8),
+                    )
+                    assertTrue("the destination finished", sink.await(3_000))
+                    sink.failure?.let { fail(it) }
+                    assertArrayEquals(message, sink.payload)
+                    assertArrayEquals(tail, sink.tail)
+                    assertEquals("shape off keeps one record", 1, sink.records)
+                    assertEquals(message.size, sink.largest)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun anAcceptErrorStopsTheServerAndClosesTheSession() {
+        val gate = CountDownLatch(1)
+        Harness(listenerFactory = { AcceptErrorServerSocket(gate) }).use { harness ->
+            harness.connect().use { client ->
+                negotiate(client)
+                gate.countDown()
+                assertTrue(
+                    "An accept error must stop the server closed.",
+                    waitFor(2_000) { harness.server.failureReason == "accept" },
+                )
+                assertFalse(harness.server.isRunning)
+                val health = harness.server.health()
+                assertFalse(health.running)
+                assertEquals("accept", health.failureReason)
+                assertTrue(health.degraded)
+                assertEndOfStream(client)
+                assertTrue(waitFor(2_000) { harness.server.tokenCopyIsCleared() })
+                harness.server.stop()
+                try {
+                    harness.server.start()
+                    fail("A server that failed in accept must not restart.")
+                } catch (_: IllegalStateException) {
+                    // Expected.
+                }
+            }
+        }
+    }
+
+    @Test
+    fun aConcurrentStopWaitsForTheActiveStopWithinItsBound() {
+        val closeStarted = CountDownLatch(1)
+        val releaseClose = CountDownLatch(1)
+        Harness(
+            listenerFactory = { SlowCloseServerSocket(closeStarted, releaseClose) },
+            stopWaitTimeout = Duration.ofMillis(200),
+        ).use { harness ->
+            val owner = Thread({ harness.server.stop() }, "test-stop-owner").apply {
+                isDaemon = true
+                start()
+            }
+            try {
+                assertTrue("The owner stop must begin closing.", closeStarted.await(2, TimeUnit.SECONDS))
+                val waiterDone = CountDownLatch(1)
+                var waiterIncomplete = false
+                val waiter = Thread({
+                    harness.server.stop()
+                    waiterIncomplete = harness.server.stopWasIncomplete
+                    waiterDone.countDown()
+                }, "test-stop-waiter").apply {
+                    isDaemon = true
+                    start()
+                }
+                assertTrue(
+                    "A concurrent stop must return within its bound.",
+                    waiterDone.await(2, TimeUnit.SECONDS),
+                )
+                assertTrue("The waiter must report the bounded return.", waiterIncomplete)
+                assertFalse("Cleanup must still be in progress.", harness.server.stopFinished)
+                assertFalse("The waiter thread must have finished.", waiter.isAlive)
+                assertTrue("The owner must still be cleaning up.", owner.isAlive)
+            } finally {
+                releaseClose.countDown()
+            }
+            owner.join(5_000)
+            assertFalse("The owner stop must finish after the release.", owner.isAlive)
+            assertTrue("The stop must report completion.", harness.server.stopFinished)
+        }
+    }
+
+    @Test
+    fun aTransientWorkerRejectionRefusesTheFlowAndKeepsTheServerServing() {
+        TcpEcho().use { echo ->
+            var executor: RejectingExecutor? = null
+            Harness(workerExecutorFactory = { limit, factory ->
+                RejectingExecutor(limit, factory).also { executor = it }
+            }).use { harness ->
+                harness.connect().use { first ->
+                    negotiate(first)
+                    write(first, ipv4Request(COMMAND_CONNECT, echo.port))
+                    assertEquals(0, readReply(first.getInputStream()))
+                    executor!!.reject(3)
+                    harness.connect().use { second ->
+                        assertEndOfStream(second)
+                    }
+                    assertTrue("A capacity refusal must not stop the server.", harness.server.isRunning)
+                    assertNull(harness.server.failureReason)
+                    write(first, "still".toByteArray())
+                    assertArrayEquals(
+                        "still".toByteArray(),
+                        readExactly(first.getInputStream(), 5),
+                    )
+                }
+                executor!!.reject(0)
+                harness.connect().use { third ->
+                    negotiate(third)
+                    write(third, ipv4Request(COMMAND_CONNECT, echo.port))
+                    assertEquals(0, readReply(third.getInputStream()))
+                }
+            }
+        }
+    }
+
+    @Test
+    fun aTransientPumpRejectionReportsCodeOneAndKeepsTheServerServing() {
+        TcpEcho().use { echo ->
+            var executor: RejectingExecutor? = null
+            Harness(workerExecutorFactory = { limit, factory ->
+                RejectingExecutor(limit, factory).also { executor = it }
+            }).use { harness ->
+                harness.connect().use { client ->
+                    negotiate(client)
+                    executor!!.reject(3)
+                    write(client, ipv4Request(COMMAND_CONNECT, echo.port))
+                    assertEquals(1, readReply(client.getInputStream()))
+                    assertEndOfStream(client)
+                }
+                assertTrue("A capacity refusal must not stop the server.", harness.server.isRunning)
+                assertNull(harness.server.failureReason)
+                executor!!.reject(0)
+                harness.connect().use { next ->
+                    negotiate(next)
+                    write(next, ipv4Request(COMMAND_CONNECT, echo.port))
+                    assertEquals(0, readReply(next.getInputStream()))
+                }
+            }
+        }
+    }
+
+    @Test
+    fun aWorkerThreadCreationFailureStopsTheServerClosed() {
+        Harness(workerThreadFactory = ThrowingThreadFactory()).use { harness ->
+            harness.connect().use { client ->
+                assertEndOfStream(client)
+            }
+            assertTrue(
+                "A real thread creation failure must stop the server.",
+                waitFor(2_000) { harness.server.failureReason == "worker_start" },
+            )
+            assertFalse(harness.server.isRunning)
+            assertTrue(waitFor(2_000) { harness.server.tokenCopyIsCleared() })
+        }
+    }
+
+    @Test
+    fun theServerRejectsLimitsAboveTheDeclaredCaps() {
+        val cellular = CellularSession(CellularSockets(FakeBinding()))
+        try {
+            assertThrows(IllegalArgumentException::class.java) {
+                SourceSocksServer(
+                    cellular = cellular,
+                    resolver = FakeResolver(),
+                    bindAddress = LOOPBACK,
+                    token = TOKEN,
+                    maximumRelays = SourceSocksServer.MAXIMUM_RELAYS + 1,
+                )
+            }
+            assertThrows(IllegalArgumentException::class.java) {
+                SourceSocksServer(
+                    cellular = cellular,
+                    resolver = FakeResolver(),
+                    bindAddress = LOOPBACK,
+                    token = TOKEN,
+                    setupReserve = SourceSocksServer.SETUP_RESERVE + 1,
+                )
+            }
+            assertThrows(IllegalArgumentException::class.java) {
+                SourceSocksServer(
+                    cellular = cellular,
+                    resolver = FakeResolver(),
+                    bindAddress = LOOPBACK,
+                    token = TOKEN,
+                    resolverLimit = 0,
+                )
+            }
+            val largest = SourceSocksServer(
+                cellular = cellular,
+                resolver = FakeResolver(),
+                bindAddress = LOOPBACK,
+                token = TOKEN,
+                maximumRelays = SourceSocksServer.MAXIMUM_RELAYS,
+                setupReserve = SourceSocksServer.SETUP_RESERVE,
+            )
+            assertEquals(SourceSocksServer.MAXIMUM_SESSIONS, largest.totalSessionLimit)
+            largest.stop()
+        } finally {
+            cellular.close()
+        }
+    }
+
+    @Test
+    fun theResolverQueueIsBoundedAndRefusesOverflow() {
+        val resolver = HoldingResolver()
+        Harness(
+            resolver = resolver,
+            maximumRelays = 4,
+            setupReserve = 4,
+            resolverLimit = 2,
+            connectTimeout = Duration.ofSeconds(20),
+        ).use { harness ->
+            val clients = mutableListOf<Socket>()
+            try {
+                repeat(4) { index ->
+                    val client = harness.connect()
+                    clients += client
+                    negotiate(client)
+                    write(client, domainRequest(9, "hold-$index.test.invalid"))
+                    assertTrue(
+                        "Lookup $index must reach the resolver pool.",
+                        waitFor(2_000) {
+                            harness.server.resolverStatus().outstanding == index + 1
+                        },
+                    )
+                }
+                assertTrue(
+                    "Two lookups run and two wait in the bounded queue.",
+                    waitFor(2_000) {
+                        val status = harness.server.resolverStatus()
+                        status.active == 2 && status.queued == 2
+                    },
+                )
+                val overflow = harness.connect()
+                clients += overflow
+                negotiate(overflow)
+                write(overflow, domainRequest(9, "overflow.test.invalid"))
+                assertEquals(1, readReply(overflow.getInputStream()))
+                assertEndOfStream(overflow)
+                assertTrue(harness.server.isRunning)
+                assertNull(harness.server.failureReason)
+                val status = harness.server.resolverStatus()
+                assertEquals(2, status.threads)
+                assertEquals(2, status.queueLimit)
+                assertEquals(1L, status.rejections)
+            } finally {
+                resolver.releaseAll()
+                clients.forEach { client ->
+                    try {
+                        client.close()
+                    } catch (_: IOException) {
+                        // Already closed.
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun anAbandonedLookupReportsTheRecoveryLimit() {
+        val resolver = HoldingResolver()
+        Harness(
+            resolver = resolver,
+            maximumRelays = 1,
+            setupReserve = 1,
+            resolverLimit = 1,
+            connectTimeout = Duration.ofMillis(250),
+        ).use { harness ->
+            harness.connect().use { client ->
+                negotiate(client)
+                write(client, domainRequest(9, "stuck.test.invalid"))
+                assertEquals(1, readReply(client.getInputStream()))
+                assertEndOfStream(client)
+            }
+            assertTrue(
+                "A lookup past its deadline must be reported as abandoned.",
+                waitFor(2_000) { harness.server.resolverStatus().abandoned == 1 },
+            )
+            assertTrue(
+                "A stuck resolver must report the recovery limit.",
+                harness.server.resolverStatus().exhausted,
+            )
+            assertTrue(harness.server.health().degraded)
+            assertTrue(harness.server.isRunning)
+            assertNull(harness.server.failureReason)
+            resolver.releaseAll()
+            assertTrue(
+                "A resolver that returns must release the abandoned count.",
+                waitFor(2_000) { harness.server.resolverStatus().abandoned == 0 },
+            )
+            assertFalse(harness.server.resolverStatus().exhausted)
+            assertFalse(harness.server.health().degraded)
+        }
+    }
+
+    @Test
+    fun oneShotEchoTrickleClosesAtTheAbsoluteDeadline() {
+        val echo = FakeEcho()
+        Harness(echo = echo, echoRequestTimeout = Duration.ofMillis(300)).use { harness ->
+            harness.connect().use { client ->
+                negotiate(client)
+                write(client, echoRequest(COMMAND_ECHO, byteArrayOf(1, 1, 1, 1)))
+                assertEquals(0, readReply(client.getInputStream()))
+                val output = client.getOutputStream()
+                try {
+                    output.write(byteArrayOf(0, 8))
+                    output.flush()
+                    repeat(8) {
+                        Thread.sleep(80)
+                        output.write(0x41)
+                        output.flush()
+                    }
+                } catch (_: IOException) {
+                    // The server can close while the trickle is still running.
+                }
+                assertEndOfStream(client)
+                assertTrue(
+                    "A trickle must not complete the one-shot echo request.",
+                    echo.received.isEmpty(),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun anEvictedBlockedRelayReleasesItsWorkerPermit() {
+        val firehose = FirehoseServer()
+        val fake = FakeClientSocket()
+        val listener = ScriptedAcceptServerSocket(fake)
+        try {
+            Harness(
+                listenerFactory = { listener },
+                maximumRelays = 1,
+                setupReserve = 0,
+                workerLimitOverride = 2,
+                udpIdleTimeout = Duration.ofMillis(100),
+                housekeepingInterval = Duration.ofSeconds(60),
+            ).use { harness ->
+                fake.offer(greetingAndAuth(TOKEN))
+                fake.offer(ipv4Request(COMMAND_CONNECT, firehose.port))
+                assertTrue(
+                    "The scripted session must reach its success reply.",
+                    waitFor(3_000) { fake.responseBytes().size >= 14 },
+                )
+                val reply = fake.responseBytes()
+                assertEquals(5, reply[4].toInt())
+                assertEquals(0, reply[5].toInt())
+                fake.blockWrites()
+                fake.endInput()
+                assertTrue(
+                    "The relay must block in a client write.",
+                    fake.writeBlocked.await(3, TimeUnit.SECONDS),
+                )
+                // The half-closed phase passes its idle bound. Housekeeping
+                // is long, so the eviction comes from the next admit.
+                Thread.sleep(700)
+                harness.connect().use { second ->
+                    // The second connection evicts the stale session before
+                    // it can be served. Closing it releases any permit it
+                    // obtained.
+                    second.close()
+                }
+                assertTrue(
+                    "The eviction must abort the blocked client write.",
+                    waitFor(2_000) { fake.outputAborted },
+                )
+                assertTrue(
+                    "An evicted blocked write must release its worker permit.",
+                    waitFor(3_000) { harness.server.availableWorkers == 2 },
+                )
+                harness.connect().use { third ->
+                    negotiate(third)
+                    write(third, ipv4Request(COMMAND_CONNECT, firehose.port))
+                    assertEquals(0, readReply(third.getInputStream()))
+                }
+                assertTrue(harness.server.isRunning)
+                assertNull(harness.server.failureReason)
+            }
+        } finally {
+            fake.forceAbort()
+            fake.endInput()
+            listener.close()
+            firehose.close()
+        }
+    }
+
+    private fun greetingAndAuth(token: String): ByteArray =
+        byteArrayOf(5, 1, 2) + authBytes(token)
+
+    private fun clientHello(bodyLength: Int): ByteArray {
+        val message = ByteArray(4 + bodyLength)
+        message[0] = 1
+        message[1] = ((bodyLength ushr 16) and 0xFF).toByte()
+        message[2] = ((bodyLength ushr 8) and 0xFF).toByte()
+        message[3] = (bodyLength and 0xFF).toByte()
+        for (index in 0 until bodyLength) {
+            message[4 + index] = (index % 251).toByte()
+        }
+        return message
+    }
+
+    private fun record(payload: ByteArray, versionMinor: Int = 1): ByteArray {
+        val out = ByteArray(5 + payload.size)
+        out[0] = 22
+        out[1] = 3
+        out[2] = versionMinor.toByte()
+        out[3] = ((payload.size ushr 8) and 0xFF).toByte()
+        out[4] = (payload.size and 0xFF).toByte()
+        System.arraycopy(payload, 0, out, 5, payload.size)
+        return out
     }
 
     private fun waitFor(timeoutMillis: Long, condition: () -> Boolean): Boolean {
@@ -1110,6 +2021,32 @@ class SourceSocksServerTest {
             bytes.size.toByte(),
             *bytes,
         )
+    }
+
+    @Test
+    fun aFailedStartClearsTheTokenCopy() {
+        val occupied = ServerSocket(0, 1, LOOPBACK)
+        try {
+            val server = SourceSocksServer(
+                cellular = CellularSession(CellularSockets(FakeBinding())),
+                resolver = FakeResolver(),
+                bindAddress = LOOPBACK,
+                token = TOKEN,
+                port = occupied.localPort,
+            )
+
+            assertThrows(IOException::class.java) { server.start() }
+
+            assertTrue(
+                "A failed bind must clear the in-memory token copy.",
+                server.tokenCopyIsCleared(),
+            )
+            // A later stop must stay idempotent and keep the copy clear.
+            server.stop()
+            assertTrue(server.tokenCopyIsCleared())
+        } finally {
+            occupied.close()
+        }
     }
 
     private fun write(client: Socket, bytes: ByteArray) {

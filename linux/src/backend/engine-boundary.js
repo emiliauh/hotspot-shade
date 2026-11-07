@@ -97,7 +97,10 @@ function createEngineBoundaryBackend(boundary) {
     beginPairing: function () { return call('pair.begin'); },
     cancelPairing: function () { return call('pair.cancel'); },
     forget: function () { return call('pair.forget'); },
-    start: function (options) { return call('tunnel.start', { ping: options && options.ping === true }); },
+    start: function (options) {
+      const mode = options && options.mode === 'direct' ? 'direct' : 'phone';
+      return call('tunnel.start', { mode: mode, ping: mode === 'phone' && options && options.ping === true });
+    },
     stop: function () { return call('tunnel.stop'); },
     probe: function () { return call('phone.probe'); },
     activity: function (query) { return call('activity', { since: query && query.since }); },

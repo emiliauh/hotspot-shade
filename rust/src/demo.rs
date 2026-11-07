@@ -230,7 +230,8 @@ fn pair_view(state: &mut State) -> Value {
 fn platform() -> Value {
     json!({"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"admin":false,
     "default_iface":"en0","default_iface_name":"en0",
-    "capabilities":{"ip_ttl_tcp":true,"ip_ttl_udp":true,"bound_if":true,"v6_hop_limit":true,"utun_needs_root":true}})
+    "capabilities":{"ip_ttl_tcp":true,"ip_ttl_udp":true,"bound_if":true,"v6_hop_limit":true,"utun_needs_root":true},
+    "destination_privacy":crate::diagnostics::destination_privacy_capability()})
 }
 impl GuiBackend for DemoBackend {
     fn status(&self) -> Result<Value, String> {
@@ -328,7 +329,9 @@ impl GuiBackend for DemoBackend {
         let p = platform();
         Ok(
             json!({"available":true,"os":p["os"],"arch":p["arch"],"admin":false,
-            "default_iface":"en0","capabilities":p["capabilities"],"notes":["Demo probe. Values are simulated."],"demo":true}),
+            "default_iface":"en0","capabilities":p["capabilities"],
+            "platform":p,
+            "notes":["Demo probe. Values are simulated."],"demo":true}),
         )
     }
     fn diagnostics(&self) -> Result<Value, String> {
@@ -836,6 +839,78 @@ mod tests {
         assert!(!value.to_string().contains("token"));
         d.stop().unwrap();
         assert_eq!(d.diagnostics().unwrap()["running"], false);
+    }
+
+    #[test]
+    fn demo_status_and_probe_report_the_shared_destination_privacy_capability() {
+        let d = DemoBackend::new();
+        // The demo derives the row from the same constructor as the service,
+        // so the page cannot meet a second shape in demo mode.
+        let expected = crate::diagnostics::destination_privacy_capability();
+        let status = d.status().unwrap();
+        assert_eq!(status["demo"], true);
+        let status_privacy = &status["platform"]["destination_privacy"];
+        assert_eq!(status_privacy, &expected);
+        assert_eq!(status_privacy["mode"], "off");
+        assert_eq!(status_privacy["default_mode"], "off");
+        assert_eq!(status_privacy["modes"]["off"], "supported");
+        for name in ["shape", "hide", "cover"] {
+            assert_eq!(status_privacy["modes"][name], "unsupported", "{name}");
+        }
+        assert_eq!(status_privacy["sni_override"], "unsupported");
+        assert_eq!(status_privacy["ech"], "unsupported");
+        let probe = d.probe().unwrap();
+        assert_eq!(probe["demo"], true);
+        assert_eq!(probe["platform"]["destination_privacy"], expected);
+        // The earlier flattened probe keys stay for compatibility.
+        assert_eq!(probe["available"], true);
+        assert_eq!(probe["os"], std::env::consts::OS);
+        assert_eq!(probe["default_iface"], "en0");
+        assert_eq!(probe["notes"], json!(["Demo probe. Values are simulated."]));
+        // A simulated probe does not claim an active mode, ECH, or a leak.
+        let text = format!(
+            "{status_privacy} {}",
+            probe["platform"]["destination_privacy"]
+        );
+        for forbidden in [
+            "token",
+            "identity",
+            "example.com",
+            "127.0.0.1",
+            "::1",
+            "active",
+            "leak",
+        ] {
+            assert!(!text.contains(forbidden), "{forbidden}");
+        }
+    }
+
+    #[test]
+    fn demo_diagnostics_keep_destination_privacy_off_with_zero_counters() {
+        let d = DemoBackend::new();
+        let expected = crate::diagnostics::destination_privacy();
+        let stopped = d.diagnostics().unwrap();
+        assert_eq!(stopped["demo"], true);
+        assert_eq!(stopped["running"], false);
+        assert_eq!(stopped["destination_privacy"], expected);
+        d.start(json!({"mode":"tun"})).unwrap();
+        let running = d.diagnostics().unwrap();
+        assert_eq!(running["demo"], true);
+        assert_eq!(running["running"], true);
+        // A simulated tunnel never turns a mode on and never records a
+        // privacy event. The section keeps the engine contract.
+        assert_eq!(running["destination_privacy"], expected);
+        let privacy = &running["destination_privacy"];
+        assert_eq!(privacy["mode"], "off");
+        let counters = privacy["counters"].as_object().unwrap();
+        assert_eq!(counters.len(), 13);
+        assert!(counters.values().all(|count| count.as_u64() == Some(0)));
+        assert_eq!(privacy["counters"]["ech_ok"], 0);
+        let text = privacy.to_string();
+        for forbidden in ["token", "example.com", "127.0.0.1", "::1", "active", "leak"] {
+            assert!(!text.contains(forbidden), "{forbidden}");
+        }
+        d.stop().unwrap();
     }
 
     #[test]

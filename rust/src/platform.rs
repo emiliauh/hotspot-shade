@@ -17,7 +17,10 @@ struct SystemRunner;
 
 impl CommandRunner for SystemRunner {
     fn run(&self, program: &str, args: &[String]) -> io::Result<()> {
-        let out = Command::new(program).args(args).output()?;
+        let out = Command::new(program)
+            .args(args)
+            .env_remove(crate::secret_env::PHONE_TOKEN_ENV)
+            .output()?;
         if out.status.success() {
             Ok(())
         } else {
@@ -816,5 +819,25 @@ mod tests {
         configure_link_with(&fake, "utun6", "198.18.0.5".parse().unwrap(), 1500).unwrap();
         assert_eq!(fake.calls.lock().unwrap()[0][3], "198.18.0.6");
         assert!(configure_link_with(&fake, "en0", "198.18.0.1".parse().unwrap(), 1500).is_err());
+    }
+}
+
+#[cfg(test)]
+mod phone_token_env_tests {
+    use super::*;
+
+    #[test]
+    fn system_runner_child_does_not_inherit_the_phone_token() {
+        // The shell exits non-zero when the variable is set, so a successful
+        // run proves the child did not inherit it.
+        std::env::set_var(crate::secret_env::PHONE_TOKEN_ENV, "public-test-token");
+        let result = SystemRunner.run(
+            "/bin/sh",
+            &[
+                "-c".to_string(),
+                "test -z \"${HOTSPOTSHADE_PHONE_TOKEN+x}\"".to_string(),
+            ],
+        );
+        assert!(result.is_ok(), "child inherited the token: {result:?}");
     }
 }

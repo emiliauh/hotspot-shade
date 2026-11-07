@@ -1,8 +1,8 @@
 using System.Reflection;
 using System.Runtime.InteropServices;
 
-[assembly: AssemblyTitle("HotspotShade WinUI 2 prototype")]
-[assembly: AssemblyDescription("A simulated WinUI 2 user interface prototype. No engine.")]
+[assembly: AssemblyTitle("HotspotShade for Windows")]
+[assembly: AssemblyDescription("HotspotShade for Windows. WinUI 2 window for the HotspotShade engine.")]
 [assembly: AssemblyConfiguration("")]
 [assembly: AssemblyCompany("HotspotShade")]
 [assembly: AssemblyProduct("HotspotShade")]

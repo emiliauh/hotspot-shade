@@ -99,6 +99,9 @@ pub enum PairError {
     NoPhone,
     /// Another socket error.
     Io,
+    /// A peer answered a FORGET, but protocol v1 cannot prove that the source
+    /// device removed this target device key. See [`ForgetReply`].
+    Unconfirmed,
 }
 impl fmt::Display for PairError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -117,7 +120,7 @@ impl PairError {
             }
             Self::Phone(PhoneStatus::Rejected) => "The source device rejected the pairing message.",
             Self::Phone(PhoneStatus::TimedOut) => {
-                "Nobody answered on the source device within 60 seconds. Try again."
+                "Nobody answered the prompt on the source device in time. Try again."
             }
             Self::Phone(PhoneStatus::NotActive) => {
                 "Open HotspotShade on your source device."
@@ -135,6 +138,9 @@ impl PairError {
             Self::Random => "The target device random source failed.",
             Self::NoPhone => "Connect this device to the source device hotspot.",
             Self::Io => "The pairing connection failed.",
+            Self::Unconfirmed => {
+                "The source device answered, but this target device cannot verify that it removed the pairing."
+            }
         }
     }
 }
@@ -278,6 +284,12 @@ impl Identity {
     pub fn public(&self) -> [u8; 32] {
         PublicKey::from(&self.secret).to_bytes()
     }
+    /// The secret bytes for the one private handoff to an elevated engine.
+    /// The caller must keep the copy in a zeroizing buffer. Do not log it,
+    /// write it to a status answer, or pass it on a command line.
+    pub fn secret_bytes(&self) -> [u8; 32] {
+        self.secret.to_bytes()
+    }
     /// `$HOME/Library/Application Support/hotspotshade/identity.key`.
     #[cfg(unix)]
     pub fn default_path() -> Result<PathBuf, PairError> {
@@ -377,6 +389,34 @@ impl Identity {
         let _ = path;
         Err(PairError::Identity)
     }
+}
+
+/// The identity that a root engine imports from the user engine. The root
+/// engine runs with a different HOME, so it cannot read the user's key file.
+/// The value is set once, before the engine serves any request. Keeping it in
+/// memory avoids a second copy of the key on disk.
+static IMPORTED_IDENTITY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+/// Install the handoff identity. A second install of the same key is a no-op,
+/// so two engines that import one handoff in the same process agree. A second
+/// install with a different key is refused, so no request can replace the
+/// identity of a running engine.
+pub fn set_imported_identity(secret: [u8; 32]) -> Result<(), PairError> {
+    match IMPORTED_IDENTITY.set(secret) {
+        Ok(()) => Ok(()),
+        Err(_) if IMPORTED_IDENTITY.get() == Some(&secret) => Ok(()),
+        Err(_) => Err(PairError::Identity),
+    }
+}
+
+/// The identity for this process: the imported handoff key when one is set,
+/// otherwise the user key file. All pairing, presence, and forget paths use
+/// this function so a root engine never creates a different identity.
+pub fn local_identity() -> Result<Identity, PairError> {
+    if let Some(secret) = IMPORTED_IDENTITY.get() {
+        return Ok(Identity::from_bytes(*secret));
+    }
+    Identity::load_or_create(&Identity::default_path()?)
 }
 
 /// The Windows identity store.
@@ -2486,14 +2526,44 @@ impl FrameReader {
     }
 }
 
-/// Timeouts for one pairing. The defaults keep a silent phone from holding
-/// the GUI for more than about 70 seconds.
+/// The source device prompt window after REVEAL while its app is active, in
+/// seconds. Keep it equal to `DECISION_SECONDS` in `source_pairing.rs`,
+/// `decisionSeconds` in `ios/HotspotProxy/Pairing.swift`, and
+/// `DECISION_MILLIS` in the Android `PairingResponder.kt`.
+pub const SOURCE_DECISION_SECONDS: u64 = 60;
+/// The source device prompt window while its app is inactive, in seconds. A
+/// prompt that starts while the app is inactive gets this window. The first
+/// inactive notice for a live prompt extends it to at most this long after
+/// that notice. Keep it equal to `INACTIVE_DECISION_SECONDS` in
+/// `source_pairing.rs`, `inactiveDecisionSeconds` in the iOS app, and
+/// `INACTIVE_DECISION_MILLIS` in the Android app.
+pub const SOURCE_INACTIVE_DECISION_SECONDS: u64 = 120;
+/// The longest time that a source device can keep one prompt open after
+/// REVEAL. A prompt can start while the app is inactive (120 seconds), and the
+/// first inactive notice can arrive just before that deadline and add up to
+/// 120 seconds after the notice. An active start with a late inactive notice
+/// gives at most 60 + 120 seconds, which is shorter.
+pub const SOURCE_MAX_DECISION_SECONDS: u64 =
+    SOURCE_INACTIVE_DECISION_SECONDS + SOURCE_INACTIVE_DECISION_SECONDS;
+/// Extra time after the longest source window for the RESULT frame to cross
+/// the hotspot link.
+const RESULT_MARGIN_SECONDS: u64 = 2;
+
+/// Timeouts for one pairing. Every phase is bounded, and the cancel flag stops
+/// a wait within about 100 ms.
+///
+/// The RESULT wait covers the longest source device prompt window. If the
+/// target device stopped waiting earlier, a person could approve the prompt
+/// after the target device closed the connection. A source device that misses
+/// the close could then add trust for a pairing that the target device already
+/// reported as failed. A silent source device can hold the GUI for at most
+/// about 246 seconds; the person can cancel at any time.
 #[derive(Clone, Copy, Debug)]
 pub struct PairTimeouts {
     pub connect: Duration,
     /// From HELLO to CHALLENGE.
     pub challenge: Duration,
-    /// From REVEAL to RESULT. The phone user has 60 seconds.
+    /// From REVEAL to RESULT. It covers [`SOURCE_MAX_DECISION_SECONDS`].
     pub result: Duration,
 }
 impl Default for PairTimeouts {
@@ -2501,7 +2571,7 @@ impl Default for PairTimeouts {
         Self {
             connect: Duration::from_secs(2),
             challenge: Duration::from_secs(2),
-            result: Duration::from_secs(62),
+            result: Duration::from_secs(SOURCE_MAX_DECISION_SECONDS + RESULT_MARGIN_SECONDS),
         }
     }
 }
@@ -2743,8 +2813,10 @@ pub(crate) fn status_at(
     audit: &normalization::Audit,
     cancel: &AtomicBool,
 ) -> Result<PhoneInfo, PairError> {
-    authenticated_command(address, identity, iface, audit, cancel, false)?
-        .ok_or(PairError::Protocol)
+    match authenticated_command(address, identity, iface, audit, cancel, false)? {
+        CommandAnswer::Status(info) => Ok(info),
+        CommandAnswer::Forget(_) => Err(PairError::Protocol),
+    }
 }
 
 /// Ask the source device app whether it trusts this target device when the
@@ -2817,6 +2889,58 @@ pub(crate) fn probe_unpaired_at(
     }
 }
 
+/// The answer that a peer gave to one FORGET attempt.
+///
+/// Protocol v1 gives the source device no static key, and the source device
+/// sends its FORGET answer as a plaintext RESULT. A host that answers on the
+/// pairing port, or a host on the path, can send each of these answers while
+/// the real source device still trusts this target device key. No variant
+/// proves that the source device removed the key. A caller must not report
+/// remote deletion from any of them. It can report that the peer answered and
+/// that the removal is not verified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForgetReply {
+    /// The peer sent CHALLENGE with known = 1, the target device sent the
+    /// sealed FORGET, and the peer answered with the exact plaintext RESULT
+    /// Ok. A real source device sends this after it removes the key.
+    Acknowledged,
+    /// The peer said before the handshake that it does not trust this key:
+    /// CHALLENGE with known = 0, or RESULT Rejected. The target device sent no
+    /// FORGET command.
+    ReportedUnknown,
+    /// The peer answered the sealed FORGET with the exact plaintext RESULT
+    /// Rejected. A real source device also sends this when it cannot open the
+    /// command, so this answer does not show that the key is gone.
+    Rejected,
+}
+
+/// Send one FORGET to the source device and report what the peer answered.
+///
+/// `Ok` means only that a peer answered in a valid v1 form. See
+/// [`ForgetReply`]: no answer proves remote deletion.
+pub fn forget_attempt(
+    host: Ipv4Addr,
+    identity: &Identity,
+    iface: Option<u32>,
+    audit: &normalization::Audit,
+    cancel: &AtomicBool,
+) -> Result<ForgetReply, PairError> {
+    forget_attempt_at(
+        SocketAddr::V4(SocketAddrV4::new(host, PAIRING_PORT)),
+        identity,
+        iface,
+        audit,
+        cancel,
+    )
+}
+
+/// Send one FORGET and return `Ok` only for a proof of remote deletion.
+///
+/// Protocol v1 cannot prove remote deletion (see [`ForgetReply`]), so this
+/// function never returns `Ok`. A valid answer from a peer gives
+/// [`PairError::Unconfirmed`]. A transport or protocol failure gives its own
+/// error. A caller that wants to tell an unverified answer from no answer uses
+/// [`forget_attempt`].
 pub fn forget(
     host: Ipv4Addr,
     identity: &Identity,
@@ -2840,7 +2964,27 @@ fn forget_at(
     audit: &normalization::Audit,
     cancel: &AtomicBool,
 ) -> Result<(), PairError> {
-    authenticated_command(address, identity, iface, audit, cancel, true).map(|_| ())
+    forget_attempt_at(address, identity, iface, audit, cancel)?;
+    Err(PairError::Unconfirmed)
+}
+
+fn forget_attempt_at(
+    address: SocketAddr,
+    identity: &Identity,
+    iface: Option<u32>,
+    audit: &normalization::Audit,
+    cancel: &AtomicBool,
+) -> Result<ForgetReply, PairError> {
+    match authenticated_command(address, identity, iface, audit, cancel, true)? {
+        CommandAnswer::Forget(reply) => Ok(reply),
+        CommandAnswer::Status(_) => Err(PairError::Protocol),
+    }
+}
+
+/// The answer to one authenticated status or forget command.
+enum CommandAnswer {
+    Status(PhoneInfo),
+    Forget(ForgetReply),
 }
 
 fn authenticated_command(
@@ -2850,7 +2994,7 @@ fn authenticated_command(
     audit: &normalization::Audit,
     cancel: &AtomicBool,
     forget: bool,
-) -> Result<Option<PhoneInfo>, PairError> {
+) -> Result<CommandAnswer, PairError> {
     let mut stream = normalization::tcp_connect_cancellable(
         address,
         iface,
@@ -2877,14 +3021,17 @@ fn authenticated_command(
     let message = read_frame(&mut stream, &mut reader, deadline, cancel)?;
     let p_e = match decode_challenge(&message)? {
         ChallengeOrResult::Challenge { p_e, known: true } => p_e,
-        // A FORGET for a key that the source device already removed is a
-        // success. There is nothing left to remove.
-        ChallengeOrResult::Challenge { known: false, .. } if forget => return Ok(None),
+        // The peer says that it does not trust this key. The answer is
+        // plaintext and unauthenticated, so it is not proof that the source
+        // device removed the key. Report the claim and send no command.
+        ChallengeOrResult::Challenge { known: false, .. } if forget => {
+            return Ok(CommandAnswer::Forget(ForgetReply::ReportedUnknown))
+        }
         ChallengeOrResult::Challenge { known: false, .. } => {
             return Err(PairError::Phone(PhoneStatus::Rejected))
         }
         ChallengeOrResult::Result(ResultMessage::Status(PhoneStatus::Rejected)) if forget => {
-            return Ok(None)
+            return Ok(CommandAnswer::Forget(ForgetReply::ReportedUnknown))
         }
         ChallengeOrResult::Result(ResultMessage::Status(s)) => return Err(PairError::Phone(s)),
         _ => return Err(PairError::Protocol),
@@ -2921,10 +3068,15 @@ fn authenticated_command(
     write_frame(&mut stream, &request)?;
     let answer = read_frame(&mut stream, &mut reader, deadline, cancel)?;
     if forget {
-        // A rejected FORGET means that the source device already removed this
-        // key. The key is gone in both cases, so both answers are success.
-        if answer == [MSG_RESULT, 0] || answer == [MSG_RESULT, PhoneStatus::Rejected as u8] {
-            return Ok(None);
+        // Protocol v1 answers FORGET with a plaintext RESULT and no sealed
+        // part. Any peer can send it, so the answer is an unauthenticated claim
+        // and never proof of remote deletion. Accept only the two exact forms
+        // that a source device sends.
+        if answer == [MSG_RESULT, PhoneStatus::Ok as u8] {
+            return Ok(CommandAnswer::Forget(ForgetReply::Acknowledged));
+        }
+        if answer == [MSG_RESULT, PhoneStatus::Rejected as u8] {
+            return Ok(CommandAnswer::Forget(ForgetReply::Rejected));
         }
         return Err(PairError::Protocol);
     }
@@ -2968,7 +3120,7 @@ fn authenticated_command(
     if std::net::IpAddr::V4(host) != address.ip() {
         return Err(PairError::Protocol);
     }
-    Ok(Some(PhoneInfo {
+    Ok(CommandAnswer::Status(PhoneInfo {
         proxy_running: plain[20] == 1,
         foreground: plain[21] == 1,
         connections: u16::from_be_bytes([plain[22], plain[23]]),
@@ -2999,13 +3151,25 @@ impl PairPhase {
 }
 
 /// One snapshot for `GET /api/phone/pair`. All text is fixed or numeric.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PairView {
     pub phase: PairPhase,
     pub code: Option<String>,
     pub host: Option<Ipv4Addr>,
     pub port: Option<u16>,
     pub error: Option<&'static str>,
+}
+/// The SAS code is a pairing secret, so Debug never prints it.
+impl std::fmt::Debug for PairView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairView")
+            .field("phase", &self.phase)
+            .field("code", &self.code.as_ref().map(|_| "[redacted]"))
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("error", &self.error)
+            .finish()
+    }
 }
 impl Default for PairView {
     fn default() -> Self {
@@ -4353,35 +4517,20 @@ pub(crate) mod tests {
         handle.join().unwrap();
     }
 
-    #[test]
-    fn forget_revokes_trust_on_the_phone() {
-        let identity = Identity::from_bytes(L_S_PRIV);
-        let phone = Arc::new(Mutex::new(MockPhone::new(Decide::Allow)));
-        phone.lock().unwrap().trust.insert(identity.public());
-        let (address, handle) = spawn_phone(Arc::clone(&phone), 1);
-        let audit = normalization::Audit::default();
-        let result = forget_at(address, &identity, None, &audit, &AtomicBool::new(false));
-        assert_eq!(result, Ok(()));
-        assert!(phone.lock().unwrap().trust.is_empty());
-        assert_eq!(audit.snapshot(), (1, 0));
-        handle.join().unwrap();
+    // Read one length-prefixed frame from a test socket.
+    fn read_test_frame(stream: &mut TcpStream) -> Vec<u8> {
+        let mut header = [0u8; 2];
+        stream.read_exact(&mut header).unwrap();
+        let mut payload = vec![0u8; u16::from_be_bytes(header) as usize];
+        stream.read_exact(&mut payload).unwrap();
+        payload
     }
 
-    #[test]
-    fn forget_of_a_key_the_phone_already_removed_is_success() {
-        let identity = Identity::from_bytes(L_S_PRIV);
-        // An unknown key gets RESULT Rejected from a status-only HELLO. The key
-        // is gone, so a FORGET succeeds.
-        let (address, handle) = spawn_phone(Arc::new(Mutex::new(MockPhone::new(Decide::Allow))), 1);
-        let audit = normalization::Audit::default();
-        let result = forget_at(address, &identity, None, &audit, &AtomicBool::new(false));
-        assert_eq!(result, Ok(()));
-        assert_eq!(audit.snapshot(), (1, 0));
-        handle.join().unwrap();
-        // A source device that answers a CHALLENGE with known = 0 also counts
-        // as success.
-        let identity = Identity::from_bytes(L_S_PRIV);
-        let challenge = encode_challenge(&public(&P_E_PRIV), false);
+    // A rogue peer that runs the v1 handshake with its own ephemeral key. It
+    // does not know any trust list. It sends `challenge_known` in CHALLENGE.
+    // When it says it knows the key, it reads REVEAL and the sealed FORGET and
+    // then sends `answer` as the FORGET answer.
+    fn spawn_rogue(challenge_known: bool, answer: Vec<u8>) -> (SocketAddr, thread::JoinHandle<()>) {
         let server = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = server.local_addr().unwrap();
         let worker = thread::spawn(move || {
@@ -4389,17 +4538,253 @@ pub(crate) mod tests {
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            let mut header = [0u8; 2];
-            stream.read_exact(&mut header).unwrap();
-            let mut hello = vec![0u8; u16::from_be_bytes(header) as usize];
-            stream.read_exact(&mut hello).unwrap();
+            let hello = read_test_frame(&mut stream);
+            // The target device asks for a forget with flags 2.
+            assert_eq!(hello.get(66), Some(&2));
+            let challenge = encode_challenge(&public(&P_E_PRIV), challenge_known);
             stream.write_all(&frame(&challenge).unwrap()).unwrap();
+            if challenge_known {
+                let reveal = read_test_frame(&mut stream);
+                assert_eq!(reveal[0], MSG_REVEAL);
+                let request = read_test_frame(&mut stream);
+                assert_eq!(request[0], 0x07);
+                stream.write_all(&frame(&answer).unwrap()).unwrap();
+            }
             let mut byte = [0u8; 1];
             let _ = stream.read(&mut byte);
         });
-        let result = forget_at(address, &identity, None, &audit, &AtomicBool::new(false));
-        assert_eq!(result, Ok(()));
+        (address, worker)
+    }
+
+    // A rogue peer on the path. It relays HELLO, CHALLENGE, and REVEAL between
+    // the target device and the real source device, drops the sealed FORGET,
+    // and sends a plaintext RESULT Ok itself. The real source device never
+    // receives the command and keeps its trust.
+    fn spawn_relay_that_drops_forget(source: SocketAddr) -> (SocketAddr, thread::JoinHandle<()>) {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = server.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (mut target, _) = server.accept().unwrap();
+            target
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut phone = TcpStream::connect(source).unwrap();
+            phone
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let hello = read_test_frame(&mut target);
+            phone.write_all(&frame(&hello).unwrap()).unwrap();
+            let challenge = read_test_frame(&mut phone);
+            target.write_all(&frame(&challenge).unwrap()).unwrap();
+            let reveal = read_test_frame(&mut target);
+            phone.write_all(&frame(&reveal).unwrap()).unwrap();
+            let request = read_test_frame(&mut target);
+            assert_eq!(request[0], 0x07);
+            // Drop the command. Close the source device connection so it
+            // stops waiting.
+            let _ = phone.shutdown(std::net::Shutdown::Both);
+            drop(phone);
+            target
+                .write_all(&frame(&[MSG_RESULT, PhoneStatus::Ok as u8]).unwrap())
+                .unwrap();
+            let mut byte = [0u8; 1];
+            let _ = target.read(&mut byte);
+        });
+        (address, worker)
+    }
+
+    #[test]
+    fn forget_reaches_a_real_source_but_is_never_confirmed() {
+        let identity = Identity::from_bytes(L_S_PRIV);
+        let phone = Arc::new(Mutex::new(MockPhone::new(Decide::Allow)));
+        phone.lock().unwrap().trust.insert(identity.public());
+        let (address, handle) = spawn_phone(Arc::clone(&phone), 2);
+        let audit = normalization::Audit::default();
+        let cancel = AtomicBool::new(false);
+        // A legitimate source device removes the key and acknowledges.
+        let reply = forget_attempt_at(address, &identity, None, &audit, &cancel);
+        assert_eq!(reply, Ok(ForgetReply::Acknowledged));
+        assert!(phone.lock().unwrap().trust.is_empty());
+        // The confirmation API still cannot call the answer proof.
+        phone.lock().unwrap().trust.insert(identity.public());
+        let result = forget_at(address, &identity, None, &audit, &cancel);
+        assert_eq!(result, Err(PairError::Unconfirmed));
+        assert!(phone.lock().unwrap().trust.is_empty());
+        assert_eq!(audit.snapshot(), (2, 0));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn forget_of_a_key_the_source_reports_unknown_is_not_confirmed() {
+        let identity = Identity::from_bytes(L_S_PRIV);
+        // An unknown key gets RESULT Rejected from a forget HELLO.
+        let (address, handle) = spawn_phone(Arc::new(Mutex::new(MockPhone::new(Decide::Allow))), 2);
+        let audit = normalization::Audit::default();
+        let cancel = AtomicBool::new(false);
+        let reply = forget_attempt_at(address, &identity, None, &audit, &cancel);
+        assert_eq!(reply, Ok(ForgetReply::ReportedUnknown));
+        let result = forget_at(address, &identity, None, &audit, &cancel);
+        assert_eq!(result, Err(PairError::Unconfirmed));
+        assert_eq!(audit.snapshot(), (2, 0));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn rogue_forget_answers_are_never_confirmed_while_the_source_still_trusts() {
+        let identity = Identity::from_bytes(L_S_PRIV);
+        let audit = normalization::Audit::default();
+        let cancel = AtomicBool::new(false);
+        // The real source device trusts this target device the whole time. No
+        // rogue below reaches it, so its trust must stay.
+        let phone = Arc::new(Mutex::new(MockPhone::new(Decide::Allow)));
+        phone.lock().unwrap().trust.insert(identity.public());
+
+        // A plaintext RESULT Rejected before the handshake.
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = server.local_addr().unwrap();
+        let rejected_first = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = server.accept().unwrap();
+                let _ = read_test_frame(&mut stream);
+                stream
+                    .write_all(&frame(&encode_result_status(PhoneStatus::Rejected)).unwrap())
+                    .unwrap();
+            }
+        });
+        assert_eq!(
+            forget_attempt_at(address, &identity, None, &audit, &cancel),
+            Ok(ForgetReply::ReportedUnknown)
+        );
+        assert_eq!(
+            forget_at(address, &identity, None, &audit, &cancel),
+            Err(PairError::Unconfirmed)
+        );
+        rejected_first.join().unwrap();
+
+        // CHALLENGE with known = 0.
+        for confirm in [false, true] {
+            let (address, worker) = spawn_rogue(false, Vec::new());
+            if confirm {
+                assert_eq!(
+                    forget_at(address, &identity, None, &audit, &cancel),
+                    Err(PairError::Unconfirmed)
+                );
+            } else {
+                assert_eq!(
+                    forget_attempt_at(address, &identity, None, &audit, &cancel),
+                    Ok(ForgetReply::ReportedUnknown)
+                );
+            }
+            worker.join().unwrap();
+        }
+
+        // A full handshake with the rogue's own key, then a plaintext RESULT
+        // Ok or Rejected. The rogue needs no trust list and no secret.
+        for (answer, expected) in [
+            (
+                vec![MSG_RESULT, PhoneStatus::Ok as u8],
+                ForgetReply::Acknowledged,
+            ),
+            (
+                vec![MSG_RESULT, PhoneStatus::Rejected as u8],
+                ForgetReply::Rejected,
+            ),
+        ] {
+            let (address, worker) = spawn_rogue(true, answer.clone());
+            assert_eq!(
+                forget_attempt_at(address, &identity, None, &audit, &cancel),
+                Ok(expected)
+            );
+            worker.join().unwrap();
+            let (address, worker) = spawn_rogue(true, answer);
+            assert_eq!(
+                forget_at(address, &identity, None, &audit, &cancel),
+                Err(PairError::Unconfirmed)
+            );
+            worker.join().unwrap();
+        }
+
+        // Any other answer form is a protocol error, not an acknowledgement.
+        for answer in [
+            vec![MSG_RESULT, PhoneStatus::Ok as u8, 0],
+            vec![MSG_RESULT, PhoneStatus::Busy as u8],
+            vec![MSG_RESULT, 9],
+            vec![0x06, 0],
+        ] {
+            let (address, worker) = spawn_rogue(true, answer);
+            assert_eq!(
+                forget_attempt_at(address, &identity, None, &audit, &cancel),
+                Err(PairError::Protocol)
+            );
+            worker.join().unwrap();
+        }
+
+        // A relay that drops the sealed FORGET and answers RESULT Ok itself.
+        let (source, source_handle) = spawn_phone(Arc::clone(&phone), 1);
+        let (address, relay) = spawn_relay_that_drops_forget(source);
+        assert_eq!(
+            forget_attempt_at(address, &identity, None, &audit, &cancel),
+            Ok(ForgetReply::Acknowledged)
+        );
+        relay.join().unwrap();
+        source_handle.join().unwrap();
+        let (source, source_handle) = spawn_phone(Arc::clone(&phone), 1);
+        let (address, relay) = spawn_relay_that_drops_forget(source);
+        assert_eq!(
+            forget_at(address, &identity, None, &audit, &cancel),
+            Err(PairError::Unconfirmed)
+        );
+        relay.join().unwrap();
+        source_handle.join().unwrap();
+
+        // The real source device still trusts the key after every rogue
+        // answer, and the confirmation API never reported success.
+        assert!(phone.lock().unwrap().trust.contains(&identity.public()));
+        assert_eq!(audit.snapshot().1, 0);
+    }
+
+    #[test]
+    fn forget_transport_failures_keep_their_own_errors() {
+        let identity = Identity::from_bytes(L_S_PRIV);
+        let audit = normalization::Audit::default();
+        let cancel = AtomicBool::new(false);
+        // A closed port is unreachable, not an unverified answer.
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = server.local_addr().unwrap();
+        drop(server);
+        assert_eq!(
+            forget_at(address, &identity, None, &audit, &cancel),
+            Err(PairError::Unreachable)
+        );
+        // A peer that closes after HELLO gives no answer.
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = server.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            let _ = read_test_frame(&mut stream);
+        });
+        let result = forget_attempt_at(address, &identity, None, &audit, &cancel);
+        assert!(
+            matches!(result, Err(PairError::Io) | Err(PairError::Protocol)),
+            "{result:?}"
+        );
+        assert_ne!(result, Err(PairError::Unconfirmed));
         worker.join().unwrap();
+        // A cancelled attempt reports the cancel.
+        let (address, handle) = spawn_phone(Arc::new(Mutex::new(MockPhone::new(Decide::Allow))), 0);
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(
+            forget_at(address, &identity, None, &audit, &cancelled),
+            Err(PairError::Cancelled)
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn unconfirmed_forget_message_is_fixed_text() {
+        let message = PairError::Unconfirmed.message();
+        assert!(message.contains("cannot verify"));
+        assert_eq!(PairError::Unconfirmed.to_string(), message);
     }
 
     #[test]
@@ -4695,5 +5080,25 @@ pub(crate) mod tests {
             PairError::Unreachable.message(),
             "Open HotspotShade on your source device."
         );
+    }
+}
+
+#[cfg(test)]
+mod pair_view_debug_tests {
+    use super::*;
+
+    #[test]
+    fn pair_view_debug_does_not_print_the_code() {
+        let view = PairView {
+            phase: PairPhase::Idle,
+            code: Some("918273".to_string()),
+            host: Some(Ipv4Addr::new(172, 20, 10, 1)),
+            port: Some(8080),
+            error: None,
+        };
+        let text = format!("{view:?}");
+        assert!(!text.contains("918273"), "{text}");
+        assert!(text.contains("[redacted]"));
+        assert!(text.contains("172.20.10.1"));
     }
 }

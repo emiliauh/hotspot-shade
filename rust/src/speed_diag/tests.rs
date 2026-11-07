@@ -226,7 +226,12 @@ fn phone_path_measures_load_and_probes_with_audited_sockets() {
     let upstream = http_server(http.clone(), "speed.example.test:");
     let phone_counts = Arc::new(PhoneCounts::default());
     let phone = mock_phone(upstream, phone_counts.clone(), "speed.example.test");
-    let config = base_config(phone, upstream.port());
+    let mut config = base_config(phone, upstream.port());
+    // The sample loop records the warm boundary from wall time. A host that
+    // deschedules this thread across the whole warmup window would leave
+    // `mbps_after_warmup` null even though the load ran. Start the steady
+    // window at the phase start so the measurement only needs one sample.
+    config.warmup = 0.0;
     let report = run_path(
         PathKind::Phone,
         &config,

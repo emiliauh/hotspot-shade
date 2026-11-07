@@ -1,0 +1,16 @@
+[package]
+name = "tls-transport-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Test-only TLS 1.3 authenticated transport spike for HotspotShade"
+
+# This crate is an isolated experiment. It is not a workspace member of the
+# engine, it has its own lockfile, and nothing in rust/ or the apps depends on
+# it. The dependencies are test-only and stay in this subtree.
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "logging"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+sha2 = "0.10"
+
+[dev-dependencies]
