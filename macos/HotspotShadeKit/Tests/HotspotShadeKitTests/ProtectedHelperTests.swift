@@ -4026,7 +4026,8 @@ final class ProtectedHelperTests: XCTestCase {
     // Process would reap it itself, and RunningRootEngine must read the exit
     // status through waitpid.
     private func spawnShell(_ script: String) throws -> pid_t {
-        var argv: [UnsafeMutablePointer<CChar>?] = ["/bin/sh", "-c", script].map { strdup($0) }
+        let words: [String] = ["/bin/sh", "-c", script]
+        var argv: [UnsafeMutablePointer<CChar>?] = words.map { strdup($0) }
         argv.append(nil)
         let environment = ["PATH=/usr/bin:/bin"]
         var envp: [UnsafeMutablePointer<CChar>?] = environment.map { strdup($0) }

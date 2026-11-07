@@ -488,6 +488,8 @@ mod windows_identity {
     use std::path::{Component, Path, PathBuf, Prefix};
     use std::ptr;
     use std::slice;
+    use std::thread;
+    use std::time::Duration;
 
     type Handle = *mut c_void;
     type Psid = *mut c_void;
@@ -596,6 +598,7 @@ mod windows_identity {
 
     const ERROR_FILE_NOT_FOUND: u32 = 2;
     const ERROR_PATH_NOT_FOUND: u32 = 3;
+    const ERROR_SHARING_VIOLATION: u32 = 32;
     const ERROR_FILE_EXISTS: u32 = 80;
     const ERROR_ALREADY_EXISTS: u32 = 183;
     const ERROR_NO_TOKEN: u32 = 1008;
@@ -605,6 +608,11 @@ mod windows_identity {
     pub(super) const MAGIC: &[u8; 4] = b"HSW1";
     const ENTROPY: &[u8] = b"hotspotshade-identity-v1";
     const MAX_TEMP_ATTEMPTS: usize = 16;
+    /// A concurrent creator holds the final file open for a short time while
+    /// it renames the temporary file into place. The open then fails with a
+    /// sharing violation. Retry for at most 2 seconds, then fail closed.
+    const MAX_SHARING_ATTEMPTS: u32 = 100;
+    const SHARING_RETRY_DELAY: Duration = Duration::from_millis(20);
 
     // FOLDERID_LocalAppData.
     const FOLDERID_LOCAL_APPDATA: Guid = Guid {
@@ -1738,27 +1746,38 @@ mod windows_identity {
 
     fn open_existing_file(path: &Path) -> Result<Option<Handle>, PairError> {
         let text = wide_path(path)?;
-        let handle = unsafe {
-            CreateFileW(
-                text.as_ptr(),
-                GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES,
-                FILE_SHARE_READ,
-                ptr::null(),
-                OPEN_EXISTING,
-                FILE_FLAG_OPEN_REPARSE_POINT,
-                ptr::null_mut(),
-            )
-        };
-        if handle as isize == INVALID_HANDLE_VALUE {
-            return match last_error() {
-                ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Ok(None),
-                _ => Err(PairError::Identity),
+        let mut attempt = 1;
+        loop {
+            let handle = unsafe {
+                CreateFileW(
+                    text.as_ptr(),
+                    GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ,
+                    ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT,
+                    ptr::null_mut(),
+                )
             };
+            if handle as isize == INVALID_HANDLE_VALUE {
+                match last_error() {
+                    ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => return Ok(None),
+                    // A concurrent creator can hold the new file during its
+                    // rename. Wait for that handle to close. Do not widen the
+                    // share mode.
+                    ERROR_SHARING_VIOLATION if attempt < MAX_SHARING_ATTEMPTS => {
+                        attempt += 1;
+                        thread::sleep(SHARING_RETRY_DELAY);
+                        continue;
+                    }
+                    _ => return Err(PairError::Identity),
+                }
+            }
+            if handle.is_null() {
+                return Err(PairError::Identity);
+            }
+            return Ok(Some(handle));
         }
-        if handle.is_null() {
-            return Err(PairError::Identity);
-        }
-        Ok(Some(handle))
     }
 
     unsafe fn wipe_raw(pointer: *mut u8, length: usize) {
@@ -3974,6 +3993,50 @@ pub(crate) mod tests {
             let name = entry.unwrap().file_name();
             assert!(!name.to_string_lossy().starts_with("identity.key.tmp-"));
         }
+    }
+
+    /// Hold the key file with DELETE access, as a concurrent rename does. The
+    /// reader opens without delete sharing, so its open gets a sharing
+    /// violation while the handle is open.
+    #[cfg(windows)]
+    fn hold_key_for_rename(path: &Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        const DELETE: u32 = 0x0001_0000;
+        std::fs::OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(0x7)
+            .open(path)
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn identity_waits_for_a_transient_sharing_violation() {
+        let root = TempRoot::new("hs-identity-sharing");
+        let path = root.key_path();
+        let public = private_identity(&path);
+        let holder = hold_key_for_rename(&path);
+        let release = thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(200));
+            drop(holder);
+        });
+        assert_eq!(Identity::load_or_create(&path).unwrap().public(), public);
+        release.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn identity_fails_closed_on_a_held_sharing_violation() {
+        let root = TempRoot::new("hs-identity-sharing-held");
+        let path = root.key_path();
+        let public = private_identity(&path);
+        let holder = hold_key_for_rename(&path);
+        assert_eq!(
+            Identity::load_or_create(&path).unwrap_err(),
+            PairError::Identity
+        );
+        drop(holder);
+        assert_eq!(Identity::load_or_create(&path).unwrap().public(), public);
     }
 
     #[cfg(windows)]
