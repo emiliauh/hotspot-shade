@@ -25,6 +25,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Bedtime
+import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.Key
@@ -36,8 +37,10 @@ import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.VerifiedUser
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -59,6 +62,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.hotspotshade.demo.BuildConfig
+import com.hotspotshade.demo.HotspotAdapterState
 import com.hotspotshade.demo.model.ManualConnectionPolicy
 import com.hotspotshade.demo.model.ManualConnectionState
 import com.hotspotshade.demo.model.RealProxyState
@@ -95,8 +99,12 @@ internal fun SettingsScreen(
     onToggleManualToken: () -> Unit,
     onCopyManualToken: () -> Unit,
     onCopyConnectionDetails: () -> Unit,
+    adapter: HotspotAdapterState,
+    onAdapterRefresh: () -> Unit,
+    onAdapterSelect: (String?) -> Unit,
 ) {
     var advancedExpanded by rememberSaveable { mutableStateOf(false) }
+    var showAdapterPicker by rememberSaveable { mutableStateOf(false) }
     val reduce = LocalReduceMotion.current
     val tokens = LocalHsTokens.current
     val privacyReport = remember { SourcePrivacyCapabilities.report(Build.VERSION.SDK_INT) }
@@ -273,6 +281,11 @@ internal fun SettingsScreen(
                 onCopyConnectionDetails = onCopyConnectionDetails,
             )
 
+            HotspotAdapterGroup(
+                adapter = adapter,
+                onOpen = { showAdapterPicker = true },
+            )
+
             SettingsGroup {
                 Row(
                     modifier = Modifier
@@ -365,6 +378,18 @@ internal fun SettingsScreen(
                 )
             }
         }
+    }
+
+    if (showAdapterPicker) {
+        HotspotAdapterDialog(
+            adapter = adapter,
+            onSelect = { name ->
+                showAdapterPicker = false
+                onAdapterSelect(name)
+            },
+            onDismiss = { showAdapterPicker = false },
+            onRefresh = onAdapterRefresh,
+        )
     }
 }
 
@@ -667,6 +692,183 @@ private fun ManualConnectionGroup(
         SectionDivider()
         SettingsFootnote(ManualConnectionPolicy.USERNAME_NOTE)
         SettingsFootnote(ManualConnectionPolicy.CLIPBOARD_NOTE)
+    }
+}
+
+@Composable
+private fun HotspotAdapterGroup(
+    adapter: HotspotAdapterState,
+    onOpen: () -> Unit,
+) {
+    val tokens = LocalHsTokens.current
+    SettingsGroup(title = "Hotspot network adapter") {
+        HotspotAdapterRow(
+            value = adapter.chosenName ?: "Automatic",
+            onClick = onOpen,
+        )
+        SectionDivider()
+        SettingsFootnote(
+            "Choose which network interface the proxy treats as the hotspot. " +
+                "The name is an inference, not proof, and the proxy still checks " +
+                "that the interface is safe before it binds it. The change takes " +
+                "effect on the next start.",
+        )
+        if (adapter.loading) {
+            SectionDivider()
+            SettingsStatusRow(
+                icon = Icons.Outlined.Refresh,
+                tint = tokens.secondaryText,
+                text = "Reading interfaces…",
+            )
+        } else if (adapter.chosenName != null &&
+            adapter.names.none { it == adapter.chosenName }
+        ) {
+            SectionDivider()
+            SettingsStatusRow(
+                icon = Icons.Outlined.Refresh,
+                tint = tokens.warning,
+                text = "The chosen interface was not found. The proxy will not start " +
+                    "until it appears or you choose another.",
+            )
+        }
+    }
+}
+
+@Composable
+private fun HotspotAdapterRow(
+    value: String,
+    onClick: () -> Unit,
+) {
+    val tokens = LocalHsTokens.current
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(
+                role = Role.Button,
+                onClickLabel = "Choose the hotspot network adapter",
+                onClick = onClick,
+            )
+            .padding(horizontal = 16.dp, vertical = 12.dp)
+            .minimumInteractiveComponentSize(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text(
+            text = "Hotspot network adapter",
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodyMedium,
+            color = tokens.secondaryText,
+        )
+        Icon(
+            imageVector = Icons.Outlined.ChevronRight,
+            contentDescription = null,
+            tint = tokens.secondaryText,
+            modifier = Modifier.size(20.dp),
+        )
+    }
+}
+
+@Composable
+private fun HotspotAdapterDialog(
+    adapter: HotspotAdapterState,
+    onSelect: (String?) -> Unit,
+    onDismiss: () -> Unit,
+    onRefresh: () -> Unit,
+) {
+    val tokens = LocalHsTokens.current
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surface,
+        title = {
+            Text(
+                text = "Hotspot network adapter",
+                style = MaterialTheme.typography.headlineSmall,
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                AdapterOptionRow(
+                    label = "Automatic",
+                    selected = adapter.chosenName == null,
+                    onClick = { onSelect(null) },
+                )
+                adapter.names.forEach { name ->
+                    AdapterOptionRow(
+                        label = name,
+                        selected = adapter.chosenName == name,
+                        onClick = { onSelect(name) },
+                    )
+                }
+                val note: String = when {
+                    adapter.loading -> "Reading interfaces…"
+                    adapter.unavailable ->
+                        "The interface list needs the network permission to load."
+                    adapter.names.isEmpty() ->
+                        "No safe interfaces were found. Turn on the hotspot and " +
+                            "tap Refresh."
+                    else -> ""
+                }
+                if (note.isNotEmpty()) {
+                    Text(
+                        text = note,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = tokens.secondaryText,
+                        modifier = Modifier.padding(top = 12.dp),
+                    )
+                }
+                Text(
+                    text = "The name records which interface you think is the hotspot. " +
+                        "It is not proof. The proxy still checks the interface before " +
+                        "it binds, and it refuses an interface that a reported " +
+                        "network holds. The change takes effect on the next start.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = tokens.secondaryText,
+                    modifier = Modifier.padding(top = 12.dp),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onRefresh) {
+                Text("Refresh")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Close")
+            }
+        },
+    )
+}
+
+@Composable
+private fun AdapterOptionRow(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        RadioButton(selected = selected, onClick = null)
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
     }
 }
 

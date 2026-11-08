@@ -68,8 +68,46 @@ fn linux_route(route: crate::environment_linux::LinuxDefaultRoute) -> DefaultRou
     }
 }
 
+/// Read the Windows IPv4 default route.
+///
+/// The call reads the two unscoped default route probes and the selected
+/// physical adapter through `windows_physical_path`. It changes nothing. The
+/// returned interface is the decimal adapter index, which
+/// `normalization::interface_index` parses back to the same index on Windows.
+/// The gateway is a real private or shared IPv4 next hop. A VPN, a split
+/// default route, an on-link route, a tunnel, a loopback, a virtual adapter,
+/// or a failed read fails closed with an error instead of naming a non-hotspot
+/// gateway.
+#[cfg(windows)]
+pub fn default_route() -> io::Result<DefaultRoute> {
+    let (index, gateway) =
+        crate::windows_physical_path::default_physical_route().map_err(physical_route_error)?;
+    Ok(DefaultRoute {
+        interface: index.to_string(),
+        gateway: Some(gateway),
+    })
+}
+
+/// Map a physical route refusal to a read-only discovery error.
+///
+/// A missing or unusable gateway is [`io::ErrorKind::NotFound`], so the
+/// caller reports no hotspot rather than a server failure. Every other refusal
+/// is [`io::ErrorKind::Other`]. Both fail closed.
+#[cfg(windows)]
+fn physical_route_error(error: crate::windows_physical_path::PhysicalPathError) -> io::Error {
+    use crate::windows_physical_path::PhysicalPathError;
+    match error {
+        PhysicalPathError::GatewayUnusable(_)
+        | PhysicalPathError::GatewayNotOnAdapterSubnet
+        | PhysicalPathError::DestinationMismatch => {
+            io::Error::new(io::ErrorKind::NotFound, "no physical hotspot default route")
+        }
+        _ => io::Error::other("physical default route discovery failed"),
+    }
+}
+
 /// Return an error on a platform without default route discovery.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub fn default_route() -> io::Result<DefaultRoute> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,

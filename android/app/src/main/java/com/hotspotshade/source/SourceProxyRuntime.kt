@@ -241,10 +241,12 @@ internal object SourceProxyRuntime {
         val observation = NetworkInterfaceObservationReader(
             ConnectivityNetworkSource(connectivity),
         )
+        val choiceStore = HotspotInterfaceChoiceStore(preferences(context))
         return NetworkInterfaceHotspotAddressFinder(
             PlatformInterfaceSource(),
             { observation.read() },
             tetheredInterfaceEvidence(context),
+            HotspotInterfaceChoiceSource { choiceStore.load() },
         )
     }
 

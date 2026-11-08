@@ -204,7 +204,7 @@ class HotspotAddressFinderTest {
     }
 
     @Test
-    fun aReportedTetherRoleDoesNotConfirmAnUnreportedWlan() {
+    fun aReportedTetherRoleIsExcludedAndDoesNotConfirmAnUnreportedWlan() {
         val tetherNames = listOf(
             "ap0",
             "softap0",
@@ -216,6 +216,7 @@ class HotspotAddressFinderTest {
             "eth0",
             "p2p0",
         )
+        val wlanAddress = InetAddress.getByName("192.168.43.1")
         for (tetherName in tetherNames) {
             val source = FakeSource(
                 listOf(
@@ -224,21 +225,27 @@ class HotspotAddressFinderTest {
                 ),
             )
 
-            // The reported Wi-Fi network is a tether role, not a station. It
-            // cannot serve as proof that a separate wlan is the hotspot.
-            assertNull(
-                "$tetherName must not confirm wlan1",
-                finder(
-                    source,
-                    observed(tetherName, wifiClient),
-                    observed("rmnet_data0", cellular),
-                ).findHotspotAddress(),
+            // The reported Wi-Fi network is a tether role, not a station. It is
+            // excluded and cannot serve as station evidence. The unreported
+            // wlan1 is admitted only at the fallback rank, never as a rank-4
+            // inference from the tether name.
+            val result = probe(
+                source,
+                observed(tetherName, wifiClient),
+                observed("rmnet_data0", cellular),
             )
+            assertTrue(result is HotspotProbe.Observed)
+            val observed = result as HotspotProbe.Observed
+            assertEquals(
+                listOf(HotspotCandidate(5, wlanAddress)),
+                observed.candidates,
+            )
+            assertTrue(InetAddress.getByName("192.168.1.24") in observed.excludedAddresses)
         }
     }
 
     @Test
-    fun aReportedWlanDoesNotConfirmADifferentUnreportedWlan() {
+    fun aReportedWlanClientAdmitsTheUnreportedWlanAtTheFallbackRank() {
         val source = FakeSource(
             listOf(
                 snapshot("wlan0", "192.168.1.24"),
@@ -247,8 +254,21 @@ class HotspotAddressFinderTest {
         )
 
         // A reported wlan name is ambiguous: it can be the station or the
-        // access point. It is not proof that the other wlan is tethering.
-        assertNull(
+        // access point, so it is not station evidence. The reported wlan0 is
+        // excluded, and the unreported wlan1 is admitted only at the fallback
+        // rank, not as a rank-4 inference.
+        val result = probe(
+            source,
+            observed("wlan0", wifiClient),
+            observed("rmnet_data0", cellular),
+        )
+        assertTrue(result is HotspotProbe.Observed)
+        assertEquals(
+            listOf(HotspotCandidate(5, InetAddress.getByName("192.168.43.1"))),
+            (result as HotspotProbe.Observed).candidates,
+        )
+        assertEquals(
+            InetAddress.getByName("192.168.43.1"),
             finder(
                 source,
                 observed("wlan0", wifiClient),
@@ -289,8 +309,14 @@ class HotspotAddressFinderTest {
         )
 
         // A caller can build an observation in a test or a future adapter.
-        // The finder still refuses an ambiguous wlan as client evidence.
-        assertNull(finder(source, complete).findHotspotAddress())
+        // The finder still refuses an ambiguous wlan as client evidence, so
+        // wlan1 is admitted at the fallback rank, not the inferred rank.
+        val result = probe(source, complete)
+        assertTrue(result is HotspotProbe.Observed)
+        assertEquals(
+            listOf(HotspotCandidate(5, InetAddress.getByName("192.168.43.1"))),
+            (result as HotspotProbe.Observed).candidates,
+        )
     }
 
     @Test
@@ -397,7 +423,7 @@ class HotspotAddressFinderTest {
     }
 
     @Test
-    fun doesNotUseTheWlan1ClientInterface() {
+    fun anUnreportedWlanAccessPointIsFoundNextToAWlanClient() {
         val source = FakeSource(
             listOf(
                 snapshot("wlan0", "192.168.43.1"),
@@ -405,9 +431,13 @@ class HotspotAddressFinderTest {
             ),
         )
 
-        // wlan0 is the access point. wlan1 is the Wi-Fi client. The reported
-        // wlan1 name is ambiguous, so it cannot confirm wlan0 either.
-        assertNull(finder(source, observed("wlan1", wifiClient)).findHotspotAddress())
+        // wlan1 is the reported Wi-Fi client (excluded). The unreported wlan0
+        // access point is admitted at the fallback rank.
+        assertEquals(
+            InetAddress.getByName("192.168.43.1"),
+            finder(source, observed("wlan1", wifiClient)).findHotspotAddress(),
+        )
+        // A lone reported wlan1 client stays excluded.
         assertNull(
             finder(
                 FakeSource(listOf(snapshot("wlan1", "192.168.1.24"))),
@@ -444,7 +474,7 @@ class HotspotAddressFinderTest {
     }
 
     @Test
-    fun doesNotTreatSilenceAsProofOfAWlanHotspot() {
+    fun twoUnreportedWlanInterfacesTieAtTheFallbackRank() {
         val source = FakeSource(
             listOf(
                 snapshot("wlan0", "192.168.1.24"),
@@ -452,22 +482,33 @@ class HotspotAddressFinderTest {
             ),
         )
 
-        // A complete observation with no Wi-Fi client is silence, not proof
-        // that either wlan interface is tethering.
+        // A complete observation with no Wi-Fi client is silence. Each wlan is
+        // admitted at the fallback rank, and the two tie, so the finder cannot
+        // choose and fails closed.
         val silent = probe(source, NetworkInterfaceObservation.Complete(emptySet(), emptySet()))
         assertTrue(silent is HotspotProbe.Observed)
-        assertTrue((silent as HotspotProbe.Observed).candidates.isEmpty())
+        val candidates = (silent as HotspotProbe.Observed).candidates
+        assertEquals(2, candidates.size)
+        assertTrue(candidates.all { it.rank == 5 })
         assertNull(finder(source, NetworkInterfaceObservation.Complete(emptySet(), emptySet()))
             .findHotspotAddress())
     }
 
     @Test
-    fun doesNotUseAGenericEthernetInterface() {
+    fun aGenericEthernetInterfaceIsAdmittedOnlyAtTheFallbackRank() {
         val source = FakeSource(listOf(snapshot("eth0", "10.0.2.15")))
 
-        assertNull(finder(source).findHotspotAddress())
-        assertNull(
-            finder(source, observed("wlan0", wifiClient)).findHotspotAddress(),
+        // A generic unreported name is not a strong tether name, but the
+        // fallback admits it at rank 5 when it has one private IPv4 address.
+        val result = probe(source)
+        assertTrue(result is HotspotProbe.Observed)
+        assertEquals(
+            listOf(HotspotCandidate(5, InetAddress.getByName("10.0.2.15"))),
+            (result as HotspotProbe.Observed).candidates,
+        )
+        assertEquals(
+            InetAddress.getByName("10.0.2.15"),
+            finder(source).findHotspotAddress(),
         )
     }
 
@@ -606,12 +647,18 @@ class HotspotAddressFinderTest {
     }
 
     @Test
-    fun anUnlistedBtPanNameIsNotAHotspot() {
+    fun anUnlistedBtPanNameIsAdmittedOnlyAtTheFallbackRank() {
         // Android uses bt-pan* for a Bluetooth tether and for a Bluetooth PAN
-        // client. The name alone is not proof of either role.
+        // client. The name alone is not proof of either role, so it is admitted
+        // only at the fallback rank and never on an unknown read.
         val source = FakeSource(listOf(snapshot("bt-pan0", "192.168.44.2")))
 
-        assertNull(finder(source).findHotspotAddress())
+        val result = probe(source)
+        assertTrue(result is HotspotProbe.Observed)
+        assertEquals(
+            listOf(HotspotCandidate(5, InetAddress.getByName("192.168.44.2"))),
+            (result as HotspotProbe.Observed).candidates,
+        )
         assertNull(
             finder(source, NetworkInterfaceObservation.Unknown).findHotspotAddress(),
         )
@@ -873,7 +920,7 @@ class HotspotAddressFinderTest {
     }
 
     @Test
-    fun aVpnOverWifiDoesNotConfirmAnotherWlan() {
+    fun aVpnOverWifiClientIsNotStationEvidenceButTheFallbackAdmitsTheWlan() {
         val vpnOverWifi = ObservedTransports(isCellular = false, isWifi = true, isVpn = true)
         val source = FakeSource(
             listOf(
@@ -882,13 +929,19 @@ class HotspotAddressFinderTest {
             ),
         )
 
-        assertNull(
-            finder(source, observed("wlan1", vpnOverWifi)).findHotspotAddress(),
+        // wlan1 is a reported VPN-over-Wi-Fi client (excluded) and is not
+        // station evidence. The unreported wlan0 is admitted at the fallback
+        // rank, never the inferred rank.
+        val result = probe(source, observed("wlan1", vpnOverWifi))
+        assertTrue(result is HotspotProbe.Observed)
+        assertEquals(
+            listOf(HotspotCandidate(5, InetAddress.getByName("192.168.43.1"))),
+            (result as HotspotProbe.Observed).candidates,
         )
     }
 
     @Test
-    fun aWifiStationOverVpnOrCellularDoesNotConfirmAWlan() {
+    fun aWifiStationOverVpnOrCellularIsNotStationEvidence() {
         val vpnOverWifi = ObservedTransports(isCellular = false, isWifi = true, isVpn = true)
         val cellularWifi = ObservedTransports(isCellular = true, isWifi = true, isVpn = false)
         val source = FakeSource(
@@ -897,20 +950,25 @@ class HotspotAddressFinderTest {
                 snapshot("wlan1", "192.168.43.1"),
             ),
         )
+        val wlanAddress = InetAddress.getByName("192.168.43.1")
 
-        // wifi0 has an unambiguous station name, so only the transport guards
-        // can reject it. A VPN or cellular view is not a plain Wi-Fi client.
-        assertNull(
-            finder(source, observed("wifi0", vpnOverWifi)).findHotspotAddress(),
-        )
-        assertNull(
-            finder(source, observed("wifi0", cellularWifi)).findHotspotAddress(),
-        )
-
-        // The same name with a plain Wi-Fi transport is the positive control.
+        // wifi0 has an unambiguous station name, but a VPN or cellular view is
+        // not a plain Wi-Fi client, so it is not station evidence. wlan1 is
+        // admitted only at the fallback rank.
         assertEquals(
-            InetAddress.getByName("192.168.43.1"),
-            finder(source, observed("wifi0", wifiClient)).findHotspotAddress(),
+            listOf(HotspotCandidate(5, wlanAddress)),
+            (probe(source, observed("wifi0", vpnOverWifi)) as HotspotProbe.Observed).candidates,
+        )
+        assertEquals(
+            listOf(HotspotCandidate(5, wlanAddress)),
+            (probe(source, observed("wifi0", cellularWifi)) as HotspotProbe.Observed).candidates,
+        )
+
+        // The same name with a plain Wi-Fi transport is the positive control:
+        // it confirms wlan1 at the inferred rank.
+        assertEquals(
+            listOf(HotspotCandidate(4, wlanAddress)),
+            (probe(source, observed("wifi0", wifiClient)) as HotspotProbe.Observed).candidates,
         )
     }
 
@@ -1050,10 +1108,8 @@ class HotspotAddressFinderTest {
         val source = FakeSource(listOf(snapshot("wlan1", "192.168.43.1")))
         val complete = NetworkInterfaceObservation.Complete(emptySet(), emptySet())
 
-        // The automatic rule rejects this name because no Wi-Fi client is
-        // reported. The person selected the access point, so the finder accepts
-        // the one private address on that interface.
-        assertNull(finder(source, complete).findHotspotAddress())
+        // The fallback already admits this name at rank 5. The explicit choice
+        // still applies at USER_CHOICE_RANK and wins.
         assertEquals(
             address,
             choiceFinder(source, complete, choice("wlan1")).findHotspotAddress(),
@@ -1720,6 +1776,112 @@ class HotspotAddressFinderTest {
                 HotspotInterfaceOption("ap0", InetAddress.getByName("192.168.43.1")),
             ),
             selectableHotspotInterfaces(source.interfaces, complete),
+        )
+    }
+
+    // --- Fail-closed fallback rank -----------------------------------------
+
+    @Test
+    fun aClientOffWlanAccessPointIsFoundAtTheFallbackRank() {
+        val source = FakeSource(
+            listOf(
+                snapshot("wlan1", "192.168.43.1"),
+                snapshot("rmnet_data0", "10.44.0.9"),
+            ),
+        )
+
+        // The phone's hotspot is on and its Wi-Fi client is off. No Wi-Fi
+        // network is reported, so no station evidence exists. The unreported
+        // wlan1 access point is admitted at the fallback rank.
+        val result = probe(source, observed("rmnet_data0", cellular))
+        assertTrue(result is HotspotProbe.Observed)
+        assertEquals(
+            listOf(HotspotCandidate(5, InetAddress.getByName("192.168.43.1"))),
+            (result as HotspotProbe.Observed).candidates,
+        )
+        assertEquals(
+            InetAddress.getByName("192.168.43.1"),
+            finder(source, observed("rmnet_data0", cellular)).findHotspotAddress(),
+        )
+    }
+
+    @Test
+    fun twoUnreportedPrivateInterfacesFailClosed() {
+        val source = FakeSource(
+            listOf(
+                snapshot("eth0", "10.0.2.15"),
+                snapshot("wlan1", "192.168.43.1"),
+            ),
+        )
+
+        // Two unreported interfaces each hold one private IPv4 address. They
+        // tie at the fallback rank, so the finder fails closed.
+        val result = probe(source)
+        assertTrue(result is HotspotProbe.Observed)
+        val candidates = (result as HotspotProbe.Observed).candidates
+        assertEquals(2, candidates.size)
+        assertTrue(candidates.all { it.rank == 5 })
+        assertNull(finder(source).findHotspotAddress())
+    }
+
+    @Test
+    fun cellularAndVirtualInterfacesAreNeverChosenAtTheFallbackRank() {
+        val source = FakeSource(
+            listOf(
+                snapshot("rmnet_data0", "10.44.0.9"),
+                snapshot("ccmni1", "10.12.0.4"),
+                snapshot("tun0", "10.8.0.2"),
+                snapshot("wg0", "10.10.0.2"),
+            ),
+        )
+
+        // Cellular and virtual prefixes are excluded from the fallback. No
+        // candidate remains.
+        val result = probe(source, NetworkInterfaceObservation.Complete(emptySet(), emptySet()))
+        assertTrue(result is HotspotProbe.Observed)
+        assertTrue((result as HotspotProbe.Observed).candidates.isEmpty())
+        assertNull(
+            finder(source, NetworkInterfaceObservation.Complete(emptySet(), emptySet()))
+                .findHotspotAddress(),
+        )
+    }
+
+    @Test
+    fun aPartialOrUnknownObservationDoesNotAdmitTheFallback() {
+        val source = FakeSource(listOf(snapshot("wlan1", "192.168.43.1")))
+
+        assertNull(
+            finder(source, NetworkInterfaceObservation.Partial(emptySet()))
+                .findHotspotAddress(),
+        )
+        assertNull(
+            finder(source, NetworkInterfaceObservation.Unknown).findHotspotAddress(),
+        )
+    }
+
+    @Test
+    fun aManualChoiceWinsOverTheAutomaticFallbackAndAMissingChoiceFailsClosed() {
+        val complete = NetworkInterfaceObservation.Complete(emptySet(), emptySet())
+        val source = FakeSource(
+            listOf(
+                snapshot("ap0", "192.168.43.1"),
+                snapshot("wlan1", "192.168.44.1"),
+            ),
+        )
+
+        // The automatic rules would rank ap0 above wlan1. The person chose
+        // wlan1, so the explicit choice wins.
+        assertEquals(
+            InetAddress.getByName("192.168.44.1"),
+            choiceFinder(source, complete, choice("wlan1")).findHotspotAddress(),
+        )
+        // A choice whose interface is gone fails closed instead of falling back
+        // to ap0.
+        assertChoiceRejected(
+            source,
+            complete,
+            choice("wlan9"),
+            HotspotChoiceOutcome.INTERFACE_MISSING,
         )
     }
 }

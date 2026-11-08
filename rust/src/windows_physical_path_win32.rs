@@ -569,6 +569,24 @@ fn observe_gateway() -> Result<super::GatewayObservation, PhysicalPathError> {
     })
 }
 
+/// Read the physical default IPv4 route.
+///
+/// The call reads the two unscoped default route probes and the selected
+/// physical adapter, then runs the pure [`super::default_physical_route_from`]
+/// decision. It returns the interface index and the IPv4 gateway only when both
+/// probes agree on the genuine `0.0.0.0/0` route with a real IPv4 next hop and
+/// the adapter is an accepted physical Ethernet or Wi-Fi adapter that matches
+/// the route. It changes no route, opens no device, and creates no socket. A
+/// VPN, a split default route, a loopback, a tunnel, a virtual adapter, or a
+/// failed read is an error, never a fallback.
+#[cfg(windows)]
+pub(crate) fn default_physical_route() -> Result<(u32, Ipv4Addr), PhysicalPathError> {
+    let gateway = observe_gateway()?;
+    let selection = super::selected_gateway(&gateway)?;
+    let adapter = read_adapter(selection.interface_luid, selection.interface_index)?;
+    super::default_physical_route_from(&gateway, &adapter)
+}
+
 /// The three reads that make one adapter observation.
 ///
 /// The live implementation calls `GetIfEntry2`, `ConvertInterfaceLuidToGuid`

@@ -503,29 +503,39 @@ reported network holds is excluded. The platform can report upstream, client,
 or access point interfaces; every reported name is excluded even if that makes
 a real hotspot unavailable. The rule covers cellular, Wi-Fi, VPN, Ethernet, and
 Bluetooth PAN. The finder returns only an interface that passes the rules below.
-With the name rules, a strong tethering name is admitted by the heuristic: `swlan*`, `ap*`,
-`softap*`, and `rndis*`. `bt-pan*` is not a strong name. Android uses the
-same prefix for a Bluetooth tether and a Bluetooth PAN client, so the finder
-does not guess. A `wlan*` name is a weak candidate: it needs a complete
-observation that names a separate, unambiguous Wi-Fi station, and the candidate
-must not be a reported network. Reported `wlan*` and tether-style names cannot
-provide that station evidence. That is an inference from station plus access
-point concurrency, not proof.
+With the name rules, a strong tethering name is admitted by the heuristic:
+`swlan*`, `ap*`, `softap*`, and `rndis*`. `bt-pan*` is not a strong name.
+Android uses the same prefix for a Bluetooth tether and a Bluetooth PAN client,
+so the finder does not guess. A `wlan*` name is a weak candidate: with a
+complete observation that names a separate, unambiguous Wi-Fi station, it is
+admitted at the inferred rank, and the candidate must not be a reported
+network. Reported `wlan*` and tether-style names cannot provide that station
+evidence. That is an inference from station plus access point concurrency, not
+proof.
+
+When the name rules cannot rank an unreported interface, the finder applies a
+fail-closed fallback: an interface with a complete observation, a name that is
+not virtual- or cellular-prefixed, and exactly one safe private IPv4 address is
+admitted at the fallback rank. This covers a `wlan*` access point on a ROM that
+names the station `wlan0` or leaves the Wi-Fi client off, and also a generic
+unreported `eth*`, `usb*`, `ncm*`, or `bt-pan*` name with one private address.
+It is the weakest automatic evidence and an inference from one private address,
+not proof of tethering. A `tun*`, `wg*`, `ppp*`, or other virtual name and a
+`rmnet*` or other cellular name are never admitted by the fallback.
 
 A missing capability, a missing link-properties value, a missing interface
 name, or a failed platform call makes the observation partial. A partial read
 keeps every name that it read, so a known client interface stays excluded. It
-never confirms a `wlan*` name, because one missing client name could hide the
-station. The finder never treats an unread name as an absent client. When two
-interfaces or two private addresses hold the best rank, a new start waits
-because the finder cannot choose between them. An existing run can continue
-while its bound address remains a candidate. With the name rules, a generic name such as `eth*`, `usb*`, or
-`wg*` is never a hotspot. The finder returns null when it cannot confirm an
-interface. The
-pairing listener and the proxy then stop instead of binding a client or VPN
-address. A strong Wi-Fi access point name ranks above `rndis` USB; an inferred
-weak `wlan` candidate ranks below it. Fake sources drive the
-JVM tests.
+never confirms a `wlan*` name and never admits the fallback, because one
+missing client name could hide the station. The finder never treats an unread
+name as an absent client. When two interfaces or two private addresses hold the
+best rank, a new start waits because the finder cannot choose between them. An
+existing run can continue while its bound address remains a candidate. The
+finder returns null when it cannot confirm an interface. The pairing listener
+and the proxy then stop instead of binding a client or VPN address. A strong
+Wi-Fi access point name ranks above `rndis` USB; an inferred weak `wlan`
+candidate ranks below it, and both rank above the fallback. Fake sources drive
+the JVM tests.
 
 An interface name alone does not prove that the interface is tethering. A
 vendor ROM can hide the Wi-Fi client network while the access point is up, name
@@ -622,6 +632,16 @@ those versions the name rules and the network observation are the only
 evidence, and their accuracy varies by vendor ROM. That discovery gap and the
 OEM compatibility question remain open.
 
+When the automatic rules fail closed on a vendor ROM, the person can name the
+hotspot interface. The Settings page has a "Hotspot network adapter" picker
+that lists the safe interface names from `selectableInterfaces()` and stores
+one name, or "Automatic". The finder revalidates the stored name on every probe
+and never lets it override a reported client or upstream network. A selected
+interface that is missing, reported, unsafe, or without exactly one private
+IPv4 address fails closed rather than falling back to the name rules. The name
+is an inference, not proof. The picker shows interface names only; it never
+shows or logs an address.
+
 `SourceProxyController` holds the state machine: start, wait for the network,
 run, stop. It reports `HOTSPOT_NOT_FOUND`, `TOKEN_MISSING`, `BIND_FAILED`,
 `START_FAILED`, `NETWORK_LOST`, `CAPABILITIES_LOST`, `NETWORK_UNAVAILABLE`,
@@ -637,9 +657,10 @@ network callback or hotspot callback never starts a second run.
   connection counts.
 - Settings: background, notifications, the real pairing listener, the real
   paired target devices, destination privacy, the manual connection values,
-  and Advanced. Advanced holds the real state, the real port, the real
-  connection counts, token rotation, diagnostics, and the version. The port is
-  read-only. See "Not in the app" below.
+  the hotspot network adapter picker, and Advanced. Advanced holds the real
+  state, the real port, the real connection counts, token rotation,
+  diagnostics, and the version. The port is read-only. See "Not in the app"
+  below.
 - Pairing: a real Allow or Deny dialog with a six digit code.
 - Semantic light and dark themes. The app follows the system theme.
 - Animation for tab changes, status changes, the button, expanding rows, the

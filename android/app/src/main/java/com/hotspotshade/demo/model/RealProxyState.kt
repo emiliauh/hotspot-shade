@@ -129,7 +129,9 @@ data class RealProxyState(
             RealProxyPhase.OFF ->
                 "Start the proxy when your target device is connected to your hotspot."
             RealProxyPhase.STARTING -> "Starting the source proxy."
-            RealProxyPhase.WAITING_FOR_HOTSPOT -> "Turn on the hotspot, then tap Start again."
+            RealProxyPhase.WAITING_FOR_HOTSPOT ->
+                "Turn on Personal Hotspot. If it is on, choose the hotspot network " +
+                    "adapter in Settings."
             RealProxyPhase.WAITING_FOR_CELLULAR ->
                 "The hotspot is ready. Waiting for the cellular network."
             RealProxyPhase.RUNNING -> "Target devices can connect through the hotspot."

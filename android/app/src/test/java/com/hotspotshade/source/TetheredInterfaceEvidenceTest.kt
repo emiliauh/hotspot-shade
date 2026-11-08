@@ -1041,10 +1041,14 @@ class TetheredInterfaceEvidenceTest {
     }
 
     @Test
-    fun unavailableEvidenceDoesNotConfirmAWlanWithoutAClient() {
+    fun unavailableEvidenceFallsBackToTheFallbackRankForAWlanWithoutAClient() {
         val source = FakeSource(listOf(snapshot("wlan1", "192.168.43.1")))
 
-        assertNull(
+        // Unavailable evidence keeps the name rules, which admit the unreported
+        // wlan1 at the fallback rank because it has one private IPv4 address
+        // and a complete observation.
+        assertEquals(
+            address("192.168.43.1"),
             finder(source, TetheredInterfaceState.Unavailable).findHotspotAddress(),
         )
     }

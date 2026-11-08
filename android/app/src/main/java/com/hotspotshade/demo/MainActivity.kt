@@ -24,6 +24,7 @@ class MainActivity : ComponentActivity() {
     private val pairingViewModel: PairingViewModel by viewModels()
     private val proxyViewModel: ProxyViewModel by viewModels()
     private val manualConnectionViewModel: ManualConnectionViewModel by viewModels()
+    private val hotspotAdapterViewModel: HotspotAdapterViewModel by viewModels()
     private val secureWindow by lazy {
         SecureWindowController(ActivitySecureWindow(window))
     }
@@ -70,6 +71,7 @@ class MainActivity : ComponentActivity() {
                 pairingViewModel = pairingViewModel,
                 proxyViewModel = proxyViewModel,
                 manualConnectionViewModel = manualConnectionViewModel,
+                hotspotAdapterViewModel = hotspotAdapterViewModel,
                 onTokenReveal = secureWindow::update,
             )
         }
@@ -81,6 +83,7 @@ private fun HotspotShadeApp(
     pairingViewModel: PairingViewModel,
     proxyViewModel: ProxyViewModel,
     manualConnectionViewModel: ManualConnectionViewModel,
+    hotspotAdapterViewModel: HotspotAdapterViewModel,
     onTokenReveal: (Boolean) -> Unit,
 ) {
     val tokenRevealed = manualConnectionViewModel.state.tokenVisible
@@ -94,6 +97,7 @@ private fun HotspotShadeApp(
             pairingViewModel = pairingViewModel,
             proxyViewModel = proxyViewModel,
             manualConnectionViewModel = manualConnectionViewModel,
+            hotspotAdapterViewModel = hotspotAdapterViewModel,
         )
     }
 }

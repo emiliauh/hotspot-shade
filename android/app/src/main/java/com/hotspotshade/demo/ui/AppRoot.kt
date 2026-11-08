@@ -68,6 +68,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import com.hotspotshade.demo.BuildConfig
+import com.hotspotshade.demo.HotspotAdapterViewModel
 import com.hotspotshade.demo.ManualConnectionViewModel
 import com.hotspotshade.demo.ProxyViewModel
 import com.hotspotshade.demo.ui.theme.LocalHsTokens
@@ -90,6 +91,7 @@ fun AppRoot(
     pairingViewModel: PairingViewModel,
     proxyViewModel: ProxyViewModel,
     manualConnectionViewModel: ManualConnectionViewModel,
+    hotspotAdapterViewModel: HotspotAdapterViewModel,
 ) {
     val real = proxyViewModel.state
     val manual = manualConnectionViewModel.state
@@ -147,6 +149,10 @@ fun AppRoot(
 
     LaunchedEffect(tab, realStatus.trustedTargets) {
         if (tab == AppTab.SETTINGS) manualConnectionViewModel.refresh()
+    }
+
+    LaunchedEffect(tab) {
+        if (tab == AppTab.SETTINGS) hotspotAdapterViewModel.refresh()
     }
 
     val startProxy = {
@@ -292,6 +298,9 @@ fun AppRoot(
                             onCopyManualToken = manualConnectionViewModel::copyToken,
                             onCopyConnectionDetails =
                                 manualConnectionViewModel::copyConnectionDetails,
+                            adapter = hotspotAdapterViewModel.state,
+                            onAdapterRefresh = hotspotAdapterViewModel::refresh,
+                            onAdapterSelect = hotspotAdapterViewModel::select,
                         )
                     }
                 }

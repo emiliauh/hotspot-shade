@@ -25,7 +25,8 @@ class RealProxyStateTest {
         val state = RealProxyState(phase = RealProxyPhase.WAITING_FOR_HOTSPOT)
 
         assertEquals("Waiting for the hotspot", state.statusTitle)
-        assertTrue(state.statusMessage.contains("Turn on the hotspot"))
+        assertTrue(state.statusMessage.contains("Turn on Personal Hotspot"))
+        assertTrue(state.statusMessage.contains("hotspot network adapter"))
         assertEquals(StatusKind.ATTENTION, state.statusKind)
         assertFalse(state.active)
         assertFalse(state.running)

@@ -414,3 +414,22 @@ fn the_windows_observer_has_a_read_only_evidence_signature() {
     > = windows_physical_path::observe;
     let _ = observe;
 }
+
+#[cfg(windows)]
+#[test]
+fn the_windows_default_physical_route_is_read_only() {
+    let default_physical_route: fn() -> Result<(u32, Ipv4Addr), PhysicalPathError> =
+        windows_physical_path::default_physical_route;
+    let _ = default_physical_route;
+}
+
+#[cfg(windows)]
+#[test]
+fn the_windows_idle_token_gate_is_read_only() {
+    let observe: fn(
+        Ipv4Addr,
+        u32,
+    ) -> Result<windows_physical_path::PhysicalPathProof, PhysicalPathError> =
+        windows_physical_path::observe_token_destination_idle;
+    let _ = observe;
+}

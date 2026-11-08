@@ -686,6 +686,34 @@ impl fmt::Display for PhysicalPathError {
 
 impl std::error::Error for PhysicalPathError {}
 
+impl PhysicalPathError {
+    /// A fixed-vocabulary reason for a presence failure in diagnostics.
+    ///
+    /// The reason is the variant name plus the fixed static message, and only
+    /// the Windows error code for an `Api` or a wrapped route error. It never
+    /// holds an address, prefix, next hop, index, LUID, or GUID, so a
+    /// diagnostics or probe line built from it cannot leak the hotspot
+    /// network. Do not put this reason in user-facing status text.
+    pub fn presence_reason(&self) -> String {
+        match self {
+            Self::InvalidDestination(message) => format!("InvalidDestination: {message}"),
+            Self::InvalidObservation(message) => format!("InvalidObservation: {message}"),
+            Self::GatewayUnusable(message) => format!("GatewayUnusable: {message}"),
+            Self::DestinationMismatch => "DestinationMismatch".to_string(),
+            Self::AdapterNotPhysical(message) => format!("AdapterNotPhysical: {message}"),
+            Self::AdapterIdentityChanged => "AdapterIdentityChanged".to_string(),
+            Self::AdapterAddressUnusable(message) => format!("AdapterAddressUnusable: {message}"),
+            Self::GatewayNotOnAdapterSubnet => "GatewayNotOnAdapterSubnet".to_string(),
+            Self::DestinationRouteUnusable(message) => {
+                format!("DestinationRouteUnusable: {message}")
+            }
+            Self::RouteVerify(inner) => format!("RouteVerify: {}", inner.presence_kind()),
+            #[cfg(any(windows, test))]
+            Self::Api { code, .. } => format!("Api: {code}"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct GatewaySelection {
     gateway: Ipv4Addr,
@@ -1086,6 +1114,35 @@ fn selected_gateway(
     ))
 }
 
+/// Decide the physical default route from one gateway and one adapter
+/// observation.
+///
+/// This is the pure core of Windows default route discovery. It changes
+/// nothing. It returns the interface index and the IPv4 gateway only when the
+/// two gateway probes agree on the genuine `0.0.0.0/0` route with a real
+/// private or shared IPv4 next hop (never on-link or zero), and the selected
+/// adapter is an accepted physical Ethernet or Wi-Fi adapter that matches the
+/// route. A split default route, a VPN route, a loopback, a tunnel, a virtual
+/// adapter, or an identity mismatch is an error, never a fallback.
+///
+/// The live reader `win32::default_physical_route` fills these observations
+/// from `GetBestInterfaceEx`, `GetBestRoute2`, `GetIfEntry2`, and
+/// `GetUnicastIpAddressTable`. Tests build them from fixed data.
+#[cfg(any(windows, test))]
+pub(crate) fn default_physical_route_from(
+    gateway: &GatewayObservation,
+    adapter: &PhysicalAdapterObservation,
+) -> Result<(u32, Ipv4Addr), PhysicalPathError> {
+    let selection = selected_gateway(gateway)?;
+    validate_adapter(adapter)?;
+    if adapter.identity.interface_index() != selection.interface_index
+        || adapter.identity.interface_luid() != selection.interface_luid
+    {
+        return Err(PhysicalPathError::AdapterIdentityChanged);
+    }
+    Ok((selection.interface_index, selection.gateway))
+}
+
 fn validate_destination(destination: Ipv4Addr) -> Result<(), PhysicalPathError> {
     if !is_private_hotspot_ipv4(destination) {
         return Err(PhysicalPathError::InvalidDestination(
@@ -1330,9 +1387,28 @@ fn network_v4(address: Ipv4Addr, length: u8) -> Ipv4Addr {
 mod win32;
 
 #[cfg(windows)]
+pub(crate) use win32::default_physical_route;
+#[cfg(windows)]
 pub use win32::observe;
 #[cfg(windows)]
 pub(crate) use win32::observe_token_destination;
+
+/// Run the Windows token gate for one source device destination with no owned
+/// run.
+///
+/// This is the read-only gate that the presence probe and manual check use
+/// while no tunnel runs: the unscoped default route must be the physical
+/// hotspot route, the pinned interface must be a physical Ethernet or Wi-Fi
+/// adapter, and the destination must equal its default gateway. It changes no
+/// route, opens no socket, and sends no packet. See `prove_token_destination`
+/// for the exact rules.
+#[cfg(windows)]
+pub fn observe_token_destination_idle(
+    destination: Ipv4Addr,
+    pinned_index: u32,
+) -> Result<PhysicalPathProof, PhysicalPathError> {
+    observe_token_destination(destination, pinned_index, None)
+}
 
 #[cfg(test)]
 mod tests {
@@ -1494,6 +1570,81 @@ mod tests {
         observation.adapter_after.interface_type = IF_TYPE_ETHERNET_CSMACD;
         let proof = verify(&observation).unwrap();
         assert_eq!(proof.kind(), PhysicalAdapterKind::Ethernet);
+    }
+
+    #[test]
+    fn default_physical_route_accepts_agreeing_physical_probes() {
+        let (index, gateway) = default_physical_route_from(
+            &gateway_observation(GATEWAY, INDEX, LUID),
+            &default_adapter(),
+        )
+        .unwrap();
+        assert_eq!(index, INDEX);
+        assert_eq!(gateway, GATEWAY);
+    }
+
+    #[test]
+    fn default_physical_route_refuses_disagreeing_probes() {
+        let mut gateway = gateway_observation(GATEWAY, INDEX, LUID);
+        gateway.probes[1].route.next_hop = IpAddr::V4(Ipv4Addr::new(172, 20, 10, 254));
+        assert!(matches!(
+            default_physical_route_from(&gateway, &default_adapter()).unwrap_err(),
+            PhysicalPathError::GatewayUnusable(_)
+        ));
+    }
+
+    #[test]
+    fn default_physical_route_refuses_a_zero_or_on_link_gateway() {
+        let gateway = GatewayObservation {
+            probes: [
+                gateway_probe(GATEWAY_PROBES[0], Ipv4Addr::UNSPECIFIED, INDEX, LUID),
+                gateway_probe(GATEWAY_PROBES[1], Ipv4Addr::UNSPECIFIED, INDEX, LUID),
+            ],
+        };
+        assert_eq!(
+            default_physical_route_from(&gateway, &default_adapter()).unwrap_err(),
+            PhysicalPathError::GatewayUnusable(
+                "the selected default route has no private or shared unicast gateway"
+            )
+        );
+    }
+
+    #[test]
+    fn default_physical_route_refuses_a_non_physical_adapter() {
+        let adapter = adapter(
+            identity(INDEX, LUID, guid(1)),
+            24, // IF_TYPE_SOFTWARE_LOOPBACK
+            LOCAL,
+            PREFIX_LENGTH,
+        );
+        assert!(matches!(
+            default_physical_route_from(&gateway_observation(GATEWAY, INDEX, LUID), &adapter)
+                .unwrap_err(),
+            PhysicalPathError::AdapterNotPhysical(_)
+        ));
+    }
+
+    #[test]
+    fn default_physical_route_refuses_a_tunnel_adapter() {
+        let mut adapter = default_adapter();
+        adapter.tunnel_type = 2;
+        assert!(matches!(
+            default_physical_route_from(&gateway_observation(GATEWAY, INDEX, LUID), &adapter)
+                .unwrap_err(),
+            PhysicalPathError::AdapterNotPhysical(_)
+        ));
+    }
+
+    #[test]
+    fn default_physical_route_refuses_a_gateway_on_another_adapter() {
+        assert_eq!(
+            default_physical_route_from(
+                &gateway_observation(GATEWAY, INDEX + 1, LUID),
+                &default_adapter(),
+            )
+            .unwrap_err(),
+            PhysicalPathError::AdapterIdentityChanged
+        );
     }
 
     #[test]
@@ -2259,6 +2410,74 @@ mod tests {
             "the physical route evidence was refused"
         );
         assert_eq!(format!("{unknown:?}"), "RouteVerify(<redacted>)");
+    }
+
+    #[test]
+    fn presence_reason_is_a_fixed_vocabulary_without_addresses() {
+        let route_error = RouteVerifyError::UnexpectedNextHop {
+            prefix: prefix(Ipv4Addr::new(172, 20, 10, 0), 28),
+            next_hop: IpAddr::V4(Ipv4Addr::new(172, 20, 9, 254)),
+        };
+        let cases: Vec<(PhysicalPathError, String)> = vec![
+            (
+                PhysicalPathError::InvalidDestination(
+                    "the destination must be a private or shared IPv4 unicast address",
+                ),
+                "InvalidDestination: the destination must be a private or shared IPv4 unicast address"
+                    .to_string(),
+            ),
+            (
+                PhysicalPathError::InvalidObservation("the on-link prefix length is above 32"),
+                "InvalidObservation: the on-link prefix length is above 32".to_string(),
+            ),
+            (
+                PhysicalPathError::GatewayUnusable(
+                    "the two default route probes selected different routes",
+                ),
+                "GatewayUnusable: the two default route probes selected different routes".to_string(),
+            ),
+            (PhysicalPathError::DestinationMismatch, "DestinationMismatch".to_string()),
+            (
+                PhysicalPathError::AdapterNotPhysical("the filter interface flag is set"),
+                "AdapterNotPhysical: the filter interface flag is set".to_string(),
+            ),
+            (PhysicalPathError::AdapterIdentityChanged, "AdapterIdentityChanged".to_string()),
+            (
+                PhysicalPathError::AdapterAddressUnusable(
+                    "the adapter must report exactly one usable IPv4 address",
+                ),
+                "AdapterAddressUnusable: the adapter must report exactly one usable IPv4 address"
+                    .to_string(),
+            ),
+            (
+                PhysicalPathError::GatewayNotOnAdapterSubnet,
+                "GatewayNotOnAdapterSubnet".to_string(),
+            ),
+            (
+                PhysicalPathError::DestinationRouteUnusable(
+                    "the destination route uses a next hop instead of the adapter link",
+                ),
+                "DestinationRouteUnusable: the destination route uses a next hop instead of the adapter link"
+                    .to_string(),
+            ),
+            (
+                PhysicalPathError::RouteVerify(route_error),
+                "RouteVerify: UnexpectedNextHop".to_string(),
+            ),
+            (
+                PhysicalPathError::Api {
+                    operation: "GetBestRoute2",
+                    code: 5,
+                },
+                "Api: 5".to_string(),
+            ),
+        ];
+        for (error, expected) in cases {
+            let text = error.presence_reason();
+            assert_eq!(text, expected);
+            assert!(!text.contains("172.20.10.0"), "{text}");
+            assert!(!text.contains("172.20.9.254"), "{text}");
+        }
     }
 
     #[test]

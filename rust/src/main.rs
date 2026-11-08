@@ -4,6 +4,7 @@ use hotspotshade::gui_backend_windows::WindowsGuiBackend;
 use hotspotshade::{
     autostop,
     normalization::{self, Audit},
+    pairing,
     phone::PhoneProxy,
     service::{Ipv6Policy, Service, TunOptions},
 };
@@ -329,6 +330,41 @@ fn probe() -> io::Result<()> {
     let sock = normalization::udp_socket(IpAddr::V4(Ipv4Addr::LOCALHOST), None, &audit)?;
     println!("UDP TTL: {}", sock.ttl()?);
     println!("TTL audit failures: {}", audit.snapshot().1);
+    // Presence discovery, read-only. The gateway address is printed because
+    // the owner runs this locally; diagnostics never print it.
+    match hotspotshade::windows_route_verify::default_ipv4_gateway() {
+        Err(error) => println!(
+            "hotspot gateway: failed: gateway: {}",
+            error.presence_kind()
+        ),
+        Ok((gateway, gateway_index)) => {
+            if !gateway.is_private() {
+                println!("hotspot gateway: failed: gateway: not_private");
+            } else {
+                match normalization::interface_name(gateway_index) {
+                    Err(_) => {
+                        println!("hotspot gateway: failed: gateway: interface_name_unavailable")
+                    }
+                    Ok(name) if name.starts_with("HotspotShade-Tunnel") => {
+                        println!("hotspot gateway: failed: gateway: tunnel_interface")
+                    }
+                    Ok(_) => {
+                        println!("hotspot gateway: ok ({gateway})");
+                        match hotspotshade::windows_physical_path::observe_token_destination_idle(
+                            gateway,
+                            gateway_index,
+                        ) {
+                            Ok(_) => println!("token gate (pairing port): ok"),
+                            Err(error) => println!(
+                                "token gate (pairing port): failed: token_gate: {}",
+                                error.presence_reason()
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    }
     println!("Wintun and route changes require Administrator rights.");
     Ok(())
 }
@@ -1669,6 +1705,23 @@ fn run() -> Result<(), String> {
         }
         #[cfg(any(unix, windows))]
         Some("probe") => { validate_options(&args[1..],&[],&[])?; probe().map_err(|e|e.to_string()) },
+        Some("identity-check") => {
+            validate_options(&args[1..], &[], &[])?;
+            match pairing::local_identity() {
+                Ok(identity) => {
+                    println!("identity: ok");
+                    println!("fingerprint: {}", pairing::hex(&identity.public()));
+                    Ok(())
+                }
+                Err(_) => {
+                    println!("identity: failed");
+                    if let Some(detail) = pairing::last_identity_failure() {
+                        println!("{detail}");
+                    }
+                    Err("the identity key cannot be used".into())
+                }
+            }
+        }
         Some("gui") => {
             set_startup_stage(StartupStage::Arguments);
             validate_options(&args[1..],&["--port","--port-file","--token-fd","--parent-fd","--wintun","--grant-file","--handoff-fd","--credentials-fd"],&["--demo","--no-open","--experimental-icmp","--experimental-icmp-persistent"])?;
@@ -2350,7 +2403,7 @@ fn run() -> Result<(), String> {
         Some("--privileged-helper" | "socks5" | "phone" | "phone-udp-diag" | "phone-speed-diag") => {
             Err(hotspotshade::WINDOWS_NOT_IMPLEMENTED.into())
         }
-        _ => Err("Usage: hotspotshade --version | probe | gui [--port N] [--port-file PATH] [--token-fd N] [--parent-fd N] [--wintun PATH] [--grant-file PATH] [--handoff-fd N] [--credentials-fd N] [--experimental-icmp] [--experimental-icmp-persistent] | socks5 [--port N] [--iface NAME] [--dns-servers IP[:PORT][,IP[:PORT]...]] | phone --phone IPv4:PORT [--listen 127.0.0.1:PORT] [--iface NAME] [--secrets-fd N] [--check] | phone-udp-diag --phone 172.20.10.1:PORT --iface NAME --target IP:PORT [--rate N] [--seconds N] [--burst N] [--pad N] [--wait N] [--drop-percent N] [--secrets-fd N] [--own-responder] [--json] | phone-speed-diag --phone IPv4:PORT --iface NAME --host NAME|IP [--address IP] [--port N] [--download-path /P] [--upload-path /P] [--probe-path /P] [--paths phone|direct|phone,direct|direct,phone] [--streams N] [--seconds N] [--idle-seconds N] [--warmup N] [--probe-interval-ms N] [--repeat N] [--max-mb N] [--udp-target IP:PORT] [--secrets-fd N] [--json] | udp-responder --listen IP:PORT [--seconds N] [--max-pps N] [--peer IP] [--json] | tun [--iface NAME] [--unit N] [--addr IPv4] [--wintun PATH] [--dns-upstream IPv4[:PORT]] [--ipv6 block|forward|inherit] [--no-pin] [--no-routes] [--phone IP:PORT] [--secrets-fd N] [--experimental-icmp] [--experimental-icmp-persistent] [--workers N]".into()),
+        _ => Err("Usage: hotspotshade --version | identity-check | probe | gui [--port N] [--port-file PATH] [--token-fd N] [--parent-fd N] [--wintun PATH] [--grant-file PATH] [--handoff-fd N] [--credentials-fd N] [--experimental-icmp] [--experimental-icmp-persistent] | socks5 [--port N] [--iface NAME] [--dns-servers IP[:PORT][,IP[:PORT]...]] | phone --phone IPv4:PORT [--listen 127.0.0.1:PORT] [--iface NAME] [--secrets-fd N] [--check] | phone-udp-diag --phone 172.20.10.1:PORT --iface NAME --target IP:PORT [--rate N] [--seconds N] [--burst N] [--pad N] [--wait N] [--drop-percent N] [--secrets-fd N] [--own-responder] [--json] | phone-speed-diag --phone IPv4:PORT --iface NAME --host NAME|IP [--address IP] [--port N] [--download-path /P] [--upload-path /P] [--probe-path /P] [--paths phone|direct|phone,direct|direct,phone] [--streams N] [--seconds N] [--idle-seconds N] [--warmup N] [--probe-interval-ms N] [--repeat N] [--max-mb N] [--udp-target IP:PORT] [--secrets-fd N] [--json] | udp-responder --listen IP:PORT [--seconds N] [--max-pps N] [--peer IP] [--json] | tun [--iface NAME] [--unit N] [--addr IPv4] [--wintun PATH] [--dns-upstream IPv4[:PORT]] [--ipv6 block|forward|inherit] [--no-pin] [--no-routes] [--phone IP:PORT] [--secrets-fd N] [--experimental-icmp] [--experimental-icmp-persistent] [--workers N]".into()),
     }
 }
 /// The engine exit status for one completed run.

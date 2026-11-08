@@ -1390,6 +1390,45 @@ impl fmt::Display for RouteVerifyError {
 
 impl std::error::Error for RouteVerifyError {}
 
+impl RouteVerifyError {
+    /// A fixed-vocabulary word for a presence failure in diagnostics.
+    ///
+    /// The word is the variant name, and for a variant that carries a Windows
+    /// error code it is the variant name plus that code. It never holds an
+    /// address, prefix, next hop, index, LUID, or GUID, so a diagnostics or
+    /// probe line built from it cannot leak the hotspot network. Do not put
+    /// this word in user-facing status text.
+    pub fn presence_kind(&self) -> String {
+        match self {
+            Self::InvalidTunnelIdentity(_) => "InvalidTunnelIdentity".to_string(),
+            Self::InvalidPolicy(_) => "InvalidPolicy".to_string(),
+            Self::InvalidObservation(_) => "InvalidObservation".to_string(),
+            Self::MissingRoute { .. } => "MissingRoute".to_string(),
+            Self::ForeignRoute { .. } => "ForeignRoute".to_string(),
+            Self::IndexReused { .. } => "IndexReused".to_string(),
+            Self::CompetingRoute { .. } => "CompetingRoute".to_string(),
+            Self::MoreSpecificRoute { .. } => "MoreSpecificRoute".to_string(),
+            Self::DuplicateTunnelRoute { .. } => "DuplicateTunnelRoute".to_string(),
+            Self::UnexpectedNextHop { .. } => "UnexpectedNextHop".to_string(),
+            Self::LoopbackRoute { .. } => "LoopbackRoute".to_string(),
+            Self::BestInterfaceMismatch { .. } => "BestInterfaceMismatch".to_string(),
+            Self::BestRouteMismatch { .. } => "BestRouteMismatch".to_string(),
+            Self::BestRouteIdentityMismatch { .. } => "BestRouteIdentityMismatch".to_string(),
+            Self::MissingBestRoute { .. } => "MissingBestRoute".to_string(),
+            Self::RetainedIdentityMismatch { .. } => "RetainedIdentityMismatch".to_string(),
+            Self::AdapterIdentityChanged { .. } => "AdapterIdentityChanged".to_string(),
+            Self::InterfaceIndexChanged { .. } => "InterfaceIndexChanged".to_string(),
+            Self::Ipv6StackAbsent => "Ipv6StackAbsent".to_string(),
+            Self::Ipv6StackUnknown => "Ipv6StackUnknown".to_string(),
+            Self::Ipv6ProbeInconclusive { code, .. } => {
+                format!("Ipv6ProbeInconclusive({code})")
+            }
+            Self::Ipv6InheritNotVerifiable => "Ipv6InheritNotVerifiable".to_string(),
+            Self::Api { code, .. } => format!("Api({code})"),
+        }
+    }
+}
+
 fn valid_interface_index(index: u32) -> bool {
     index != 0 && index <= MAX_INTERFACE_INDEX
 }
@@ -3018,6 +3057,51 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.to_string(), TOKEN_DESTINATION_REFUSED);
         assert!(!error.to_string().contains("172.20"));
+    }
+
+    #[test]
+    fn presence_kind_names_the_variant_and_never_an_address() {
+        let prefix = RoutePrefix::new(IpAddr::V4(Ipv4Addr::new(172, 20, 10, 0)), 28).unwrap();
+        let next_hop = IpAddr::V4(Ipv4Addr::new(172, 20, 9, 254));
+        let cases: Vec<(RouteVerifyError, String)> = vec![
+            (
+                RouteVerifyError::MissingRoute { prefix },
+                "MissingRoute".to_string(),
+            ),
+            (
+                RouteVerifyError::UnexpectedNextHop { prefix, next_hop },
+                "UnexpectedNextHop".to_string(),
+            ),
+            (
+                RouteVerifyError::InvalidObservation("the default route is a loopback route"),
+                "InvalidObservation".to_string(),
+            ),
+            (
+                RouteVerifyError::Api {
+                    operation: "GetBestRoute2",
+                    code: 5,
+                },
+                "Api(5)".to_string(),
+            ),
+            (
+                RouteVerifyError::Ipv6ProbeInconclusive {
+                    destination: IpAddr::V6("2001:db8::1".parse().unwrap()),
+                    code: 123,
+                },
+                "Ipv6ProbeInconclusive(123)".to_string(),
+            ),
+            (
+                RouteVerifyError::Ipv6StackAbsent,
+                "Ipv6StackAbsent".to_string(),
+            ),
+        ];
+        for (error, expected) in cases {
+            let text = error.presence_kind();
+            assert_eq!(text, expected);
+            assert!(!text.contains("172.20.10.0"), "{text}");
+            assert!(!text.contains("172.20.9.254"), "{text}");
+            assert!(!text.contains("2001:db8"), "{text}");
+        }
     }
 
     const INDEX: u32 = 7;

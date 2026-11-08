@@ -419,6 +419,259 @@ pub fn local_identity() -> Result<Identity, PairError> {
     Identity::load_or_create(&Identity::default_path()?)
 }
 
+/// The packed identity-store failure diagnostic.
+///
+/// The Windows loader records only a fixed step word, a component index, and a
+/// Win32 error number. It never records a path, a SID, or key material. The
+/// step words, the packing, and the formatting are host-independent, so the
+/// unit tests below run on every platform. The Windows loader is the only
+/// writer; other platforms always read `None`.
+#[cfg(any(windows, test))]
+mod identity_failure {
+    /// One step of the identity-store loader.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Step {
+        ValidatePath = 1,
+        RejectImpersonation = 2,
+        Parent = 3,
+        CurrentUserSid = 4,
+        DirectoryChain = 5,
+        AncestorOpen = 6,
+        DirectoryCreate = 7,
+        DirectoryObject = 8,
+        VolumeAcls = 9,
+        AncestorValidate = 10,
+        DirectoryValidate = 11,
+        OpenFile = 12,
+        FileValidate = 13,
+        ReadFile = 14,
+        Unprotect = 15,
+        SecurityDescriptor = 16,
+        Protect = 17,
+        CreateTemp = 18,
+        TempValidate = 19,
+        WriteFile = 20,
+        Flush = 21,
+        Rename = 22,
+        WidePath = 23,
+        Sid = 24,
+        RemovalAce = 25,
+        RemovalAces = 26,
+        AncestorSecurity = 27,
+        OwnerDacl = 28,
+        FileInformation = 29,
+        DpapiBlob = 30,
+        DefaultPath = 31,
+        DeleteFile = 32,
+    }
+
+    impl Step {
+        /// The fixed word for this step. It never becomes free text.
+        pub(super) fn word(self) -> &'static str {
+            match self {
+                Self::ValidatePath => "validate_path",
+                Self::RejectImpersonation => "reject_impersonation",
+                Self::Parent => "parent",
+                Self::CurrentUserSid => "current_user_sid",
+                Self::DirectoryChain => "directory_chain",
+                Self::AncestorOpen => "ancestor_open",
+                Self::DirectoryCreate => "directory_create",
+                Self::DirectoryObject => "directory_object",
+                Self::VolumeAcls => "volume_acls",
+                Self::AncestorValidate => "ancestor_validate",
+                Self::DirectoryValidate => "directory_validate",
+                Self::OpenFile => "open_file",
+                Self::FileValidate => "file_validate",
+                Self::ReadFile => "read_file",
+                Self::Unprotect => "unprotect",
+                Self::SecurityDescriptor => "security_descriptor",
+                Self::Protect => "protect",
+                Self::CreateTemp => "create_temp",
+                Self::TempValidate => "temp_validate",
+                Self::WriteFile => "write_file",
+                Self::Flush => "flush",
+                Self::Rename => "rename",
+                Self::WidePath => "wide_path",
+                Self::Sid => "sid",
+                Self::RemovalAce => "removal_ace",
+                Self::RemovalAces => "removal_aces",
+                Self::AncestorSecurity => "ancestor_security",
+                Self::OwnerDacl => "owner_dacl",
+                Self::FileInformation => "file_information",
+                Self::DpapiBlob => "dpapi_blob",
+                Self::DefaultPath => "default_path",
+                Self::DeleteFile => "delete_file",
+            }
+        }
+
+        /// Recover a step from its packed id.
+        pub(super) fn from_id(id: u16) -> Option<Self> {
+            Some(match id {
+                1 => Self::ValidatePath,
+                2 => Self::RejectImpersonation,
+                3 => Self::Parent,
+                4 => Self::CurrentUserSid,
+                5 => Self::DirectoryChain,
+                6 => Self::AncestorOpen,
+                7 => Self::DirectoryCreate,
+                8 => Self::DirectoryObject,
+                9 => Self::VolumeAcls,
+                10 => Self::AncestorValidate,
+                11 => Self::DirectoryValidate,
+                12 => Self::OpenFile,
+                13 => Self::FileValidate,
+                14 => Self::ReadFile,
+                15 => Self::Unprotect,
+                16 => Self::SecurityDescriptor,
+                17 => Self::Protect,
+                18 => Self::CreateTemp,
+                19 => Self::TempValidate,
+                20 => Self::WriteFile,
+                21 => Self::Flush,
+                22 => Self::Rename,
+                23 => Self::WidePath,
+                24 => Self::Sid,
+                25 => Self::RemovalAce,
+                26 => Self::RemovalAces,
+                27 => Self::AncestorSecurity,
+                28 => Self::OwnerDacl,
+                29 => Self::FileInformation,
+                30 => Self::DpapiBlob,
+                31 => Self::DefaultPath,
+                32 => Self::DeleteFile,
+                _ => return None,
+            })
+        }
+    }
+
+    /// Bits 0..32 hold the Win32 error, 32..48 the component index, 48..64 the
+    /// step id. Step ids start at 1, so a packed value of 0 is the "no failure"
+    /// sentinel.
+    pub(super) fn pack(step: Step, index: u64, win32: u32) -> u64 {
+        (u64::from(step as u16) << 48) | (index.min(u16::MAX as u64) << 32) | u64::from(win32)
+    }
+
+    /// The formatted diagnostic, or `None` for the no-failure sentinel.
+    pub(super) fn format(packed: u64) -> Option<String> {
+        if packed == 0 {
+            return None;
+        }
+        let step = Step::from_id(((packed >> 48) & 0xffff) as u16)?;
+        let index = (packed >> 32) & 0xffff;
+        let win32 = (packed & 0xffff_ffff) as u32;
+        Some(format!(
+            "step={} component={} win32={}",
+            step.word(),
+            index,
+            win32
+        ))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::HashSet;
+
+        #[test]
+        fn packing_round_trips_step_index_and_error() {
+            for (step, index, win32) in [
+                (Step::AncestorOpen, 3, 32u32),
+                (Step::ValidatePath, 0, 0),
+                (Step::DirectoryCreate, 4, 183),
+                (Step::OpenFile, 0, 2),
+                (Step::Rename, 0, 80),
+            ] {
+                let packed = pack(step, index, win32);
+                let expected = format!("step={} component={} win32={}", step.word(), index, win32);
+                assert_eq!(format(packed), Some(expected));
+            }
+        }
+
+        #[test]
+        fn every_step_has_a_unique_id_and_word() {
+            let steps = [
+                Step::ValidatePath,
+                Step::RejectImpersonation,
+                Step::Parent,
+                Step::CurrentUserSid,
+                Step::DirectoryChain,
+                Step::AncestorOpen,
+                Step::DirectoryCreate,
+                Step::DirectoryObject,
+                Step::VolumeAcls,
+                Step::AncestorValidate,
+                Step::DirectoryValidate,
+                Step::OpenFile,
+                Step::FileValidate,
+                Step::ReadFile,
+                Step::Unprotect,
+                Step::SecurityDescriptor,
+                Step::Protect,
+                Step::CreateTemp,
+                Step::TempValidate,
+                Step::WriteFile,
+                Step::Flush,
+                Step::Rename,
+                Step::WidePath,
+                Step::Sid,
+                Step::RemovalAce,
+                Step::RemovalAces,
+                Step::AncestorSecurity,
+                Step::OwnerDacl,
+                Step::FileInformation,
+                Step::DpapiBlob,
+                Step::DefaultPath,
+                Step::DeleteFile,
+            ];
+            let mut ids = HashSet::new();
+            let mut words = HashSet::new();
+            for step in steps {
+                let id = step as u16;
+                assert!(id != 0, "{step:?} must not use the zero sentinel");
+                assert!(ids.insert(id), "duplicate id {id}");
+                assert_eq!(Step::from_id(id), Some(step), "{step:?}");
+                assert!(
+                    words.insert(step.word()),
+                    "duplicate word {:?}",
+                    step.word()
+                );
+                assert!(!step.word().is_empty());
+                assert!(!step.word().contains(' '));
+            }
+        }
+
+        #[test]
+        fn zero_is_the_no_failure_sentinel() {
+            assert_eq!(format(0), None);
+        }
+
+        #[test]
+        fn a_component_index_is_capped_at_u16_max() {
+            let packed = pack(Step::AncestorOpen, u64::MAX, 32);
+            assert_eq!(
+                format(packed).as_deref(),
+                Some(format!("step=ancestor_open component={} win32=32", u16::MAX).as_str())
+            );
+        }
+    }
+}
+
+/// The first failing step of the most recent identity load, for diagnostics.
+///
+/// The string holds only a fixed step word, a component index, and a Win32
+/// error number, for example `"step=ancestor_open component=3 win32=32"`. It
+/// never holds a path, a SID, or key material. On non-Windows platforms this
+/// always returns `None`.
+#[cfg(windows)]
+pub fn last_identity_failure() -> Option<String> {
+    windows_identity::last_identity_failure()
+}
+
+#[cfg(not(windows))]
+pub fn last_identity_failure() -> Option<String> {
+    None
+}
+
 /// The Windows identity store.
 ///
 /// The secret key is protected with per-user DPAPI. The file holds a DPAPI
@@ -481,6 +734,7 @@ pub fn local_identity() -> Result<Identity, PairError> {
 /// that user.
 #[cfg(windows)]
 mod windows_identity {
+    use super::identity_failure::{self, Step as IdentityStep};
     use super::{hex, random_bytes, Identity, PairError};
     use std::ffi::{c_void, OsStr, OsString};
     use std::mem;
@@ -488,6 +742,7 @@ mod windows_identity {
     use std::path::{Component, Path, PathBuf, Prefix};
     use std::ptr;
     use std::slice;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use std::time::Duration;
 
@@ -909,11 +1164,11 @@ mod windows_identity {
 
         fn bytes(&self) -> Result<&[u8], PairError> {
             if self.0.pb_data.is_null() || self.0.cb_data == 0 {
-                return Err(PairError::Identity);
+                return Err(fail(IdentityStep::DpapiBlob, 0));
             }
             let length = self.0.cb_data as usize;
             if length > MAX_DPAPI_OUTPUT {
-                return Err(PairError::Identity);
+                return Err(fail(IdentityStep::DpapiBlob, 0));
             }
             Ok(unsafe { slice::from_raw_parts(self.0.pb_data, length) })
         }
@@ -965,6 +1220,32 @@ mod windows_identity {
         unsafe { GetLastError() }
     }
 
+    /// The first failing step of the most recent load, packed. Zero is the
+    /// no-failure sentinel.
+    static LAST_IDENTITY_FAILURE: AtomicU64 = AtomicU64::new(0);
+
+    /// Clear the record at the start of one load. The load then records only
+    /// its own first failure.
+    fn reset_identity_failure() {
+        LAST_IDENTITY_FAILURE.store(0, Ordering::Release);
+    }
+
+    /// Record the first failure of the current load and return
+    /// [`PairError::Identity`]. The value packs a fixed step word, a component
+    /// index, and the current Win32 error. A later failure in the same load
+    /// cannot overwrite the first one.
+    fn fail(step: IdentityStep, index: u64) -> PairError {
+        let packed = identity_failure::pack(step, index, last_error());
+        let _ =
+            LAST_IDENTITY_FAILURE.compare_exchange(0, packed, Ordering::Relaxed, Ordering::Relaxed);
+        PairError::Identity
+    }
+
+    /// The formatted first failure of the most recent load, or `None`.
+    pub(super) fn last_identity_failure() -> Option<String> {
+        identity_failure::format(LAST_IDENTITY_FAILURE.load(Ordering::Acquire))
+    }
+
     fn wide_string(value: &str) -> Vec<u16> {
         OsStr::new(value)
             .encode_wide()
@@ -975,11 +1256,11 @@ mod windows_identity {
     /// Add the `\\?\` prefix so the Win32 calls accept long paths.
     fn wide_path(path: &Path) -> Result<Vec<u16>, PairError> {
         if !path.is_absolute() {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::WidePath, 0));
         }
         let raw: Vec<u16> = path.as_os_str().encode_wide().collect();
         if raw.is_empty() || raw.contains(&0) {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::WidePath, 0));
         }
         const BACKSLASH: u16 = 0x5C;
         const DOT: u16 = 0x2E;
@@ -1000,13 +1281,13 @@ mod windows_identity {
         } else {
             // A drive-absolute path has the form `C:\`.
             if raw.len() < 3 || raw[1] != 0x3A || raw[2] != BACKSLASH {
-                return Err(PairError::Identity);
+                return Err(fail(IdentityStep::WidePath, 0));
             }
             out.extend_from_slice(&verbatim);
             out.extend_from_slice(&raw);
         }
         if out.len() >= 32767 {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::WidePath, 0));
         }
         out.push(0);
         Ok(out)
@@ -1059,22 +1340,22 @@ mod windows_identity {
     /// value before any other Win32 call reads the SID.
     fn sid_length_bounded(sid: Psid, max_bytes: u32) -> Result<u32, PairError> {
         if sid.is_null() || max_bytes < MIN_SID_BYTES {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::Sid, 0));
         }
         let header = unsafe { slice::from_raw_parts(sid as *const u8, MIN_SID_BYTES as usize) };
         if header[0] != SID_REVISION {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::Sid, 0));
         }
         let count = u32::from(header[1]);
         if count == 0 || count > MAX_SID_SUB_AUTHORITIES {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::Sid, 0));
         }
         let length = MIN_SID_BYTES + count * 4;
         if length > MAX_SID_BYTES || length > max_bytes {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::Sid, 0));
         }
         if unsafe { IsValidSid(sid) } == 0 || unsafe { GetLengthSid(sid) } != length {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::Sid, 0));
         }
         Ok(length)
     }
@@ -1089,14 +1370,14 @@ mod windows_identity {
                     LocalFree(pointer.cast());
                 }
             }
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::Sid, 0));
         }
         let text = wide_ptr_to_string(pointer);
         unsafe {
             LocalFree(pointer.cast());
         }
         if !valid_sid_text(&text) {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::Sid, 0));
         }
         Ok(text)
     }
@@ -1107,7 +1388,7 @@ mod windows_identity {
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0
             || token.is_null()
         {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::CurrentUserSid, 0));
         }
         let token = HandleGuard(token);
         let mut needed = 0u32;
@@ -1116,7 +1397,7 @@ mod windows_identity {
             GetTokenInformation(token.0, TOKEN_USER, ptr::null_mut(), 0, &mut needed);
         }
         if needed < mem::size_of::<TokenUser>() as u32 || needed > MAX_TOKEN_USER_BYTES {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::CurrentUserSid, 0));
         }
         // A u64 buffer is aligned for the pointer and DWORD fields.
         let words = (needed as usize).div_ceil(8);
@@ -1132,7 +1413,7 @@ mod windows_identity {
         } == 0
             || needed > (words * 8) as u32
         {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::CurrentUserSid, 0));
         }
         let user = unsafe { &*(buffer.as_ptr() as *const TokenUser) };
         sid_to_string(user.user.sid, MAX_SID_BYTES)
@@ -1150,7 +1431,7 @@ mod windows_identity {
             if !token.is_null() {
                 drop(HandleGuard(token));
             }
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::RejectImpersonation, 0));
         }
         if !token.is_null() {
             drop(HandleGuard(token));
@@ -1158,7 +1439,7 @@ mod windows_identity {
         if error == ERROR_NO_TOKEN {
             Ok(())
         } else {
-            Err(PairError::Identity)
+            Err(fail(IdentityStep::RejectImpersonation, 0))
         }
     }
 
@@ -1178,6 +1459,7 @@ mod windows_identity {
         ace_type: u8,
         ace: *const c_void,
         length: usize,
+        index: u64,
     ) -> Result<usize, PairError> {
         const OBJECT_TYPE_PRESENT: u32 = 0x1;
         const INHERITED_OBJECT_TYPE_PRESENT: u32 = 0x2;
@@ -1186,12 +1468,12 @@ mod windows_identity {
             ACCESS_ALLOWED_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_ACE_TYPE => Ok(mask_end),
             ACCESS_ALLOWED_OBJECT_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE => {
                 if length < mask_end + 4 {
-                    return Err(PairError::Identity);
+                    return Err(fail(IdentityStep::RemovalAce, index));
                 }
                 let flags =
                     unsafe { ptr::read_unaligned((ace as *const u8).add(mask_end) as *const u32) };
                 if flags & !(OBJECT_TYPE_PRESENT | INHERITED_OBJECT_TYPE_PRESENT) != 0 {
-                    return Err(PairError::Identity);
+                    return Err(fail(IdentityStep::RemovalAce, index));
                 }
                 let mut offset = mask_end + 4;
                 if flags & OBJECT_TYPE_PRESENT != 0 {
@@ -1201,11 +1483,11 @@ mod windows_identity {
                     offset += 16;
                 }
                 if offset >= length {
-                    return Err(PairError::Identity);
+                    return Err(fail(IdentityStep::RemovalAce, index));
                 }
                 Ok(offset)
             }
-            _ => Err(PairError::Identity),
+            _ => Err(fail(IdentityStep::RemovalAce, index)),
         }
     }
 
@@ -1219,23 +1501,26 @@ mod windows_identity {
         acl_bytes: usize,
         user: &str,
         hazard: u32,
+        index: u64,
     ) -> Result<(), PairError> {
         let offset = (ace as usize)
             .checked_sub(dacl as usize)
-            .ok_or(PairError::Identity)?;
+            .ok_or_else(|| fail(IdentityStep::RemovalAce, index))?;
         if offset < ACL_HEADER_BYTES {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::RemovalAce, index));
         }
         let bytes = ace as *const u8;
         let header = unsafe { ptr::read_unaligned(bytes as *const AceHeader) };
         let length = usize::from(header.ace_size);
-        let end = offset.checked_add(length).ok_or(PairError::Identity)?;
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| fail(IdentityStep::RemovalAce, index))?;
         if length < mem::size_of::<AceHeader>()
             || length % 4 != 0
             || offset % 4 != 0
             || end > acl_bytes
         {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::RemovalAce, index));
         }
         if header.ace_flags & INHERIT_ONLY_ACE != 0 {
             return Ok(());
@@ -1260,13 +1545,13 @@ mod windows_identity {
             SYSTEM_RESOURCE_ATTRIBUTE_ACE_TYPE
             | SYSTEM_SCOPED_POLICY_ID_ACE_TYPE
             | SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE
-            | SYSTEM_ACCESS_FILTER_ACE_TYPE => Err(PairError::Identity),
+            | SYSTEM_ACCESS_FILTER_ACE_TYPE => Err(fail(IdentityStep::RemovalAce, index)),
             ACCESS_ALLOWED_ACE_TYPE
             | ACCESS_ALLOWED_OBJECT_ACE_TYPE
             | ACCESS_ALLOWED_CALLBACK_ACE_TYPE
             | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE => {
                 if length < mem::size_of::<AceHeader>() + 4 {
-                    return Err(PairError::Identity);
+                    return Err(fail(IdentityStep::RemovalAce, index));
                 }
                 let mask = unsafe {
                     ptr::read_unaligned(bytes.add(mem::size_of::<AceHeader>()) as *const u32)
@@ -1274,23 +1559,28 @@ mod windows_identity {
                 if mask & hazard == 0 {
                     return Ok(());
                 }
-                let sid_offset = allowed_ace_sid_offset(header.ace_type, ace, length)?;
+                let sid_offset = allowed_ace_sid_offset(header.ace_type, ace, length, index)?;
                 let sid = unsafe { bytes.add(sid_offset) as Psid };
                 let sid_bytes = (length - sid_offset) as u32;
                 let text = sid_to_string(sid, sid_bytes)?;
                 if trusted_principal(&text, user) {
                     Ok(())
                 } else {
-                    Err(PairError::Identity)
+                    Err(fail(IdentityStep::RemovalAce, index))
                 }
             }
             // A compound ACE is obsolete and an unknown type is unprovable.
-            ACCESS_ALLOWED_COMPOUND_ACE_TYPE => Err(PairError::Identity),
-            _ => Err(PairError::Identity),
+            ACCESS_ALLOWED_COMPOUND_ACE_TYPE => Err(fail(IdentityStep::RemovalAce, index)),
+            _ => Err(fail(IdentityStep::RemovalAce, index)),
         }
     }
 
-    fn check_removal_aces(dacl: Pacl, user: &str, hazard: u32) -> Result<(), PairError> {
+    fn check_removal_aces(
+        dacl: Pacl,
+        user: &str,
+        hazard: u32,
+        index: u64,
+    ) -> Result<(), PairError> {
         let mut size: AclSizeInformation = unsafe { mem::zeroed() };
         if unsafe {
             GetAclInformation(
@@ -1301,21 +1591,21 @@ mod windows_identity {
             )
         } == 0
         {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::RemovalAces, index));
         }
         if size.ace_count > MAX_ACL_ACES
             || size.acl_bytes_in_use < ACL_HEADER_BYTES as u32
             || size.acl_bytes_in_use > MAX_ACL_BYTES
         {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::RemovalAces, index));
         }
         let acl_bytes = size.acl_bytes_in_use as usize;
-        for index in 0..size.ace_count {
+        for ace_index in 0..size.ace_count {
             let mut ace: *mut c_void = ptr::null_mut();
-            if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
-                return Err(PairError::Identity);
+            if unsafe { GetAce(dacl, ace_index, &mut ace) } == 0 || ace.is_null() {
+                return Err(fail(IdentityStep::RemovalAces, index));
             }
-            check_removal_ace(dacl, ace, acl_bytes, user, hazard)?;
+            check_removal_ace(dacl, ace, acl_bytes, user, hazard, index)?;
         }
         Ok(())
     }
@@ -1328,24 +1618,26 @@ mod windows_identity {
         dacl: Pacl,
         user: &str,
         root: bool,
+        index: u64,
     ) -> Result<(), PairError> {
         if owner.is_null() || dacl.is_null() {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::AncestorSecurity, index));
         }
         let owner = sid_to_string(owner, MAX_SID_BYTES)?;
         if !trusted_principal(&owner, user) {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::AncestorSecurity, index));
         }
         let hazard = if root {
             ROOT_HAZARD_RIGHTS
         } else {
             ANCESTOR_HAZARD_RIGHTS
         };
-        check_removal_aces(dacl, user, hazard)
+        check_removal_aces(dacl, user, hazard, index)
     }
 
     fn security_owner_and_dacl(
         handle: Handle,
+        index: u64,
     ) -> Result<(Psid, Pacl, SecurityDescriptor), PairError> {
         let mut owner: Psid = ptr::null_mut();
         let mut group: Psid = ptr::null_mut();
@@ -1367,19 +1659,24 @@ mod windows_identity {
         };
         let descriptor = SecurityDescriptor(descriptor);
         if result != 0 || descriptor.0.is_null() || owner.is_null() || dacl.is_null() {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::OwnerDacl, index));
         }
         Ok((owner, dacl, descriptor))
     }
 
-    fn validate_ancestor_handle(handle: Handle, user: &str, root: bool) -> Result<(), PairError> {
-        let (owner, dacl, _descriptor) = security_owner_and_dacl(handle)?;
-        validate_ancestor_security(owner, dacl, user, root)
+    fn validate_ancestor_handle(
+        handle: Handle,
+        user: &str,
+        root: bool,
+        index: u64,
+    ) -> Result<(), PairError> {
+        let (owner, dacl, _descriptor) = security_owner_and_dacl(handle, index)?;
+        validate_ancestor_security(owner, dacl, user, root, index)
     }
 
     /// Require a volume that stores and enforces ACLs. A FAT or exFAT volume
     /// keeps no DACL, so a private ACL on that volume proves nothing.
-    fn validate_volume_acls(handle: Handle) -> Result<(), PairError> {
+    fn validate_volume_acls(handle: Handle, index: u64) -> Result<(), PairError> {
         let mut flags = 0u32;
         if unsafe {
             GetVolumeInformationByHandleW(
@@ -1394,10 +1691,10 @@ mod windows_identity {
             )
         } == 0
         {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::VolumeAcls, index));
         }
         if flags & FILE_PERSISTENT_ACLS == 0 {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::VolumeAcls, index));
         }
         Ok(())
     }
@@ -1415,7 +1712,7 @@ mod windows_identity {
     /// current, or stream component.
     fn validate_identity_path(path: &Path) -> Result<(), PairError> {
         if !path.is_absolute() || path.file_name().is_none() {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::ValidatePath, 0));
         }
         const BACKSLASH: u16 = 0x5C;
         const COLON: u16 = 0x3A;
@@ -1428,7 +1725,7 @@ mod windows_identity {
             || raw.contains(&FORWARD_SLASH)
             || raw.last() == Some(&BACKSLASH)
         {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::ValidatePath, 0));
         }
         // `Path::components` normalizes some dot and empty components. The
         // verbatim Windows path used below does not apply the same rules.
@@ -1437,7 +1734,7 @@ mod windows_identity {
             .skip(1)
             .any(|part| part.is_empty() || part == [DOT] || part == [DOT, DOT])
         {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::ValidatePath, 0));
         }
         let mut disk: Option<u8> = None;
         let mut root_seen = false;
@@ -1446,21 +1743,21 @@ mod windows_identity {
             match component {
                 Component::Prefix(prefix) => {
                     if disk.is_some() {
-                        return Err(PairError::Identity);
+                        return Err(fail(IdentityStep::ValidatePath, 0));
                     }
                     match prefix.kind() {
                         Prefix::Disk(letter) => disk = Some(letter),
                         Prefix::UNC(..) | Prefix::Verbatim(..) | Prefix::DeviceNS(..) => {
-                            return Err(PairError::Identity)
+                            return Err(fail(IdentityStep::ValidatePath, 0))
                         }
                         Prefix::VerbatimUNC(..) | Prefix::VerbatimDisk(..) => {
-                            return Err(PairError::Identity)
+                            return Err(fail(IdentityStep::ValidatePath, 0))
                         }
                     }
                 }
                 Component::RootDir => {
                     if disk.is_none() || root_seen {
-                        return Err(PairError::Identity);
+                        return Err(fail(IdentityStep::ValidatePath, 0));
                     }
                     root_seen = true;
                 }
@@ -1472,33 +1769,35 @@ mod windows_identity {
                         || units.last() == Some(&DOT)
                         || units.last() == Some(&SPACE)
                     {
-                        return Err(PairError::Identity);
+                        return Err(fail(IdentityStep::ValidatePath, 0));
                     }
                     components += 1;
                 }
-                Component::CurDir | Component::ParentDir => return Err(PairError::Identity),
+                Component::CurDir | Component::ParentDir => {
+                    return Err(fail(IdentityStep::ValidatePath, 0))
+                }
             }
         }
         if !root_seen || components == 0 || components > MAX_PATH_COMPONENTS {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::ValidatePath, 0));
         }
         let Some(letter) = disk else {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::ValidatePath, 0));
         };
         if !is_fixed_drive(letter) {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::ValidatePath, 0));
         }
         Ok(())
     }
 
     fn directory_chain(dir: &Path) -> Result<Vec<PathBuf>, PairError> {
         if !dir.is_absolute() || dir.parent().is_none() {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::DirectoryChain, 0));
         }
         let mut chain: Vec<PathBuf> = dir.ancestors().map(Path::to_path_buf).collect();
         chain.reverse();
         if chain.len() < 2 || chain.len() > MAX_PATH_COMPONENTS {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::DirectoryChain, 0));
         }
         Ok(chain)
     }
@@ -1523,7 +1822,7 @@ mod windows_identity {
         };
         let descriptor = SecurityDescriptor(descriptor);
         if result == 0 || descriptor.0.is_null() {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::SecurityDescriptor, 0));
         }
         Ok(descriptor)
     }
@@ -1540,20 +1839,20 @@ mod windows_identity {
         }
     }
 
-    fn file_information(handle: Handle) -> Result<ByHandleFileInformation, PairError> {
+    fn file_information(handle: Handle, index: u64) -> Result<ByHandleFileInformation, PairError> {
         let mut information: ByHandleFileInformation = unsafe { mem::zeroed() };
         if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::FileInformation, index));
         }
         Ok(information)
     }
 
-    fn validate_directory_object(handle: Handle) -> Result<(), PairError> {
-        let information = file_information(handle)?;
+    fn validate_directory_object(handle: Handle, index: u64) -> Result<(), PairError> {
+        let information = file_information(handle, index)?;
         if information.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
             || information.file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0
         {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::DirectoryObject, index));
         }
         Ok(())
     }
@@ -1563,29 +1862,31 @@ mod windows_identity {
         handle: Handle,
         directory: bool,
         user: &str,
+        step: IdentityStep,
+        index: u64,
     ) -> Result<ByHandleFileInformation, PairError> {
-        let information = file_information(handle)?;
+        let information = file_information(handle, index)?;
         if information.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(PairError::Identity);
+            return Err(fail(step, index));
         }
         if (information.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0) != directory {
-            return Err(PairError::Identity);
+            return Err(fail(step, index));
         }
-        let (owner, dacl, descriptor) = security_owner_and_dacl(handle)?;
+        let (owner, dacl, descriptor) = security_owner_and_dacl(handle, index)?;
         if sid_to_string(owner, MAX_SID_BYTES)? != user {
-            return Err(PairError::Identity);
+            return Err(fail(step, index));
         }
         let mut control = 0u16;
         let mut revision = 0u32;
         if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
-            return Err(PairError::Identity);
+            return Err(fail(step, index));
         }
         if revision != SDDL_REVISION_1 {
-            return Err(PairError::Identity);
+            return Err(fail(step, index));
         }
         if control & (SE_DACL_PRESENT | SE_DACL_PROTECTED) != (SE_DACL_PRESENT | SE_DACL_PROTECTED)
         {
-            return Err(PairError::Identity);
+            return Err(fail(step, index));
         }
         let mut size: AclSizeInformation = unsafe { mem::zeroed() };
         if unsafe {
@@ -1597,60 +1898,64 @@ mod windows_identity {
             )
         } == 0
         {
-            return Err(PairError::Identity);
+            return Err(fail(step, index));
         }
         if size.ace_count != 1
             || size.acl_bytes_in_use < ACL_HEADER_BYTES as u32
             || size.acl_bytes_in_use > MAX_ACL_BYTES
         {
-            return Err(PairError::Identity);
+            return Err(fail(step, index));
         }
         let mut ace: *mut c_void = ptr::null_mut();
         if unsafe { GetAce(dacl, 0, &mut ace) } == 0 || ace.is_null() {
-            return Err(PairError::Identity);
+            return Err(fail(step, index));
         }
         let ace_bytes = ace as *const u8;
         let ace_offset = (ace as usize)
             .checked_sub(dacl as usize)
-            .ok_or(PairError::Identity)?;
+            .ok_or_else(|| fail(step, index))?;
         let header_end = ace_offset
             .checked_add(mem::size_of::<AceHeader>())
-            .ok_or(PairError::Identity)?;
+            .ok_or_else(|| fail(step, index))?;
         if ace_offset < ACL_HEADER_BYTES || header_end > size.acl_bytes_in_use as usize {
-            return Err(PairError::Identity);
+            return Err(fail(step, index));
         }
         let header = unsafe { ptr::read_unaligned(ace_bytes as *const AceHeader) };
         if header.ace_type != ACCESS_ALLOWED_ACE_TYPE || header.ace_flags != 0 {
-            return Err(PairError::Identity);
+            return Err(fail(step, index));
         }
         let ace_size = usize::from(header.ace_size);
         let ace_prefix = mem::size_of::<AceHeader>() + 4;
         if ace_size < ace_prefix + MIN_SID_BYTES as usize
             || ace_size > size.acl_bytes_in_use as usize
         {
-            return Err(PairError::Identity);
+            return Err(fail(step, index));
         }
         let ace_end = ace_offset
             .checked_add(ace_size)
-            .ok_or(PairError::Identity)?;
+            .ok_or_else(|| fail(step, index))?;
         if ace_end > size.acl_bytes_in_use as usize {
-            return Err(PairError::Identity);
+            return Err(fail(step, index));
         }
         let mask = unsafe {
             ptr::read_unaligned(ace_bytes.add(mem::size_of::<AceHeader>()) as *const u32)
         };
         if mask & FILE_ALL_ACCESS != FILE_ALL_ACCESS {
-            return Err(PairError::Identity);
+            return Err(fail(step, index));
         }
         let ace_sid = unsafe { ace_bytes.add(ace_prefix) as Psid };
         let ace_sid_limit = (ace_size - ace_prefix) as u32;
         if sid_to_string(ace_sid, ace_sid_limit)? != user {
-            return Err(PairError::Identity);
+            return Err(fail(step, index));
         }
         Ok(information)
     }
 
-    fn open_directory(path: &Path, share_delete: bool) -> Result<Option<Handle>, PairError> {
+    fn open_directory(
+        path: &Path,
+        share_delete: bool,
+        index: u64,
+    ) -> Result<Option<Handle>, PairError> {
         let text = wide_path(path)?;
         let share =
             FILE_SHARE_READ | FILE_SHARE_WRITE | if share_delete { FILE_SHARE_DELETE } else { 0 };
@@ -1674,16 +1979,16 @@ mod windows_identity {
         if handle as isize == INVALID_HANDLE_VALUE {
             return match last_error() {
                 ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Ok(None),
-                _ => Err(PairError::Identity),
+                _ => Err(fail(IdentityStep::AncestorOpen, index)),
             };
         }
         if handle.is_null() {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::AncestorOpen, index));
         }
         Ok(Some(handle))
     }
 
-    fn create_directory(path: &Path, user: &str) -> Result<(), PairError> {
+    fn create_directory(path: &Path, user: &str, index: u64) -> Result<(), PairError> {
         let descriptor = private_security_descriptor(user)?;
         let attributes = security_attributes(&descriptor);
         let text = wide_path(path)?;
@@ -1692,7 +1997,7 @@ mod windows_identity {
         if unsafe { CreateDirectoryW(text.as_ptr(), &attributes) } == 0
             && last_error() != ERROR_ALREADY_EXISTS
         {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::DirectoryCreate, index));
         }
         Ok(())
     }
@@ -1713,28 +2018,30 @@ mod windows_identity {
             let mut directories = Vec::with_capacity(chain.len());
             let mut volume_checked = false;
             for (index, path) in chain.iter().enumerate() {
+                let index = index as u64;
                 let root = index == 0;
-                let target = index + 1 == chain.len();
-                let handle = match open_directory(path, root)? {
+                let target = index + 1 == chain.len() as u64;
+                let handle = match open_directory(path, root, index)? {
                     Some(handle) => handle,
                     None => {
                         if root {
-                            return Err(PairError::Identity);
+                            return Err(fail(IdentityStep::AncestorOpen, index));
                         }
-                        create_directory(path, user)?;
-                        open_directory(path, false)?.ok_or(PairError::Identity)?
+                        create_directory(path, user, index)?;
+                        open_directory(path, false, index)?
+                            .ok_or_else(|| fail(IdentityStep::AncestorOpen, index))?
                     }
                 };
                 let handle = HandleGuard(handle);
-                validate_directory_object(handle.0)?;
+                validate_directory_object(handle.0, index)?;
                 if !volume_checked {
-                    validate_volume_acls(handle.0)?;
+                    validate_volume_acls(handle.0, index)?;
                     volume_checked = true;
                 }
                 if target {
-                    validate_handle(handle.0, true, user)?;
+                    validate_handle(handle.0, true, user, IdentityStep::DirectoryValidate, index)?;
                 } else {
-                    validate_ancestor_handle(handle.0, user, root)?;
+                    validate_ancestor_handle(handle.0, user, root, index)?;
                 }
                 directories.push(handle);
             }
@@ -1770,11 +2077,11 @@ mod windows_identity {
                         thread::sleep(SHARING_RETRY_DELAY);
                         continue;
                     }
-                    _ => return Err(PairError::Identity),
+                    _ => return Err(fail(IdentityStep::OpenFile, 0)),
                 }
             }
             if handle.is_null() {
-                return Err(PairError::Identity);
+                return Err(fail(IdentityStep::OpenFile, 0));
             }
             return Ok(Some(handle));
         }
@@ -1821,11 +2128,11 @@ mod windows_identity {
             )
         } == 0
         {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::Protect, 0));
         }
         let blob = output.bytes()?;
         if blob.len() > MAX_FILE_SIZE as usize - MAGIC.len() {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::Protect, 0));
         }
         Ok(blob.to_vec())
     }
@@ -1849,11 +2156,11 @@ mod windows_identity {
             )
         };
         if result == 0 {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::Unprotect, 0));
         }
         let plain = output.bytes()?;
         if plain.len() != 32 {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::Unprotect, 0));
         }
         let mut key = [0u8; 32];
         key.copy_from_slice(plain);
@@ -1877,7 +2184,7 @@ mod windows_identity {
             } == 0
                 || read == 0
             {
-                return Err(PairError::Identity);
+                return Err(fail(IdentityStep::ReadFile, 0));
             }
             offset += read as usize;
         }
@@ -1893,14 +2200,14 @@ mod windows_identity {
             return Ok(None);
         };
         let handle = HandleGuard(handle);
-        let information = validate_handle(handle.0, false, user)?;
+        let information = validate_handle(handle.0, false, user, IdentityStep::FileValidate, 0)?;
         let length = ((information.file_size_high as u64) << 32) | information.file_size_low as u64;
         if length <= MAGIC.len() as u64 || length > MAX_FILE_SIZE {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::FileValidate, 0));
         }
         let bytes = read_file(handle.0, length as usize)?;
         if !bytes.starts_with(MAGIC) {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::FileValidate, 0));
         }
         let mut key = unprotect_identity(&bytes[MAGIC.len()..])?;
         let identity = Identity::from_bytes(key);
@@ -1925,7 +2232,7 @@ mod windows_identity {
             } == 0
                 || written == 0
             {
-                return Err(PairError::Identity);
+                return Err(fail(IdentityStep::WriteFile, 0));
             }
             offset += written as usize;
         }
@@ -1935,7 +2242,7 @@ mod windows_identity {
     fn delete_file(path: &Path) -> Result<(), PairError> {
         let text = wide_path(path)?;
         if unsafe { DeleteFileW(text.as_ptr()) } == 0 {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::DeleteFile, 0));
         }
         Ok(())
     }
@@ -1965,10 +2272,10 @@ mod windows_identity {
             }
             match last_error() {
                 ERROR_FILE_EXISTS | ERROR_ALREADY_EXISTS => continue,
-                _ => return Err(PairError::Identity),
+                _ => return Err(fail(IdentityStep::CreateTemp, 0)),
             }
         }
-        Err(PairError::Identity)
+        Err(fail(IdentityStep::CreateTemp, 0))
     }
 
     fn create_identity_file(
@@ -1976,7 +2283,7 @@ mod windows_identity {
         user: &str,
         _directories: &PinnedPath,
     ) -> Result<Identity, PairError> {
-        let dir = path.parent().ok_or(PairError::Identity)?;
+        let dir = path.parent().ok_or_else(|| fail(IdentityStep::Parent, 0))?;
         let descriptor = private_security_descriptor(user)?;
         let attributes = security_attributes(&descriptor);
 
@@ -1993,23 +2300,24 @@ mod windows_identity {
         let mut temp = TempFile::new(temp_path.clone());
         let handle = HandleGuard(handle);
         // Check the private ACL before the protected key reaches the file.
-        validate_handle(handle.0, false, user)?;
+        validate_handle(handle.0, false, user, IdentityStep::TempValidate, 0)?;
         let written = write_file(handle.0, &blob)
             .and_then(|_| {
                 if unsafe { FlushFileBuffers(handle.0) } == 0 {
-                    Err(PairError::Identity)
+                    Err(fail(IdentityStep::Flush, 0))
                 } else {
                     Ok(())
                 }
             })
             .and_then(|_| {
-                let information = validate_handle(handle.0, false, user)?;
+                let information =
+                    validate_handle(handle.0, false, user, IdentityStep::TempValidate, 0)?;
                 let size =
                     ((information.file_size_high as u64) << 32) | information.file_size_low as u64;
                 if size == blob.len() as u64 {
                     Ok(())
                 } else {
-                    Err(PairError::Identity)
+                    Err(fail(IdentityStep::TempValidate, 0))
                 }
             });
         drop(handle);
@@ -2033,15 +2341,17 @@ mod windows_identity {
             if error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS {
                 // Another process created the file first. Load that file.
                 drop(temp);
-                return read_identity_file(path, user, _directories)?.ok_or(PairError::Identity);
+                return read_identity_file(path, user, _directories)?
+                    .ok_or_else(|| fail(IdentityStep::Rename, 0));
             }
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::Rename, 0));
         }
         temp.disarm();
-        read_identity_file(path, user, _directories)?.ok_or(PairError::Identity)
+        read_identity_file(path, user, _directories)?.ok_or_else(|| fail(IdentityStep::Rename, 0))
     }
 
     pub(super) fn default_path() -> Result<PathBuf, PairError> {
+        reset_identity_failure();
         let mut pointer: *mut u16 = ptr::null_mut();
         // The known folder is independent of the environment. A forged
         // LOCALAPPDATA value cannot redirect the key file.
@@ -2055,7 +2365,7 @@ mod windows_identity {
                     CoTaskMemFree(pointer.cast());
                 }
             }
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::DefaultPath, 0));
         }
         let folder = wide_ptr_to_path(pointer);
         // The known folder API allocates with CoTaskMemAlloc.
@@ -2063,15 +2373,16 @@ mod windows_identity {
             CoTaskMemFree(pointer.cast());
         }
         if folder.as_os_str().is_empty() || !folder.is_absolute() {
-            return Err(PairError::Identity);
+            return Err(fail(IdentityStep::DefaultPath, 0));
         }
         Ok(folder.join("hotspotshade").join("identity.key"))
     }
 
     pub(super) fn load_or_create(path: &Path) -> Result<Identity, PairError> {
+        reset_identity_failure();
         validate_identity_path(path)?;
         reject_impersonation()?;
-        let dir = path.parent().ok_or(PairError::Identity)?;
+        let dir = path.parent().ok_or_else(|| fail(IdentityStep::Parent, 0))?;
         let user = current_user_sid()?;
         // Validate every directory on the path on every load. The handles pin
         // the path and reject a directory or intermediate reparse point. The
@@ -2168,7 +2479,7 @@ mod windows_identity {
         {
             return Err(PairError::Identity);
         }
-        validate_ancestor_security(owner, dacl, &user, root)
+        validate_ancestor_security(owner, dacl, &user, root, 0)
     }
 
     #[cfg(test)]

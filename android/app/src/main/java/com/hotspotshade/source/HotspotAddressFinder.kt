@@ -223,20 +223,17 @@ internal data class HotspotCandidate(
 )
 
 /**
- * A possible future explicit hotspot interface choice.
+ * An explicit hotspot interface choice.
  *
  * Android 15 and earlier have no public API that names the tethering
  * interface, and the automatic name rules fail closed when a vendor ROM uses
- * an unexpected name or hides the Wi-Fi client. A selection UI could let a
- * person name the interface that the hotspot settings show. It would be a
- * statement about which interface is tethering, not proof, and it must never
- * override a reported client or upstream network.
+ * an unexpected name or hides the Wi-Fi client. The selection UI lets a person
+ * name the interface that the hotspot settings show. It is a statement about
+ * which interface is tethering, not proof, and it never overrides a reported
+ * client or upstream network.
  *
- * Manual selection is not wired. The current app does not offer, store, or
- * pass a choice, and the finder defaults to [Automatic]. Do not wire it until
- * the UI states the limitation and warns that the proxy will be reachable at
- * the selected address, and until the watch behavior for a selected address
- * has been reviewed.
+ * The Settings page stores one [Selected] name (with no pinned address) or
+ * [Automatic]. The finder defaults to [Automatic] when nothing is stored.
  */
 internal sealed interface HotspotInterfaceChoice {
     /** Use the automatic name rules. This is the default. */
@@ -394,14 +391,12 @@ internal interface HotspotAddressFinder {
     }
 
     /**
-     * Return the interfaces that a future settings screen could offer as
-     * explicit choices.
+     * Return the interfaces that the settings screen offers as explicit
+     * choices.
      *
      * The default returns an empty list. The network finder overrides it and
-     * applies [selectableHotspotInterfaces]. The current app does not call
-     * this method. Manual selection is unwired until the UI warning and watch
-     * behavior are reviewed. The call reads platform state, so a caller should
-     * not run it on the main thread.
+     * applies [selectableHotspotInterfaces]. The settings screen calls this
+     * method off the main thread, because it reads platform state.
      */
     fun selectableInterfaces(): List<HotspotInterfaceOption> = emptyList()
 }
@@ -476,18 +471,24 @@ internal interface HotspotAddressFinder {
  * Bluetooth PAN client, and the public API before Android 16 does not say
  * which one is active. The finder does not guess.
  *
- * A `wlan*` name is a weak candidate. It needs a complete observation that
- * names an unambiguous Wi-Fi station outside the tether name prefixes, such as
- * `wifi0` or `wl0`, and the candidate itself must not be a reported network. A reported
- * `wlan*` or access point name does not count, because the platform can report
- * the access point under that name. This is a narrow concurrency inference,
- * not proof. Many devices name the station `wlan0`, so this path deliberately
- * fails closed there; a strong name or the API 36 callback is needed. An
- * unlisted `wlan*` name is never accepted from silence, from a partial read,
- * or from another unreported `wlan*` name. A vendor ROM can also expose a
+ * A `wlan*` name is a weak candidate. It is admitted at the inferred rank when
+ * a complete observation names an unambiguous Wi-Fi station outside the tether
+ * name prefixes, such as `wifi0` or `wl0`, and the candidate itself must not be
+ * a reported network. A reported `wlan*` or access point name does not count,
+ * because the platform can report the access point under that name. This is a
+ * narrow concurrency inference, not proof.
+ *
+ * When no such station evidence exists, an unreported `wlan*` name is admitted
+ * instead at the fail-closed fallback rank (see the rank order below) when the
+ * observation is complete and the interface has exactly one safe private IPv4
+ * address. Many devices name the station `wlan0`, so an access point named
+ * `wlan1` gets no station evidence; the fallback covers that common case. It is
+ * an inference from one private address, not proof. A partial or unknown read
+ * never admits the fallback, and neither does a second unreported private
+ * interface, which ties at the fallback rank. A vendor ROM can still expose a
  * station name while it keeps the access point hidden or gives it a tether-like
- * name. The finder can then still infer the wrong `wlan*` interface. This
- * residual risk is why a strong name and the API 36 callback are preferred.
+ * name, so the finder can infer the wrong `wlan*` interface. This residual risk
+ * is why a strong name and the API 36 callback are preferred.
  *
  * ## Automatic rank order
  *
@@ -498,15 +499,20 @@ internal interface HotspotAddressFinder {
  * 3. `softap*`
  * 4. `rndis*`
  * 5. `wlan*`, only with the separate station evidence above
+ * 6. any remaining unreported, non-virtual, non-cellular interface with exactly
+ *    one safe private IPv4 address (the fail-closed fallback)
  *
  * A strong access point name therefore wins over a USB tether name, and a
- * strong USB tether name wins over the weak `wlan*` inference. The order is a
- * product choice, not a platform fact. `rndis*` names a USB tether role more
- * narrowly than `wlan*`, which can be either the station or the access point.
- * A generic `usb*` or `ncm*` name stays rejected because it does not prove
- * which end of the link is local. The API 36 path does not use these numbers.
- * It ranks by the validated platform type in [TetheredInterfaceKind], and the
- * two rank scales are never compared.
+ * strong USB tether name wins over the weak `wlan*` inference, which in turn
+ * wins over the fallback. The order is a product choice, not a platform fact.
+ * `rndis*` names a USB tether role more narrowly than `wlan*`, which can be
+ * either the station or the access point. The fallback covers a `wlan*` access
+ * point on a ROM that names the station `wlan0` or leaves the Wi-Fi client off,
+ * and also a generic `usb*`, `ncm*`, or `eth*` name that is unreported and has
+ * one private IPv4 address. It is the weakest automatic evidence and is never a
+ * strong claim. The API 36 path does not use these numbers. It ranks by the
+ * validated platform type in [TetheredInterfaceKind], and the two rank scales
+ * are never compared.
  *
  * ## Multiple private addresses
  *
@@ -519,9 +525,10 @@ internal interface HotspotAddressFinder {
  * The finder skips loopback, down, cellular, virtual, point-to-point, and
  * excluded interfaces. A candidate address that a reported network also holds
  * is rejected before the address can be returned. It returns null for a
- * generic name such as `eth*`, `usb*`, or `wg*`. When more than one interface
- * holds the best rank, it returns null because it cannot tell them apart. A
- * strong Wi-Fi access point name wins over a USB tether name.
+ * virtual or cellular name such as `wg*` or `rmnet*`. When more than one
+ * interface holds the best rank, it returns null because it cannot tell them
+ * apart. A strong Wi-Fi access point name wins over a USB tether name, and any
+ * named rank wins over the fallback rank.
  *
  * An interface name alone does not prove that the interface is tethering. A
  * vendor ROM can name the hotspot interface `wlan*` while hiding the Wi-Fi
@@ -530,16 +537,17 @@ internal interface HotspotAddressFinder {
  * the wrong interface, so binding the address does not prove
  * that the interface is tethering either.
  *
- * ## Android 15 and earlier: stored explicit choice (not wired)
+ * ## Android 15 and earlier: stored explicit choice
  *
- * Manual interface selection is not wired. The current app does not offer,
- * store, or pass a choice, and [HotspotInterfaceChoice.Automatic] is the
- * default. Do not wire it until the selection UI states the limitation and
- * warns that the proxy will be reachable at the selected address, and until
- * the watch behavior for a selected address has been reviewed.
+ * Manual interface selection is wired. The Settings page offers a "Hotspot
+ * network adapter" picker that lists the safe interface names and stores one
+ * name as [HotspotInterfaceChoice.Selected], or stores
+ * [HotspotInterfaceChoice.Automatic] when the person clears the choice. The
+ * picker shows interface names only. The selection UI states the limitation
+ * and warns that the proxy will be reachable at the selected address.
  *
- * The finder can validate a stored choice when a future caller supplies one
- * through [HotspotInterfaceChoiceSource]. The source is read only when
+ * The finder validates a stored choice supplied through
+ * [HotspotInterfaceChoiceSource]. The source is read only when
  * [tetheredEvidence] is [TetheredInterfaceState.Unavailable]; API 36 evidence
  * stays authoritative. A source that throws makes the finder fail closed
  * instead of guessing.
@@ -565,13 +573,13 @@ internal interface HotspotAddressFinder {
  *   not fall back to the name rules, so a stale choice cannot silently bind a
  *   different interface.
  *
- * The choice would record that a person identified the hotspot interface when
- * the platform exposes no safe answer. It is not proof. A future selection UI
- * must show the interface name and address, state the limitation, and warn
- * that the proxy will be reachable at that address. It can build a list with
- * [selectableHotspotInterfaces] and save the selected name and address. The
- * caller owns that storage and passes [HotspotInterfaceChoice.Automatic] when
- * the person clears the choice.
+ * The choice records that a person identified the hotspot interface when the
+ * platform exposes no safe answer. It is not proof. The selection UI shows the
+ * interface name and states the limitation, and warns that the proxy will be
+ * reachable at that address. It builds its list with
+ * [selectableHotspotInterfaces] and saves the selected name. The caller owns
+ * that storage and passes [HotspotInterfaceChoice.Automatic] when the person
+ * clears the choice.
  */
 internal class NetworkInterfaceHotspotAddressFinder(
     private val source: InterfaceSource,
@@ -827,10 +835,37 @@ internal class NetworkInterfaceHotspotAddressFinder(
     ): List<HotspotCandidate> {
         val lower = normalizeInterfaceName(snapshot.name) ?: return emptyList()
         if (lower in observation.excludedNames) return emptyList()
-        val rank = rankOf(lower, observation) ?: return emptyList()
-        return safePrivateIpv4Addresses(snapshot.addresses, excludedAddresses).map {
-            HotspotCandidate(rank, it)
-        }
+        val safeAddresses = safePrivateIpv4Addresses(snapshot.addresses, excludedAddresses)
+        val rank = rankOf(lower, observation)
+            ?: fallbackRankOf(lower, observation, safeAddresses)
+            ?: return emptyList()
+        return safeAddresses.map { HotspotCandidate(rank, it) }
+    }
+
+    /**
+     * Admit one unreported, otherwise-unranked interface at the fallback rank.
+     *
+     * The name rules return null for a name that proves neither a tether role
+     * nor a Wi-Fi station. The common case is a `wlan*` access point on a ROM
+     * that names the station `wlan0` or leaves the Wi-Fi client off, so no
+     * unambiguous station evidence exists. Instead of always failing closed, the
+     * finder admits the interface at [PRIVATE_IPV4_FALLBACK_RANK] when the
+     * evidence is complete and the interface is unreported, non-virtual,
+     * non-cellular, and has exactly one safe private IPv4 address. That is an
+     * inference from the presence of one private address, not proof of a
+     * tethering role. Two such interfaces tie at the fallback rank, so the
+     * existing best-rank rule keeps them failing closed.
+     */
+    private fun fallbackRankOf(
+        name: String,
+        observation: NetworkInterfaceObservation,
+        safeAddresses: List<InetAddress>,
+    ): Int? {
+        if (observation !is NetworkInterfaceObservation.Complete) return null
+        if (hasVirtualNamePrefix(name)) return null
+        if (hasCellularNamePrefix(name)) return null
+        if (safeAddresses.size != 1) return null
+        return PRIVATE_IPV4_FALLBACK_RANK
     }
 
     private fun rankOf(
@@ -871,27 +906,33 @@ internal class NetworkInterfaceHotspotAddressFinder(
         const val SOFTAP_RANK = 2
         const val USB_TETHER_RANK = 3
         const val INFERRED_WLAN_RANK = 4
+
+        // The fail-closed last resort. An unreported, non-virtual, non-cellular
+        // interface with exactly one safe private IPv4 address is admitted here
+        // when the name rules cannot rank it. The common case is a `wlan*`
+        // access point on a ROM that names the station `wlan0` or leaves the
+        // Wi-Fi client off, so no unambiguous station evidence exists. This is
+        // an inference from one private address, not proof of tethering. Two
+        // such interfaces tie here, so the best-rank rule still fails closed.
+        const val PRIVATE_IPV4_FALLBACK_RANK = 5
     }
 }
 
 /**
- * Return interface choices that a future settings screen could offer.
+ * Return interface choices that the settings screen offers.
  *
  * The function applies the same safety filters as the finder: a complete
  * network observation, no reported client or upstream name, no address that a
  * reported network holds, no cellular or virtual name, an up non-loopback
  * interface, and a private IPv4 address. It also rejects interfaces that
  * `NetworkInterface` marks as virtual or point-to-point. One option is returned
- * per safe private IPv4 address, so a person could pin the address that the
- * hotspot settings show. An interface with several safe addresses therefore
- * offers several choices instead of one guess.
+ * per safe private IPv4 address, so a caller can tell how many addresses an
+ * interface holds. An interface with several safe addresses therefore offers
+ * several options; the settings screen shows one row per interface name.
  *
- * The function is a UI helper for a future explicit choice. The current app
- * does not call it. Do not wire it before the selection UI states the
- * limitation and warns that the proxy will be reachable at the selected
- * address, and before the watch behavior for a selected address is reviewed.
- * The finder validates a stored choice again on every probe; an option list is
- * never proof that an interface is tethering.
+ * The settings screen builds its picker from this list and saves the selected
+ * name. The finder validates a stored choice again on every probe; an option
+ * list is never proof that an interface is tethering.
  */
 internal fun selectableHotspotInterfaces(
     snapshots: List<InterfaceSnapshot>,

@@ -109,6 +109,10 @@ struct Shared {
     presence: RunPresence,
     extra: Mutex<ProbeExtra>,
     last_stop: Mutex<Option<(&'static str, u64)>>,
+    /// The last presence discovery failure, as a fixed-vocabulary string. It
+    /// holds no address, interface name or index, GUID, LUID, MAC, or token.
+    /// It is cleared when a discovery succeeds.
+    presence_failure: Mutex<Option<String>>,
     /// Set once when the HTTP server begins shutdown. It cancels a probe or a
     /// start in progress and refuses a later start.
     closing: AtomicBool,
@@ -158,20 +162,45 @@ fn is_private_gateway(gateway: Ipv4Addr) -> bool {
     gateway.is_private()
 }
 
+/// A gateway discovery failure. `message` is the fixed user-facing code and
+/// `reason` is the fixed-vocabulary diagnostic detail, which holds no address
+/// or interface identity.
+struct GatewayError {
+    message: &'static str,
+    reason: String,
+}
+
+impl From<GatewayError> for String {
+    fn from(error: GatewayError) -> Self {
+        error.message.to_string()
+    }
+}
+
 /// Return the physical default gateway and its interface index. This is the
 /// unscoped default route, so it works only while no tunnel runs.
-fn hotspot_gateway() -> Result<(Ipv4Addr, u32), String> {
-    let (gateway, index) = crate::platform::default_ipv4_gateway()
-        .map_err(|_| "no physical hotspot gateway".to_string())?;
+fn hotspot_gateway() -> Result<(Ipv4Addr, u32), GatewayError> {
+    let (gateway, index) =
+        crate::windows_route_verify::default_ipv4_gateway().map_err(|error| GatewayError {
+            message: "no physical hotspot gateway",
+            reason: format!("gateway: {}", error.presence_kind()),
+        })?;
     // A hotspot gateway is always a private address. A public default
     // gateway is a local network, not a source device.
     if !is_private_gateway(gateway) {
-        return Err("no private hotspot gateway".into());
+        return Err(GatewayError {
+            message: "no private hotspot gateway",
+            reason: "gateway: not_private".to_string(),
+        });
     }
-    let name = normalization::interface_name(index)
-        .map_err(|_| "no physical hotspot interface".to_string())?;
+    let name = normalization::interface_name(index).map_err(|_| GatewayError {
+        message: "no physical hotspot interface",
+        reason: "gateway: interface_name_unavailable".to_string(),
+    })?;
     if name.starts_with("HotspotShade-Tunnel") {
-        return Err("no physical hotspot gateway".into());
+        return Err(GatewayError {
+            message: "no physical hotspot gateway",
+            reason: "gateway: tunnel_interface".to_string(),
+        });
     }
     Ok((gateway, index))
 }
@@ -251,28 +280,105 @@ fn proxy(host: Ipv4Addr, port: u16, token: &str, iface: u32) -> PhoneProxy {
     }
 }
 
+/// A token gate failure. `message` is the fixed `source_gateway_unproven` code
+/// and `reason` is the fixed-vocabulary diagnostic detail, which holds no
+/// address or interface identity.
+struct TokenGateError {
+    message: &'static str,
+    reason: String,
+}
+
+impl From<TokenGateError> for String {
+    fn from(error: TokenGateError) -> Self {
+        error.message.to_string()
+    }
+}
+
 /// Run the token gate for one destination and pinned interface. The service
-/// chooses the run binding while a tunnel runs.
-fn token_gate(service: &Service, destination: SocketAddrV4, iface: u32) -> Result<(), String> {
-    service
-        .windows_token_gate(SocketAddr::V4(destination), Some(iface))
-        .map_err(|_| TOKEN_DESTINATION_REFUSED.to_string())
+/// chooses the run binding while a tunnel runs. The error carries the fixed
+/// `source_gateway_unproven` code and, for diagnostics, a fixed-vocabulary
+/// reason that names the physical path failure without any address or
+/// identity.
+fn token_gate(
+    service: &Service,
+    destination: SocketAddrV4,
+    iface: u32,
+) -> Result<(), TokenGateError> {
+    let run = if service.is_running() {
+        Some(
+            service
+                .windows_phone_run()
+                .map(|current| current.run)
+                .ok_or_else(|| TokenGateError {
+                    message: TOKEN_DESTINATION_REFUSED,
+                    reason: "token_gate: no run binding".to_string(),
+                })?,
+        )
+    } else {
+        None
+    };
+    // Keep the shape checks of the service gate (IPv4, a valid pinned index,
+    // a nonzero port) and record only the physical path reason.
+    let mut reason: Option<String> = None;
+    crate::windows_route_verify::require_token_destination_with(
+        SocketAddr::V4(destination),
+        Some(iface),
+        |address, index| {
+            crate::windows_physical_path::observe_token_destination(address, index, run.as_ref())
+                .inspect_err(|error| {
+                    reason = Some(format!("token_gate: {}", error.presence_reason()));
+                })
+        },
+    )
+    .map(|_| ())
+    .map_err(|_| TokenGateError {
+        message: TOKEN_DESTINATION_REFUSED,
+        reason: reason.unwrap_or_else(|| "token_gate: invalid destination".to_string()),
+    })
+}
+
+/// A source device discovery failure. `message` is the fixed user-facing code
+/// and `reason` is the fixed-vocabulary diagnostic detail, which holds no
+/// address or interface identity.
+struct DiscoverFailure {
+    message: &'static str,
+    reason: String,
+}
+
+impl From<DiscoverFailure> for String {
+    fn from(error: DiscoverFailure) -> Self {
+        error.message.to_string()
+    }
 }
 
 /// Find the pairing listener: the running tunnel's source device, or the
 /// current physical default gateway. Then run the token gate for the pairing
 /// port. The host never comes from the client.
-fn discover_listener(service: &Service) -> Result<(Ipv4Addr, u32), String> {
+fn discover_listener(service: &Service) -> Result<(Ipv4Addr, u32), DiscoverFailure> {
     let (host, iface) = if service.is_running() {
-        let current = service.windows_phone_run().ok_or("no_hotspot")?;
+        let current = service.windows_phone_run().ok_or(DiscoverFailure {
+            message: "no_hotspot",
+            reason: "discovery: no run binding".to_string(),
+        })?;
         let SocketAddr::V4(destination) = current.destination else {
-            return Err("no_hotspot".into());
+            return Err(DiscoverFailure {
+                message: "no_hotspot",
+                reason: "discovery: the run destination is not IPv4".to_string(),
+            });
         };
         (*destination.ip(), current.iface)
     } else {
-        hotspot_gateway()?
+        hotspot_gateway().map_err(|error| DiscoverFailure {
+            message: error.message,
+            reason: error.reason,
+        })?
     };
-    token_gate(service, SocketAddrV4::new(host, PAIRING_PORT), iface)?;
+    token_gate(service, SocketAddrV4::new(host, PAIRING_PORT), iface).map_err(|error| {
+        DiscoverFailure {
+            message: error.message,
+            reason: error.reason,
+        }
+    })?;
     Ok((host, iface))
 }
 
@@ -298,6 +404,20 @@ impl Shared {
             },
         );
         json!({"stopped": outcome == RunStop::Stopped})
+    }
+
+    /// Store the fixed-vocabulary reason for the last presence failure.
+    fn record_presence_failure(&self, reason: String) {
+        if let Ok(mut slot) = self.presence_failure.lock() {
+            *slot = Some(reason);
+        }
+    }
+
+    /// Clear the last presence failure reason after a successful discovery.
+    fn clear_presence_failure(&self) {
+        if let Ok(mut slot) = self.presence_failure.lock() {
+            *slot = None;
+        }
     }
 
     /// Probe the source device once and store the answer for the run that was
@@ -384,24 +504,29 @@ impl Shared {
 
     fn probe_idle(&self, cancel: &AtomicBool) -> Option<(&'static str, Option<u16>, Option<bool>)> {
         if let Some(manual) = self.manual.lock().ok().and_then(|manual| manual.clone()) {
-            if token_gate(
+            if let Err(error) = token_gate(
                 &self.service,
                 SocketAddrV4::new(manual.host, manual.port),
                 manual.iface,
-            )
-            .is_err()
-            {
+            ) {
+                self.record_presence_failure(error.reason);
                 return Some(("no_hotspot", None, None));
             }
+            self.clear_presence_failure();
             let state = presence_probe(
                 &proxy(manual.host, manual.port, &manual.token, manual.iface),
                 cancel,
             )?;
             return Some((state, None, None));
         }
-        let Ok((gateway, iface)) = discover_listener(&self.service) else {
-            return Some(("no_hotspot", None, None));
+        let (gateway, iface) = match discover_listener(&self.service) {
+            Ok(found) => found,
+            Err(error) => {
+                self.record_presence_failure(error.reason);
+                return Some(("no_hotspot", None, None));
+            }
         };
+        self.clear_presence_failure();
         let identity = match pairing::local_identity() {
             Ok(identity) => identity,
             Err(_) => return Some(("not_responding", None, None)),
@@ -467,6 +592,7 @@ impl WindowsGuiBackend {
                 presence: RunPresence::new(),
                 extra: Mutex::new(ProbeExtra::default()),
                 last_stop: Mutex::new(None),
+                presence_failure: Mutex::new(None),
                 closing: AtomicBool::new(false),
             }),
             start_lock: Mutex::new(()),
@@ -843,7 +969,31 @@ impl GuiBackend for WindowsGuiBackend {
     }
 
     fn diagnostics(&self) -> Result<Value, String> {
-        Ok(self.shared.service.diagnostics())
+        let mut value = self.shared.service.diagnostics();
+        // Surface the Windows identity-store failure detail, if any, so the
+        // Copy diagnostics report carries the first failing step without
+        // changing any user-facing message. The string holds only a fixed step
+        // word, a component index, and a Win32 error number; it never holds a
+        // path, a SID, or key material.
+        value["identity"] = match pairing::last_identity_failure() {
+            Some(detail) => json!(detail),
+            None => Value::Null,
+        };
+        // Surface the last presence discovery failure as a fixed-vocabulary
+        // string. It holds only a step word, an error variant, a fixed static
+        // reason, and at most a Win32 error number; it never holds an address,
+        // port, interface name or index, GUID, LUID, MAC, or token.
+        value["presence"] = match self
+            .shared
+            .presence_failure
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+        {
+            Some(reason) => json!(reason),
+            None => Value::Null,
+        };
+        Ok(value)
     }
 
     fn phone_probe(&self) -> Result<Value, String> {
