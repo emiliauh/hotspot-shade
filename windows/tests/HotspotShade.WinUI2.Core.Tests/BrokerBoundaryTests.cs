@@ -487,7 +487,12 @@ namespace HotspotShade.WinUI2.Core.Tests
                     "src",
                     "HotspotShade.WinUI2.Broker",
                     "BrokerRuntime.cs"));
-                AssertEx.Contains(runtime, "args.Length != 0", "no broker arguments");
+                // The Windows full-trust launch passes "/InvokerPRAID:" and the
+                // app id. The broker ignores every argument: it reads none, and it
+                // does not refuse to start because of them.
+                AssertEx.DoesNotContain(runtime, "args[", "the broker reads no argument");
+                AssertEx.Contains(runtime, "BrokerLogCodes.ArgsIgnored", "arguments are ignored and logged by count");
+                AssertEx.DoesNotContain(runtime, "BrokerLogCodes.BadArgs", "arguments never stop the broker");
                 string endpoints = SourceText.Read(Path.Combine(
                     root,
                     "src",

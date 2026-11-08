@@ -437,8 +437,9 @@ If package storage could not be opened, the broker falls back to
 2026-11-07T01:02:03Z stage=exit code=exit attempt=4
 ```
 
-Read the last line before `stage=exit`. `stage=main` with `code=bad_args`
-means a caller passed a command-line argument. `stage=package` with
+Read the last line before `stage=exit`. `stage=main` with `code=args_ignored`
+is normal: Windows passes `/InvokerPRAID:` and the app id to the broker, and
+the broker ignores every argument. Only the count is logged. `stage=package` with
 `code=no_package` means the process has no package identity; `hresult` carries
 the Windows error. `stage=lease` with `code=held` means another broker owns the
 session. `stage=engine_start` records the user engine result and a CreateProcess

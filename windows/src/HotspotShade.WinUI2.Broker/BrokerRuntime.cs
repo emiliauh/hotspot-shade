@@ -264,39 +264,42 @@ namespace HotspotShade.WinUI2.Broker
         private static int Main(string[] args)
         {
             int exitCode;
+            int argumentCount = args == null ? 0 : args.Length;
             BrokerLog.Write(
                 BrokerLogStages.Main,
                 BrokerLogCodes.Entry,
                 null,
-                args == null ? 0 : args.Length);
-            if (args != null && args.Length != 0)
+                argumentCount);
+            if (argumentCount != 0)
             {
-                // The launcher passes no arguments. A path, port, or secret is
-                // never accepted from the command line. Only the count is
-                // logged, never the values.
+                // The Windows full-trust launch passes "/InvokerPRAID:" and
+                // the app id. The broker reads nothing from the command line, so
+                // every argument is ignored, never refused. A path, port, or
+                // secret is never accepted from the command line. Only the
+                // count is logged, never the values.
                 BrokerTrace.Event(BrokerTrace.BadArgument);
-                BrokerLog.Write(BrokerLogStages.Main, BrokerLogCodes.BadArgs);
-                exitCode = 2;
+                BrokerLog.Write(
+                    BrokerLogStages.Main,
+                    BrokerLogCodes.ArgsIgnored,
+                    null,
+                    argumentCount);
             }
-            else
+            BrokerTrace.Event(BrokerTrace.Start);
+            try
             {
-                BrokerTrace.Event(BrokerTrace.Start);
-                try
-                {
-                    exitCode = BrokerRuntime.Run();
-                }
-                catch (Exception error)
-                {
-                    BrokerTrace.Event(BrokerTrace.Fatal);
-                    BrokerLog.Write(
-                        BrokerLogStages.Fatal,
-                        BrokerLogCodes.Unhandled,
-                        BrokerLogFormat.ExceptionName(error),
-                        null,
-                        null,
-                        error.HResult);
-                    exitCode = 1;
-                }
+                exitCode = BrokerRuntime.Run();
+            }
+            catch (Exception error)
+            {
+                BrokerTrace.Event(BrokerTrace.Fatal);
+                BrokerLog.Write(
+                    BrokerLogStages.Fatal,
+                    BrokerLogCodes.Unhandled,
+                    BrokerLogFormat.ExceptionName(error),
+                    null,
+                    null,
+                    error.HResult);
+                exitCode = 1;
             }
             BrokerTrace.Event(BrokerTrace.Exit);
             BrokerLog.Write(

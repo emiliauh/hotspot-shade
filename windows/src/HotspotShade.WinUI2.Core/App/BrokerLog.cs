@@ -27,6 +27,7 @@ namespace HotspotShade.WinUI2.Core.App
     {
         public const string Entry = "entry";
         public const string BadArgs = "bad_args";
+        public const string ArgsIgnored = "args_ignored";
         public const string NoPackage = "no_package";
         public const string PackageOk = "package_ok";
         public const string LeaseOwned = "owned";
@@ -459,6 +460,7 @@ namespace HotspotShade.WinUI2.Core.App
                     {
                         case BrokerLogCodes.Entry:
                         case BrokerLogCodes.BadArgs:
+                        case BrokerLogCodes.ArgsIgnored:
                             return "broker start";
                         default:
                             return "unknown";
@@ -501,6 +503,8 @@ namespace HotspotShade.WinUI2.Core.App
                     return "started";
                 case BrokerLogCodes.BadArgs:
                     return "refused its arguments";
+                case BrokerLogCodes.ArgsIgnored:
+                    return "ignored its arguments";
                 case BrokerLogCodes.NoPackage:
                     return "found no package";
                 case BrokerLogCodes.PackageOk:
