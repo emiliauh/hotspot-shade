@@ -237,6 +237,10 @@ const NET_IF_ADMIN_STATUS_UP: u32 = 1;
 const MEDIA_CONNECT_STATE_CONNECTED: u32 = 1;
 const NET_IF_ACCESS_BROADCAST: u32 = 2;
 const TUNNEL_TYPE_NONE: u32 = 0;
+/// `MIB_IPPROTO_LOCAL`. Windows gives this protocol to every route it makes from
+/// an interface address, including the on-link subnet route, so the protocol
+/// does not say that a destination is a local address.
+#[cfg(test)]
 const ROUTE_PROTOCOL_LOCAL: u32 = 2;
 const MAX_INTERFACE_INDEX: u32 = 0x00ff_ffff;
 
@@ -1322,7 +1326,9 @@ fn validate_destination_route(
             "the destination route is a loopback route",
         ));
     }
-    if route.protocol == ROUTE_PROTOCOL_LOCAL {
+    // Windows marks the on-link subnet route as a local-protocol route, so the
+    // protocol is not checked. A local address is the adapter address itself.
+    if destination == adapter.ipv4_address {
         return Err(PhysicalPathError::DestinationRouteUnusable(
             "the destination is a local address",
         ));
@@ -1536,7 +1542,7 @@ mod tests {
             INDEX,
             LUID,
             IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            3,
+            ROUTE_PROTOCOL_LOCAL,
             false,
         )
     }
@@ -2115,13 +2121,22 @@ mod tests {
     }
 
     #[test]
-    fn a_local_destination_route_is_refused() {
-        let mut observation = default_observation();
-        observation.destination_route.route.protocol = ROUTE_PROTOCOL_LOCAL;
+    fn an_on_link_route_from_windows_with_the_local_protocol_is_accepted() {
+        // Windows reports the on-link subnet route of a hotspot client with
+        // MIB_IPPROTO_LOCAL. Version 0.2.3.0 refused that route.
+        let observation = default_observation();
         assert_eq!(
-            verify(&observation).unwrap_err(),
-            PhysicalPathError::DestinationRouteUnusable("the destination is a local address")
+            observation.destination_route.route.protocol,
+            ROUTE_PROTOCOL_LOCAL
         );
+        assert!(verify(&observation).is_ok());
+    }
+
+    #[test]
+    fn an_on_link_route_with_another_protocol_is_accepted() {
+        let mut observation = default_observation();
+        observation.destination_route.route.protocol = 3;
+        assert!(verify(&observation).is_ok());
     }
 
     #[test]

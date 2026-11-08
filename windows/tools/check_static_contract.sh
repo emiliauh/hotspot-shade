@@ -34,7 +34,7 @@ done < "$tmpdir/xml_files"
 ok "$xml_count XML files are well formed"
 
 capabilities="$(grep -o '<rescap:Capability Name="[A-Za-z]*"' "$manifest" | sed 's/.*Name="//; s/"$//' | sort | tr '\n' ' ')"
-[ "$capabilities" = "allowElevation runFullTrust " ] || fail "the package must declare exactly runFullTrust and allowElevation (found: $capabilities)"
+[ "$capabilities" = "allowElevation runFullTrust unvirtualizedResources " ] || fail "the package must declare exactly runFullTrust, allowElevation, and unvirtualizedResources (found: $capabilities)"
 if grep -q 'internetClient\|privateNetworkClientServer\|<DeviceCapability' "$manifest"; then
     fail "the package declares a network or device capability"
 fi
@@ -42,7 +42,8 @@ grep -q 'Category="windows.fullTrustProcess"' "$manifest" || fail "the package d
 grep -q 'Executable="Broker\\HotspotShade.WinUI2.Broker.exe"' "$manifest" || fail "the broker path is not fixed"
 grep -q 'EntryPoint="Windows.FullTrustApplication"' "$manifest" || fail "the broker extension lacks EntryPoint Windows.FullTrustApplication"
 grep -q '<uap:AppService Name="hotspotshade.engine" />' "$manifest" || fail "the app service is not declared"
-ok "the package declares the broker, the app service, runFullTrust, and allowElevation only"
+grep -q '<desktop6:FileSystemWriteVirtualization>disabled</desktop6:FileSystemWriteVirtualization>' "$manifest" || fail "the package does not disable FileSystemWriteVirtualization"
+ok "the package declares the broker, the app service, runFullTrust, allowElevation, and unvirtualizedResources only"
 
 if grep -q 'PackageCertificateKeyFile\|AppxPackageSigningEnabled>true' "$project"; then
     fail "the project contains signing configuration"

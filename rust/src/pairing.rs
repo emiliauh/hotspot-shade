@@ -551,6 +551,92 @@ mod identity_failure {
         (u64::from(step as u16) << 48) | (index.min(u16::MAX as u64) << 32) | u64::from(win32)
     }
 
+    /// Why the loader refused one access entry of an ancestor directory.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum AceReason {
+        /// The entry is truncated or misaligned.
+        Malformed = 1,
+        /// A policy, trust-label, or access-filter entry.
+        PolicyAce = 2,
+        /// An allow entry gives a removal right to an untrusted principal.
+        Untrusted = 3,
+        /// A compound or unknown entry type.
+        UnknownType = 4,
+    }
+
+    impl AceReason {
+        fn from_id(id: u8) -> Option<Self> {
+            Some(match id {
+                1 => Self::Malformed,
+                2 => Self::PolicyAce,
+                3 => Self::Untrusted,
+                4 => Self::UnknownType,
+                _ => return None,
+            })
+        }
+
+        fn word(self) -> &'static str {
+            match self {
+                Self::Malformed => "malformed",
+                Self::PolicyAce => "policy_ace",
+                Self::Untrusted => "untrusted",
+                Self::UnknownType => "unknown_type",
+            }
+        }
+    }
+
+    /// Fixed class words for the principal of a refused entry. The SID itself
+    /// is never recorded, because an account SID identifies the user.
+    const SID_CLASS_WORDS: [&str; 15] = [
+        "none",
+        "world",
+        "authenticated_users",
+        "users",
+        "all_app_packages",
+        "all_restricted_app_packages",
+        "creator_owner",
+        "owner_rights",
+        "interactive",
+        "package",
+        "capability",
+        "service",
+        "account",
+        "builtin",
+        "other",
+    ];
+
+    /// The class of a SID in string form, as an index into the class words.
+    pub(super) fn sid_class(sid: &str) -> u8 {
+        match sid {
+            "S-1-1-0" => 1,
+            "S-1-5-11" => 2,
+            "S-1-5-32-545" => 3,
+            "S-1-15-2-1" => 4,
+            "S-1-15-2-2" => 5,
+            "S-1-3-0" => 6,
+            "S-1-3-4" => 7,
+            "S-1-5-4" => 8,
+            _ if sid.starts_with("S-1-15-2-") => 9,
+            _ if sid.starts_with("S-1-15-3-") => 10,
+            _ if sid.starts_with("S-1-5-80-") => 11,
+            _ if sid.starts_with("S-1-5-21-") => 12,
+            _ if sid.starts_with("S-1-5-32-") => 13,
+            _ => 14,
+        }
+    }
+
+    /// The high bit marks a refused-entry detail in the Win32 field. A
+    /// refused entry is a policy result, so no Win32 error applies.
+    const ACE_DETAIL_FLAG: u32 = 0x8000_0000;
+
+    /// Pack a refused-entry detail into the Win32 field of a removal_ace step.
+    pub(super) fn ace_detail(reason: AceReason, ace_type: u8, sid_class: u8) -> u32 {
+        ACE_DETAIL_FLAG
+            | ((reason as u32) << 16)
+            | (u32::from(ace_type) << 8)
+            | u32::from(sid_class)
+    }
+
     /// The formatted diagnostic, or `None` for the no-failure sentinel.
     pub(super) fn format(packed: u64) -> Option<String> {
         if packed == 0 {
@@ -559,6 +645,23 @@ mod identity_failure {
         let step = Step::from_id(((packed >> 48) & 0xffff) as u16)?;
         let index = (packed >> 32) & 0xffff;
         let win32 = (packed & 0xffff_ffff) as u32;
+        if step == Step::RemovalAce && win32 & ACE_DETAIL_FLAG != 0 {
+            if let Some(reason) = AceReason::from_id(((win32 >> 16) & 0xff) as u8) {
+                let ace_type = (win32 >> 8) & 0xff;
+                let class = SID_CLASS_WORDS
+                    .get((win32 & 0xff) as usize)
+                    .copied()
+                    .unwrap_or("other");
+                return Some(format!(
+                    "step={} component={} reason={} ace_type={} sid={}",
+                    step.word(),
+                    index,
+                    reason.word(),
+                    ace_type,
+                    class
+                ));
+            }
+        }
         Some(format!(
             "step={} component={} win32={}",
             step.word(),
@@ -637,6 +740,45 @@ mod identity_failure {
                 );
                 assert!(!step.word().is_empty());
                 assert!(!step.word().contains(' '));
+            }
+        }
+
+        #[test]
+        fn a_refused_entry_names_the_reason_type_and_principal_class() {
+            let detail = ace_detail(AceReason::Untrusted, 0, sid_class("S-1-15-2-123-456"));
+            assert_eq!(
+                format(pack(Step::RemovalAce, 3, detail)).as_deref(),
+                Some("step=removal_ace component=3 reason=untrusted ace_type=0 sid=package")
+            );
+            let detail = ace_detail(AceReason::PolicyAce, 0x13, 0);
+            assert_eq!(
+                format(pack(Step::RemovalAce, 1, detail)).as_deref(),
+                Some("step=removal_ace component=1 reason=policy_ace ace_type=19 sid=none")
+            );
+        }
+
+        #[test]
+        fn sid_classes_never_echo_the_sid() {
+            for (sid, word) in [
+                ("S-1-1-0", "world"),
+                ("S-1-5-11", "authenticated_users"),
+                ("S-1-5-32-545", "users"),
+                ("S-1-5-32-544", "builtin"),
+                ("S-1-15-2-1", "all_app_packages"),
+                ("S-1-15-2-2", "all_restricted_app_packages"),
+                ("S-1-15-2-1-2-3", "package"),
+                ("S-1-15-3-1024-1", "capability"),
+                ("S-1-5-80-1-2", "service"),
+                ("S-1-5-21-1-2-3-1001", "account"),
+                ("S-1-3-0", "creator_owner"),
+                ("S-1-3-4", "owner_rights"),
+                ("S-1-5-4", "interactive"),
+                ("S-1-16-8192", "other"),
+            ] {
+                let detail = ace_detail(AceReason::Untrusted, 0, sid_class(sid));
+                let text = format(pack(Step::RemovalAce, 2, detail)).unwrap();
+                assert!(text.ends_with(&format!(" sid={word}")), "{sid}: {text}");
+                assert!(!text.contains("S-1-"), "{text}");
             }
         }
 
@@ -734,7 +876,7 @@ pub fn last_identity_failure() -> Option<String> {
 /// that user.
 #[cfg(windows)]
 mod windows_identity {
-    use super::identity_failure::{self, Step as IdentityStep};
+    use super::identity_failure::{self, AceReason, Step as IdentityStep};
     use super::{hex, random_bytes, Identity, PairError};
     use std::ffi::{c_void, OsStr, OsString};
     use std::mem;
@@ -1241,6 +1383,21 @@ mod windows_identity {
         PairError::Identity
     }
 
+    /// Record a refused ancestor access entry. The detail holds the reason, the
+    /// entry type, and a fixed principal class word, never the SID.
+    fn fail_ace(
+        reason: identity_failure::AceReason,
+        ace_type: u8,
+        sid_class: u8,
+        index: u64,
+    ) -> PairError {
+        let detail = identity_failure::ace_detail(reason, ace_type, sid_class);
+        let packed = identity_failure::pack(IdentityStep::RemovalAce, index, detail);
+        let _ =
+            LAST_IDENTITY_FAILURE.compare_exchange(0, packed, Ordering::Relaxed, Ordering::Relaxed);
+        PairError::Identity
+    }
+
     /// The formatted first failure of the most recent load, or `None`.
     pub(super) fn last_identity_failure() -> Option<String> {
         identity_failure::format(LAST_IDENTITY_FAILURE.load(Ordering::Acquire))
@@ -1468,12 +1625,12 @@ mod windows_identity {
             ACCESS_ALLOWED_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_ACE_TYPE => Ok(mask_end),
             ACCESS_ALLOWED_OBJECT_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE => {
                 if length < mask_end + 4 {
-                    return Err(fail(IdentityStep::RemovalAce, index));
+                    return Err(fail_ace(AceReason::Malformed, ace_type, 0, index));
                 }
                 let flags =
                     unsafe { ptr::read_unaligned((ace as *const u8).add(mask_end) as *const u32) };
                 if flags & !(OBJECT_TYPE_PRESENT | INHERITED_OBJECT_TYPE_PRESENT) != 0 {
-                    return Err(fail(IdentityStep::RemovalAce, index));
+                    return Err(fail_ace(AceReason::Malformed, ace_type, 0, index));
                 }
                 let mut offset = mask_end + 4;
                 if flags & OBJECT_TYPE_PRESENT != 0 {
@@ -1483,11 +1640,11 @@ mod windows_identity {
                     offset += 16;
                 }
                 if offset >= length {
-                    return Err(fail(IdentityStep::RemovalAce, index));
+                    return Err(fail_ace(AceReason::Malformed, ace_type, 0, index));
                 }
                 Ok(offset)
             }
-            _ => Err(fail(IdentityStep::RemovalAce, index)),
+            _ => Err(fail_ace(AceReason::UnknownType, ace_type, 0, index)),
         }
     }
 
@@ -1505,22 +1662,22 @@ mod windows_identity {
     ) -> Result<(), PairError> {
         let offset = (ace as usize)
             .checked_sub(dacl as usize)
-            .ok_or_else(|| fail(IdentityStep::RemovalAce, index))?;
+            .ok_or_else(|| fail_ace(AceReason::Malformed, 0, 0, index))?;
         if offset < ACL_HEADER_BYTES {
-            return Err(fail(IdentityStep::RemovalAce, index));
+            return Err(fail_ace(AceReason::Malformed, 0, 0, index));
         }
         let bytes = ace as *const u8;
         let header = unsafe { ptr::read_unaligned(bytes as *const AceHeader) };
         let length = usize::from(header.ace_size);
         let end = offset
             .checked_add(length)
-            .ok_or_else(|| fail(IdentityStep::RemovalAce, index))?;
+            .ok_or_else(|| fail_ace(AceReason::Malformed, header.ace_type, 0, index))?;
         if length < mem::size_of::<AceHeader>()
             || length % 4 != 0
             || offset % 4 != 0
             || end > acl_bytes
         {
-            return Err(fail(IdentityStep::RemovalAce, index));
+            return Err(fail_ace(AceReason::Malformed, header.ace_type, 0, index));
         }
         if header.ace_flags & INHERIT_ONLY_ACE != 0 {
             return Ok(());
@@ -1545,13 +1702,15 @@ mod windows_identity {
             SYSTEM_RESOURCE_ATTRIBUTE_ACE_TYPE
             | SYSTEM_SCOPED_POLICY_ID_ACE_TYPE
             | SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE
-            | SYSTEM_ACCESS_FILTER_ACE_TYPE => Err(fail(IdentityStep::RemovalAce, index)),
+            | SYSTEM_ACCESS_FILTER_ACE_TYPE => {
+                Err(fail_ace(AceReason::PolicyAce, header.ace_type, 0, index))
+            }
             ACCESS_ALLOWED_ACE_TYPE
             | ACCESS_ALLOWED_OBJECT_ACE_TYPE
             | ACCESS_ALLOWED_CALLBACK_ACE_TYPE
             | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE => {
                 if length < mem::size_of::<AceHeader>() + 4 {
-                    return Err(fail(IdentityStep::RemovalAce, index));
+                    return Err(fail_ace(AceReason::Malformed, header.ace_type, 0, index));
                 }
                 let mask = unsafe {
                     ptr::read_unaligned(bytes.add(mem::size_of::<AceHeader>()) as *const u32)
@@ -1566,12 +1725,19 @@ mod windows_identity {
                 if trusted_principal(&text, user) {
                     Ok(())
                 } else {
-                    Err(fail(IdentityStep::RemovalAce, index))
+                    Err(fail_ace(
+                        AceReason::Untrusted,
+                        header.ace_type,
+                        identity_failure::sid_class(&text),
+                        index,
+                    ))
                 }
             }
             // A compound ACE is obsolete and an unknown type is unprovable.
-            ACCESS_ALLOWED_COMPOUND_ACE_TYPE => Err(fail(IdentityStep::RemovalAce, index)),
-            _ => Err(fail(IdentityStep::RemovalAce, index)),
+            ACCESS_ALLOWED_COMPOUND_ACE_TYPE => {
+                Err(fail_ace(AceReason::UnknownType, header.ace_type, 0, index))
+            }
+            _ => Err(fail_ace(AceReason::UnknownType, header.ace_type, 0, index)),
         }
     }
 

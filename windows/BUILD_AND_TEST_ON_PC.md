@@ -33,7 +33,10 @@ engine.
 
 1. **Windows 10 version 2004 (build 19041) or later, x64.** Windows 11 23H2 or
    24H2 is the best target. Check with `winver`. The package needs build 19041
-   for the `allowElevation` capability.
+   for the `allowElevation` capability. It also disables file-system write
+   virtualization (`unvirtualizedResources` and
+   `desktop6:FileSystemWriteVirtualization`) so the engine's identity key stays
+   in the real `%LOCALAPPDATA%\hotspotshade`, not the package's redirected copy.
 2. **An administrator account that you sign in with.** The UAC prompt must be
    approved by the signed-in account. Approval with a different account
    (over-the-shoulder credentials on a standard account) is refused by

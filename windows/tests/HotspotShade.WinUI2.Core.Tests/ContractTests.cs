@@ -149,9 +149,14 @@ namespace HotspotShade.WinUI2.Core.Tests
                     .Select(e => (string)e.Attribute("Name"))
                     .OrderBy(name => name, StringComparer.Ordinal)
                     .ToList();
-                AssertEx.Equal(2, names.Count, "capability count");
+                AssertEx.Equal(3, names.Count, "capability count");
                 AssertEx.Equal("allowElevation", names[0], "elevation capability for Turn on");
                 AssertEx.Equal("runFullTrust", names[1], "full-trust broker capability");
+                AssertEx.Equal("unvirtualizedResources", names[2], "real AppData capability");
+                XElement writeVirtualization = package.Descendants()
+                    .FirstOrDefault(e => e.Name.LocalName == "FileSystemWriteVirtualization");
+                AssertEx.True(writeVirtualization != null, "FileSystemWriteVirtualization declaration");
+                AssertEx.Equal("disabled", (string)writeVirtualization, "FileSystemWriteVirtualization is disabled");
                 string text = SourceText.Read(manifest);
                 AssertEx.DoesNotContain(text, "internetClient", "internet capability");
                 AssertEx.DoesNotContain(text, "privateNetworkClientServer", "private network capability");

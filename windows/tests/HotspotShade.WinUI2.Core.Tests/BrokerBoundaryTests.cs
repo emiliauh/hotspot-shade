@@ -313,7 +313,7 @@ namespace HotspotShade.WinUI2.Core.Tests
                 }
             });
 
-            runner.Check("broker: the app package declares the broker, the app service, and two capabilities", delegate
+            runner.Check("broker: the app package declares the broker, the app service, and three capabilities", delegate
             {
                 string root = FindWindowsRoot();
                 AssertEx.True(root != null, "windows root");
@@ -340,9 +340,14 @@ namespace HotspotShade.WinUI2.Core.Tests
                     .Select(e => (string)e.Attribute("Name"))
                     .OrderBy(name => name, StringComparer.Ordinal)
                     .ToList();
-                AssertEx.Equal(2, capabilities.Count, "capability count");
+                AssertEx.Equal(3, capabilities.Count, "capability count");
                 AssertEx.Equal("allowElevation", capabilities[0], "elevation capability");
                 AssertEx.Equal("runFullTrust", capabilities[1], "full-trust capability");
+                AssertEx.Equal("unvirtualizedResources", capabilities[2], "real AppData capability");
+                XElement writeVirtualization = package.Descendants()
+                    .FirstOrDefault(e => e.Name.LocalName == "FileSystemWriteVirtualization");
+                AssertEx.True(writeVirtualization != null, "FileSystemWriteVirtualization is declared");
+                AssertEx.Equal("disabled", (string)writeVirtualization, "FileSystemWriteVirtualization is disabled");
                 AssertEx.False(
                     File.Exists(Path.Combine(root, "src", "HotspotShade.WinUI2.Broker", "Package.broker.fragment.xml")),
                     "the old inactive fragment is gone");
