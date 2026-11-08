@@ -207,6 +207,10 @@ namespace HotspotShade.WinUI2.Core.App
             get { return status; }
         }
 
+        // The window reads the broker startup log through this seam, so the
+        // failure screen and Copy diagnostics can show the real stop point.
+        public IBrokerLogSource BrokerLog { get; set; }
+
         public string Source
         {
             get { return source; }
@@ -312,6 +316,10 @@ namespace HotspotShade.WinUI2.Core.App
             else if (reply.Code == BrokerCodes.Closed)
             {
                 brokerFailure = AppText.BrokerLost;
+            }
+            else if (reply.Code == BrokerCodes.NotConnected)
+            {
+                brokerFailure = AppText.BrokerNeverConnected;
             }
             else
             {
@@ -637,7 +645,12 @@ namespace HotspotShade.WinUI2.Core.App
 
         // Build the Copy diagnostics text from real engine answers. The
         // engine diagnostics hold no address, host, token, or key.
-        public async Task<string> DiagnosticsReportAsync(string appVersion, string windowsVersion)
+        public Task<string> DiagnosticsReportAsync(string appVersion, string windowsVersion)
+        {
+            return DiagnosticsReportCoreAsync(appVersion, windowsVersion);
+        }
+
+        private async Task<string> DiagnosticsReportCoreAsync(string appVersion, string windowsVersion)
         {
             BrokerReply diagnostics = await Send(BrokerOps.Diagnostics, null).ConfigureAwait(true);
             StringBuilder report = new StringBuilder();
@@ -666,7 +679,39 @@ namespace HotspotShade.WinUI2.Core.App
             {
                 report.AppendLine("Engine diagnostics: unavailable (" + (diagnostics.Code.Length == 0 ? "http " + diagnostics.Http.ToString(CultureInfo.InvariantCulture) : diagnostics.Code) + ")");
             }
+            // The broker log stays readable after the helper exits. Copy
+            // diagnostics carries its tail, so a helper that stopped before
+            // the app service connected still explains itself.
+            BrokerLogSnapshot log = ReadBrokerLog(40);
+            report.AppendLine("Engine helper log (last 40 lines):");
+            if (log.Lines.Count == 0)
+            {
+                report.AppendLine("No engine helper log is present.");
+            }
+            else
+            {
+                for (int index = 0; index < log.Lines.Count; index++)
+                {
+                    report.AppendLine(log.Lines[index]);
+                }
+            }
             return report.ToString();
+        }
+
+        private BrokerLogSnapshot ReadBrokerLog(int maxLines)
+        {
+            try
+            {
+                if (BrokerLog == null)
+                {
+                    return BrokerLogSnapshot.Empty;
+                }
+                return BrokerLog.Read(maxLines) ?? BrokerLogSnapshot.Empty;
+            }
+            catch (Exception)
+            {
+                return BrokerLogSnapshot.Empty;
+            }
         }
 
         public string FailureReport()
@@ -731,6 +776,11 @@ namespace HotspotShade.WinUI2.Core.App
                 && (lastFailureCode == BrokerCodes.EngineMissing || utcNow() - createdAt >= FirstAnswerBudget))
             {
                 input.BrokerFailure = AppText.BrokerMessage(lastFailureCode);
+            }
+            if (!string.IsNullOrEmpty(input.BrokerFailure))
+            {
+                BrokerLogSnapshot log = ReadBrokerLog(40);
+                input.BrokerLogNote = BrokerLogText.StopLine(log);
             }
             input.EngineStarting = input.BrokerFailure == null && !everAnswered;
             input.TestDataEngine = testData;
@@ -882,7 +932,7 @@ namespace HotspotShade.WinUI2.Core.App
 
         private void ApplyBrokerState(BrokerReply reply)
         {
-            if (reply.Code == BrokerCodes.Closed)
+            if (reply.Code == BrokerCodes.Closed || reply.Code == BrokerCodes.NotConnected)
             {
                 return;
             }

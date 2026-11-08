@@ -1,13 +1,14 @@
 using System;
 using System.Runtime.InteropServices;
 using System.Threading;
+using HotspotShade.WinUI2.Core.App;
 using Windows.ApplicationModel;
 using Windows.Storage;
 
 namespace HotspotShade.WinUI2.Broker
 {
     // Fixed debugger events. A value, path, port, or secret is never passed.
-    // The broker writes no file and keeps no log on disk.
+    // The words stay the same; BrokerLog adds the bounded startup file.
     internal static class BrokerTrace
     {
         public const string Start = "start";
@@ -66,18 +67,28 @@ namespace HotspotShade.WinUI2.Broker
                 Package package = Package.Current;
                 if (package == null)
                 {
+                    BrokerLog.Write(BrokerLogStages.Package, BrokerLogCodes.NoPackage);
                     return false;
                 }
                 StorageFolder folder = package.InstalledLocation;
                 if (folder == null || string.IsNullOrEmpty(folder.Path))
                 {
+                    BrokerLog.Write(BrokerLogStages.Package, BrokerLogCodes.NoPackage);
                     return false;
                 }
                 root = folder.Path;
+                BrokerLog.Write(BrokerLogStages.Package, BrokerLogCodes.PackageOk);
                 return true;
             }
-            catch (Exception)
+            catch (Exception error)
             {
+                BrokerLog.Write(
+                    BrokerLogStages.Package,
+                    BrokerLogCodes.NoPackage,
+                    null,
+                    null,
+                    null,
+                    error.HResult);
                 return false;
             }
         }

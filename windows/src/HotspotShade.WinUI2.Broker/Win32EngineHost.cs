@@ -5,6 +5,7 @@ using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using HotspotShade.WinUI2.Core.App;
 using HotspotShade.WinUI2.Core.Engine;
 using Microsoft.Win32.SafeHandles;
 
@@ -462,6 +463,12 @@ namespace HotspotShade.WinUI2.Broker
                 if (!created)
                 {
                     error = Marshal.GetLastWin32Error();
+                    BrokerLog.Write(
+                        BrokerLogStages.EngineStart,
+                        BrokerLogCodes.CreateFailed,
+                        null,
+                        null,
+                        error);
                 }
             }
             finally
@@ -486,6 +493,7 @@ namespace HotspotShade.WinUI2.Broker
                         ? EngineLaunchFailure.BrokerMissing
                         : EngineLaunchFailure.BrokerRefused);
             }
+            BrokerLog.Write(BrokerLogStages.EngineStart, BrokerLogCodes.CreateOk);
 
             CloseHandle(process.hThread);
             processHandle = process.hProcess;

@@ -11,6 +11,7 @@ namespace HotspotShade.WinUI2.Core.Tests
             Console.WriteLine("");
             TestRunner runner = new TestRunner();
             AppSessionTests.Run(runner);
+            BrokerLogTests.Run(runner);
             InstallSecurityTests.Run(runner);
             EngineTests.Run(runner);
             EngineBoundaryTests.Run(runner);

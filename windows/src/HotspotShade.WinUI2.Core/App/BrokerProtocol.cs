@@ -215,6 +215,10 @@ namespace HotspotShade.WinUI2.Core.App
         public const string UnknownOp = "unknown_op";
         public const string Busy = "busy";
         public const string Closed = "closed";
+        // The window started the helper but no app-service connection arrived
+        // inside the attach budget. This is not the same as a connection that
+        // closed after it worked.
+        public const string NotConnected = "broker_not_connected";
         public const string EngineStarting = "engine_starting";
         public const string EngineUnavailable = "engine_unavailable";
         public const string EngineExited = "engine_exited";

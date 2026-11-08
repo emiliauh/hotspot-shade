@@ -39,6 +39,7 @@ namespace HotspotShade.WinUI2.ViewModels
             this.broker = broker;
             this.dispatcher = dispatcher;
             session = new AppSession(broker, delegate { return DateTime.UtcNow; });
+            session.BrokerLog = new BrokerLogReader();
             AttentionRows = new ObservableCollection<AttentionRow>();
             ActivityRows = new ObservableCollection<ActivityRow>();
             FailureRows = new ObservableCollection<FailureRow>();

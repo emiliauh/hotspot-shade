@@ -25,6 +25,9 @@ namespace HotspotShade.WinUI2.Services
         private BackgroundTaskDeferral deferral;
         private TaskCompletionSource<bool> attached = new TaskCompletionSource<bool>();
         private bool launching;
+        // True after the broker connected at least once. A later wait that
+        // times out means the connection dropped, not that it never arrived.
+        private bool everAttached;
 
         public static readonly BrokerConnection Instance = new BrokerConnection();
 
@@ -120,6 +123,7 @@ namespace HotspotShade.WinUI2.Services
                 connection = created;
                 deferral = held;
                 signal = attached;
+                everAttached = true;
             }
             created.ServiceClosed += OnServiceClosed;
             task.Canceled += OnCanceled;
@@ -142,7 +146,7 @@ namespace HotspotShade.WinUI2.Services
                 Task first = await Task.WhenAny(wait, Task.Delay(AttachBudget)).ConfigureAwait(true);
                 if (first != wait)
                 {
-                    return BrokerReply.Failure(BrokerCodes.Closed);
+                    return BrokerReply.Failure(NotAttachedCode());
                 }
                 lock (gate)
                 {
@@ -150,7 +154,7 @@ namespace HotspotShade.WinUI2.Services
                 }
                 if (current == null)
                 {
-                    return BrokerReply.Failure(BrokerCodes.Closed);
+                    return BrokerReply.Failure(NotAttachedCode());
                 }
             }
 
@@ -192,6 +196,14 @@ namespace HotspotShade.WinUI2.Services
             catch (Exception)
             {
                 return BrokerReply.Failure(BrokerCodes.Closed);
+            }
+        }
+
+        private string NotAttachedCode()
+        {
+            lock (gate)
+            {
+                return everAttached ? BrokerCodes.Closed : BrokerCodes.NotConnected;
             }
         }
 

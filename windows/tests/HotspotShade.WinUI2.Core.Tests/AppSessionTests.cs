@@ -712,6 +712,42 @@ namespace HotspotShade.WinUI2.Core.Tests
                 idle.Run(idle.Session.TurnOffAsync());
                 AssertEx.Equal(0, idle.Channel.Count(BrokerOps.TurnOff), "no stop sent");
             });
+
+            runner.Check("window: a helper that never connected and one that dropped say different things", delegate
+            {
+                Harness h = new Harness();
+                h.Channel.Fail = BrokerCodes.NotConnected;
+                h.Refresh();
+                DashboardModel never = h.Session.Dashboard();
+                AssertEx.Equal(AppText.Attention, never.Title, "attention");
+                AssertEx.Equal(AppText.BrokerNeverConnected, never.Subtitle, "never connected");
+                AssertEx.Equal(DashboardAction.Retry, never.Primary, "Try again");
+
+                h.Channel.Fail = BrokerCodes.Closed;
+                h.Refresh();
+                DashboardModel dropped = h.Session.Dashboard();
+                AssertEx.Equal(AppText.BrokerLost, dropped.Subtitle, "connection dropped");
+                AssertEx.True(AppText.BrokerLost != AppText.BrokerNeverConnected, "two separate strings");
+            });
+
+            runner.Check("window: the broker lost screen and diagnostics show the last log line", delegate
+            {
+                List<string> lines = new List<string>();
+                lines.Add("2026-11-07T01:02:03Z stage=connect code=not_retryable status=Unknown attempt=3");
+                lines.Add("2026-11-07T01:02:03Z stage=exit code=exit attempt=4");
+                Harness h = new Harness();
+                h.Session.BrokerLog = new FixedLogSource(lines);
+                h.Channel.Fail = BrokerCodes.NotConnected;
+                h.Refresh();
+                DashboardModel model = h.Session.Dashboard();
+                string note = "The engine helper stopped at app service connect (status Unknown, exit 4).";
+                AssertEx.True(model.Attention.Any(a => a.Text == note), "the stop point is on the screen");
+
+                string report = h.Run(h.Session.DiagnosticsReportAsync("1.0.0.0", "10.0.26100.0"));
+                AssertEx.Contains(report, "Engine helper log (last 40 lines):", "reported even when the helper is dead");
+                AssertEx.Contains(report, lines[0], "first line");
+                AssertEx.Contains(report, lines[1], "last line");
+            });
         }
 
         private static string Logs(int first, int last)
@@ -826,6 +862,22 @@ namespace HotspotShade.WinUI2.Core.Tests
             public T Run<T>(Task<T> task)
             {
                 return task.GetAwaiter().GetResult();
+            }
+        }
+
+        // One fixed broker log, read the same way as the UWP reader.
+        private sealed class FixedLogSource : IBrokerLogSource
+        {
+            private readonly List<string> lines;
+
+            public FixedLogSource(List<string> lines)
+            {
+                this.lines = lines;
+            }
+
+            public BrokerLogSnapshot Read(int maxLines)
+            {
+                return BrokerLogFormat.Snapshot(BrokerLogFormat.LastLines(lines, maxLines));
             }
         }
 

@@ -79,6 +79,24 @@ redirects (`LauncherHttp.cs` and `ListenerTable.cs`, shared with the console
 launcher). It removes the log copy from status answers and trims the logs so
 each reply fits the app-service message budget.
 
+The broker writes a small startup log to
+`%LOCALAPPDATA%\Packages\HotspotShade.Windows_<publisher id>\LocalState\broker.log`.
+The file holds at most 200 lines and 16 KB, and it is rewritten in place with
+`FileShare.ReadWrite`. A line is one UTC time and fixed words and numbers:
+
+```text
+<UTC ISO time> stage=<word> code=<word> [status=<enum name>] [attempt=<n>] [win32=<number>] [hresult=0x<hex>]
+```
+
+The log never holds a path, a port, a handle, a ValueSet value, the bearer
+secret, the source device token, or user data. A stage or code outside the
+fixed list is written as `unknown`. Every write is guarded, so a log failure
+never changes the broker lifetime. The window reads the file read-only. When
+the helper fails, the dashboard shows one plain line with the last stage, for
+example "The engine helper stopped at app service connect (status Unknown,
+exit 4)." Copy diagnostics carries the last 40 lines, so it still explains a
+helper that is already gone.
+
 ### Turn on, the only elevation
 
 Turn on is the only operation that asks Windows for administrator approval
@@ -369,9 +387,9 @@ short, on Windows:
 | `sh windows/tools/check_static_contract.sh` | `STATIC CONTRACT CHECK PASSED`. Needs `sh` and `xmllint`. |
 | `node windows/tools/check_csharp_balance.mjs windows` | `C# delimiter check passed`. |
 
-On 2026-11-06 the Core test runner makes 250 `Check` calls and the
-ServiceHost test runner makes 250. `check_static_contract.sh` reports 15 XML
-files, and the C# delimiter check reports 125 C# files. These are source
+On 2026-11-07 the Core test runner makes 276 `Check` calls and the
+ServiceHost test runner makes 281. `check_static_contract.sh` reports 15 XML
+files, and the C# delimiter check reports 133 C# files. These are source
 counts. No Windows host has run the checks.
 
 `dotnet build` cannot build the UWP project. Use MSBuild from a Developer

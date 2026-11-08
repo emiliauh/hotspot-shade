@@ -54,19 +54,40 @@ namespace HotspotShade.WinUI2.Broker
         public async Task<bool> ConnectAsync(TimeSpan retryWindow)
         {
             DateTime deadline = DateTime.UtcNow + retryWindow;
+            int attempt = 0;
             while (true)
             {
                 if (Volatile.Read(ref closed) != 0)
                 {
+                    BrokerLog.Write(BrokerLogStages.Connect, BrokerLogCodes.ConnectException, null, attempt + 1);
                     return false;
                 }
                 // A connection that failed to open is not reused. Every
                 // attempt gets a fresh AppServiceConnection.
-                AppServiceConnection created = new AppServiceConnection();
-                created.AppServiceName = BrokerProtocol.ServiceName;
-                created.PackageFamilyName = Package.Current.Id.FamilyName;
-                created.RequestReceived += OnRequestReceived;
-                created.ServiceClosed += OnServiceClosed;
+                attempt++;
+                AppServiceConnection created;
+                try
+                {
+                    created = new AppServiceConnection();
+                    created.AppServiceName = BrokerProtocol.ServiceName;
+                    created.PackageFamilyName = Package.Current.Id.FamilyName;
+                    created.RequestReceived += OnRequestReceived;
+                    created.ServiceClosed += OnServiceClosed;
+                }
+                catch (Exception error)
+                {
+                    // Package identity is required. A failure here is not a
+                    // retryable status; the broker logs it and exits 1.
+                    BrokerLog.Write(
+                        BrokerLogStages.Connect,
+                        BrokerLogCodes.CreateFailed,
+                        BrokerLogFormat.ExceptionName(error),
+                        attempt,
+                        null,
+                        error.HResult);
+                    Close();
+                    throw;
+                }
                 connection = created;
 
                 AppServiceConnectionStatus status = AppServiceConnectionStatus.Unknown;
@@ -75,20 +96,37 @@ namespace HotspotShade.WinUI2.Broker
                 {
                     status = await created.OpenAsync();
                 }
-                catch (Exception)
+                catch (Exception error)
                 {
                     // An activation race throws instead of returning a
                     // status. Treat it as retryable inside the window.
                     thrown = true;
+                    BrokerLog.Write(
+                        BrokerLogStages.Connect,
+                        BrokerLogCodes.OpenException,
+                        BrokerLogFormat.ExceptionName(error),
+                        attempt,
+                        null,
+                        error.HResult);
                 }
                 if (!thrown && status == AppServiceConnectionStatus.Success)
                 {
+                    BrokerLog.Write(BrokerLogStages.Connect, BrokerLogCodes.Connected, status.ToString(), attempt);
                     return true;
                 }
                 if ((!thrown && !IsRetryable(status)) || DateTime.UtcNow >= deadline)
                 {
+                    BrokerLog.Write(
+                        BrokerLogStages.Connect,
+                        thrown ? BrokerLogCodes.RetryExhausted : BrokerLogCodes.NotRetryable,
+                        thrown ? null : status.ToString(),
+                        attempt);
                     Close();
                     return false;
+                }
+                if (!thrown)
+                {
+                    BrokerLog.Write(BrokerLogStages.Connect, BrokerLogCodes.Attempt, status.ToString(), attempt);
                 }
                 DiscardAttempt(created);
                 await Task.Delay(250).ConfigureAwait(false);

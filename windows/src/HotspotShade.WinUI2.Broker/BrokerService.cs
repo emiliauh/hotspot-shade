@@ -74,13 +74,29 @@ namespace HotspotShade.WinUI2.Broker
             }
             string code;
             UserEngine started = null;
+            bool logged = false;
             try
             {
                 started = UserEngine.Start(root, out code);
             }
-            catch (Exception)
+            catch (Exception error)
             {
                 code = BrokerCodes.EngineUnavailable;
+                BrokerLog.Write(
+                    BrokerLogStages.EngineStart,
+                    BrokerLogCodes.StartFailed,
+                    BrokerLogFormat.ExceptionName(error),
+                    null,
+                    null,
+                    error.HResult);
+                logged = true;
+            }
+            if (!logged)
+            {
+                BrokerLog.Write(
+                    BrokerLogStages.EngineStart,
+                    started == null ? BrokerLogCodes.StartFailed : BrokerLogCodes.StartOk,
+                    started == null ? code : null);
             }
             bool close = false;
             lock (state)

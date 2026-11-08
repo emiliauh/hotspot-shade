@@ -122,6 +122,12 @@ namespace HotspotShade.WinUI2.Broker
                 int shellError;
                 if (!ShellExecuteOnSta(ref info, out shellError))
                 {
+                    BrokerLog.Write(
+                        BrokerLogStages.ElevatedStart,
+                        BrokerLogCodes.ShellFailed,
+                        null,
+                        null,
+                        shellError);
                     return new ElevatedLaunchResult(
                         shellError == BrokerNative.ErrorCancelled ? BrokerCodes.ElevationCancelled : BrokerCodes.ElevationFailed,
                         null);

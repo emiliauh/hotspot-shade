@@ -63,6 +63,7 @@
     <Compile Include="Converters\ValueConverters.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="Services\BrokerConnection.cs" />
+    <Compile Include="Services\BrokerLogReader.cs" />
     <Compile Include="Services\ClipboardService.cs" />
     <Compile Include="Services\LocalSettingsStore.cs" />
     <Compile Include="Services\WindowHandle.cs" />

@@ -415,3 +415,40 @@ above before anything else.
   the install as untrusted.
 - A Visual Studio F5 deployment is for UI work only. Turn on is refused there
   because its folder is user-writable.
+
+## 11. Troubleshooting the engine helper
+
+When the window says "HotspotShade lost its engine helper" or "started its
+engine helper, but the helper never connected", the broker startup log explains
+the stop point. Read it in PowerShell:
+
+```powershell
+Get-Content "$env:LOCALAPPDATA\Packages\HotspotShade.Windows_*\LocalState\broker.log" -Tail 40
+```
+
+The exact path is
+`%LOCALAPPDATA%\Packages\HotspotShade.Windows_<publisher id>\LocalState\broker.log`.
+If package storage could not be opened, the broker falls back to
+`%LOCALAPPDATA%\HotspotShade\broker.log`. The file holds at most 200 lines and
+16 KB. Each line is one UTC time and fixed words and numbers:
+
+```text
+2026-11-07T01:02:03Z stage=connect code=not_retryable status=Unknown attempt=3
+2026-11-07T01:02:03Z stage=exit code=exit attempt=4
+```
+
+Read the last line before `stage=exit`. `stage=main` with `code=bad_args`
+means a caller passed a command-line argument. `stage=package` with
+`code=no_package` means the process has no package identity; `hresult` carries
+the Windows error. `stage=lease` with `code=held` means another broker owns the
+session. `stage=engine_start` records the user engine result and a CreateProcess
+`win32` error. `stage=connect` records each app service attempt with its
+`AppServiceConnectionStatus` name, or the exception type and `hresult`.
+`stage=hello` records `received` or `timeout`. `stage=transport` records a
+closed connection. The last `stage=exit` line holds the process exit code in
+`attempt`.
+
+The log never holds a path, a port, a handle, a ValueSet value, the bearer
+secret, the source device token, or user data. Settings, Advanced, **Copy
+diagnostics** already appends the last 40 lines, so paste that report instead
+of the raw file when you report a failure.

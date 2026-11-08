@@ -1,6 +1,7 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using HotspotShade.WinUI2.Core.App;
 
 namespace HotspotShade.WinUI2.Broker
 {
@@ -18,8 +19,9 @@ namespace HotspotShade.WinUI2.Broker
     //    wait for the engines to exit.
     internal static class BrokerRuntime
     {
-        // A window that never says hello is gone. The broker stops.
-        private static readonly TimeSpan HelloBudget = TimeSpan.FromSeconds(30);
+        // A window that never says hello is gone. The window gives the broker
+        // 15 seconds to attach, so the broker uses the same budget.
+        private static readonly TimeSpan HelloBudget = TimeSpan.FromSeconds(15);
 
         public static int Run()
         {
@@ -30,16 +32,19 @@ namespace HotspotShade.WinUI2.Broker
                 return 3;
             }
 
-            using (SingleInstanceLease lease = SingleInstanceLease.TryAcquire())
+            SingleInstanceLease lease = SingleInstanceLease.TryAcquire();
+            if (lease == null)
             {
-                if (lease == null)
-                {
-                    // The app starts the broker again after a resume. The
-                    // running broker owns the engines; ask it to reconnect.
-                    ReconnectSignal.Raise();
-                    BrokerTrace.Event(BrokerTrace.AlreadyRunning);
-                    return 0;
-                }
+                // The app starts the broker again after a resume. The
+                // running broker owns the engines; ask it to reconnect.
+                ReconnectSignal.Raise();
+                BrokerTrace.Event(BrokerTrace.AlreadyRunning);
+                BrokerLog.Write(BrokerLogStages.Lease, BrokerLogCodes.LeaseHeld);
+                return 0;
+            }
+            BrokerLog.Write(BrokerLogStages.Lease, BrokerLogCodes.LeaseOwned);
+            using (lease)
+            {
                 using (ReconnectSignal signal = ReconnectSignal.Create())
                 {
                     return RunOwned(root, signal);
@@ -60,6 +65,7 @@ namespace HotspotShade.WinUI2.Broker
                     bool connected = transport.ConnectAsync(TimeSpan.FromSeconds(10)).GetAwaiter().GetResult();
                     if (!connected)
                     {
+                        BrokerLog.Write(BrokerLogStages.Transport, BrokerLogCodes.ConnectFailed);
                         if (!app.Known)
                         {
                             BrokerTrace.Event(BrokerTrace.ServiceUnavailable);
@@ -69,21 +75,32 @@ namespace HotspotShade.WinUI2.Broker
                     else
                     {
                         DateTime helloDeadline = DateTime.UtcNow + HelloBudget;
+                        bool helloSeen = false;
                         while (!transport.Closed.IsCompleted)
                         {
+                            if (!helloSeen && app.Known)
+                            {
+                                helloSeen = true;
+                                BrokerLog.Write(BrokerLogStages.Hello, BrokerLogCodes.HelloReceived);
+                            }
                             if (app.Exited)
                             {
                                 transport.Close();
+                                BrokerLog.Write(BrokerLogStages.Transport, BrokerLogCodes.WindowExited);
                                 return 0;
                             }
                             if (!app.Known && DateTime.UtcNow > helloDeadline)
                             {
                                 transport.Close();
                                 BrokerTrace.Event(BrokerTrace.ServiceUnavailable);
+                                BrokerLog.Write(BrokerLogStages.Hello, BrokerLogCodes.HelloTimeout);
                                 return 4;
                             }
                             transport.Closed.Wait(250);
                         }
+                        BrokerLog.Write(
+                            BrokerLogStages.Transport,
+                            app.Known ? BrokerLogCodes.TransportClosed : BrokerLogCodes.ClosedBeforeHello);
                     }
                     // The connection closed. Wait for the window to come back
                     // or for its process to end.
@@ -104,14 +121,22 @@ namespace HotspotShade.WinUI2.Broker
                     }
                 }
             }
-            catch (Exception)
+            catch (Exception error)
             {
                 BrokerTrace.Event(BrokerTrace.Fatal);
+                BrokerLog.Write(
+                    BrokerLogStages.Fatal,
+                    BrokerLogCodes.Unhandled,
+                    BrokerLogFormat.ExceptionName(error),
+                    null,
+                    null,
+                    error.HResult);
                 return 1;
             }
             finally
             {
                 BrokerTrace.Event(BrokerTrace.Stopping);
+                BrokerLog.Write(BrokerLogStages.Shutdown, BrokerLogCodes.ShutdownBegin);
                 try
                 {
                     engineStart.Wait(TimeSpan.FromSeconds(20));
@@ -128,6 +153,7 @@ namespace HotspotShade.WinUI2.Broker
                 }
                 app.Dispose();
                 BrokerTrace.Event(BrokerTrace.Stopped);
+                BrokerLog.Write(BrokerLogStages.Shutdown, BrokerLogCodes.ShutdownEnd);
             }
         }
     }
@@ -237,27 +263,48 @@ namespace HotspotShade.WinUI2.Broker
         [System.MTAThread]
         private static int Main(string[] args)
         {
+            int exitCode;
+            BrokerLog.Write(
+                BrokerLogStages.Main,
+                BrokerLogCodes.Entry,
+                null,
+                args == null ? 0 : args.Length);
             if (args != null && args.Length != 0)
             {
                 // The launcher passes no arguments. A path, port, or secret is
-                // never accepted from the command line.
+                // never accepted from the command line. Only the count is
+                // logged, never the values.
                 BrokerTrace.Event(BrokerTrace.BadArgument);
-                return 2;
+                BrokerLog.Write(BrokerLogStages.Main, BrokerLogCodes.BadArgs);
+                exitCode = 2;
             }
-            BrokerTrace.Event(BrokerTrace.Start);
-            try
+            else
             {
-                return BrokerRuntime.Run();
+                BrokerTrace.Event(BrokerTrace.Start);
+                try
+                {
+                    exitCode = BrokerRuntime.Run();
+                }
+                catch (Exception error)
+                {
+                    BrokerTrace.Event(BrokerTrace.Fatal);
+                    BrokerLog.Write(
+                        BrokerLogStages.Fatal,
+                        BrokerLogCodes.Unhandled,
+                        BrokerLogFormat.ExceptionName(error),
+                        null,
+                        null,
+                        error.HResult);
+                    exitCode = 1;
+                }
             }
-            catch (Exception)
-            {
-                BrokerTrace.Event(BrokerTrace.Fatal);
-                return 1;
-            }
-            finally
-            {
-                BrokerTrace.Event(BrokerTrace.Exit);
-            }
+            BrokerTrace.Event(BrokerTrace.Exit);
+            BrokerLog.Write(
+                BrokerLogStages.Exit,
+                BrokerLogCodes.ExitCode,
+                null,
+                exitCode);
+            return exitCode;
         }
     }
 }

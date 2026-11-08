@@ -110,6 +110,8 @@ namespace HotspotShade.WinUI2.Core.App
         public string TurnOnUnavailable { get; set; }
         public bool EngineStarting { get; set; }
         public string BrokerFailure { get; set; }
+        // One plain line from the broker startup log, when the helper failed.
+        public string BrokerLogNote { get; set; }
         public bool ElevatedSource { get; set; }
     }
 
@@ -245,6 +247,10 @@ namespace HotspotShade.WinUI2.Core.App
                 model.SourceCard = new DashboardCard(AppText.SourceDevice, AppText.StatusUnavailableLine, new[] { AppText.CheckStatusAgain });
                 model.ConnectionCard = new DashboardCard(AppText.Connection, AppText.StatusUnavailableLine, new[] { AppText.CheckStatusAgain });
                 model.Attention = new List<AttentionLine>();
+                if (!string.IsNullOrEmpty(input.BrokerLogNote))
+                {
+                    model.Attention.Add(new AttentionLine(input.BrokerLogNote, DashboardAction.None));
+                }
                 model.TurnOnReason = model.Subtitle;
                 model.TurnOffReason = model.Subtitle;
                 model.PairReason = model.Subtitle;

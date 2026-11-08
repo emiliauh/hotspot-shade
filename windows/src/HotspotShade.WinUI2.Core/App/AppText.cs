@@ -106,7 +106,8 @@ namespace HotspotShade.WinUI2.Core.App
         public const string StopUnconfirmed = "HotspotShade could not confirm that the tunnel stopped. Turn off again. If that fails, quit HotspotShade and run route print to check the routes.";
         public const string ElevatedLost = "The administrator engine exited without a confirmed stop. Its routes are not verified. Run route print in a console to check the routes on this target device. Turn on stays disabled until HotspotShade restarts.";
         public const string BrokerMissing = "HotspotShade could not start its engine helper. Reinstall HotspotShade.";
-        public const string BrokerLost = "HotspotShade lost its engine helper. Press Try again.";
+        public const string BrokerNeverConnected = "HotspotShade started its engine helper, but the helper never connected. Press Try again.";
+        public const string BrokerLost = "HotspotShade lost its engine helper after it connected. Press Try again.";
 
         // Cards and sections.
         public const string Dashboard = "Dashboard";
@@ -269,6 +270,8 @@ namespace HotspotShade.WinUI2.Core.App
                     return ElevatedLost;
                 case BrokerCodes.Closed:
                     return BrokerLost;
+                case BrokerCodes.NotConnected:
+                    return BrokerNeverConnected;
                 case BrokerCodes.EngineUnavailable:
                     return StatusUnavailableSubtitle;
                 default:
